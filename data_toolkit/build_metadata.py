@@ -66,6 +66,10 @@ if __name__ == '__main__':
                         help='Directory to save the dual grid files')
     parser.add_argument('--pbr_voxel_root', type=str, default=None,
                         help='Directory to save the pbr voxel files')
+    parser.add_argument('--edge_voxel_root', type=str, default=None,
+                        help='Directory to save the edge-distance voxel files')
+    parser.add_argument('--vertex_voxel_root', type=str, default=None,
+                        help='Directory to save the vertex-distance voxel files')
     parser.add_argument('--ss_latent_root', type=str, default=None,
                         help='Directory to save the sparse structure latent files')
     parser.add_argument('--shape_latent_root', type=str, default=None,
@@ -92,6 +96,8 @@ if __name__ == '__main__':
     opt.pbr_dump_root = opt.pbr_dump_root or opt.root
     opt.dual_grid_root = opt.dual_grid_root or opt.root
     opt.pbr_voxel_root = opt.pbr_voxel_root or opt.root
+    opt.edge_voxel_root = opt.edge_voxel_root or opt.root
+    opt.vertex_voxel_root = opt.vertex_voxel_root or opt.root
     opt.ss_latent_root = opt.ss_latent_root or opt.root
     opt.shape_latent_root = opt.shape_latent_root or opt.root
     opt.pbr_latent_root = opt.pbr_latent_root or opt.root
@@ -146,6 +152,24 @@ if __name__ == '__main__':
     pbr_voxel_metadata = {}
     for res in pbr_voxel_resolutions:
         pbr_voxel_metadata[res] = update_metadata(os.path.join(opt.pbr_voxel_root, f'pbr_voxels_{res}'), opt)
+
+    # merge edge-distance voxelized
+    edge_voxel_resolutions = []
+    for dir in os.listdir(opt.edge_voxel_root):
+        if os.path.isdir(os.path.join(opt.edge_voxel_root, dir)) and dir.startswith('edge_distance_voxels_'):
+            edge_voxel_resolutions.append(int(dir.split('_')[-1]))
+    edge_voxel_metadata = {}
+    for res in edge_voxel_resolutions:
+        edge_voxel_metadata[res] = update_metadata(os.path.join(opt.edge_voxel_root, f'edge_distance_voxels_{res}'), opt)
+
+    # merge vertex-distance voxelized
+    vertex_voxel_resolutions = []
+    for dir in os.listdir(opt.vertex_voxel_root):
+        if os.path.isdir(os.path.join(opt.vertex_voxel_root, dir)) and dir.startswith('vertex_distance_voxels_'):
+            vertex_voxel_resolutions.append(int(dir.split('_')[-1]))
+    vertex_voxel_metadata = {}
+    for res in vertex_voxel_resolutions:
+        vertex_voxel_metadata[res] = update_metadata(os.path.join(opt.vertex_voxel_root, f'vertex_distance_voxels_{res}'), opt)
         
     # merge ss latents
     ss_latent_models = []
@@ -199,6 +223,16 @@ if __name__ == '__main__':
             for res in pbr_voxel_resolutions:
                 if pbr_voxel_metadata[res] is not None:
                     f.write(f'    - {res}: {pbr_voxel_metadata[res]["pbr_voxelized"].sum()}\n')
+        if len(edge_voxel_resolutions) != 0:
+            f.write(f'  - Number of assets with edge-distance voxelization:\n')
+            for res in edge_voxel_resolutions:
+                if edge_voxel_metadata[res] is not None:
+                    f.write(f'    - {res}: {edge_voxel_metadata[res]["edge_distance_voxelized"].sum()}\n')
+        if len(vertex_voxel_resolutions) != 0:
+            f.write(f'  - Number of assets with vertex-distance voxelization:\n')
+            for res in vertex_voxel_resolutions:
+                if vertex_voxel_metadata[res] is not None:
+                    f.write(f'    - {res}: {vertex_voxel_metadata[res]["vertex_distance_voxelized"].sum()}\n')
         if len(ss_latent_models) != 0:
             f.write(f'  - Number of assets with sparse structure latents:\n')
             for model in ss_latent_models:

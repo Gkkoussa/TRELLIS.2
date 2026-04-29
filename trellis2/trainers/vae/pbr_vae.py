@@ -58,6 +58,7 @@ class PbrVaeTrainer(BasicTrainer):
     def __init__(
         self,
         *args,
+        num_workers: int = None,
         loss_type: str = 'l1',
         lambda_kl: float = 1e-6,
         lambda_ssim: float = 0.2,
@@ -76,6 +77,7 @@ class PbrVaeTrainer(BasicTrainer):
         self.lambda_lpips = lambda_lpips
         self.lambda_render = lambda_render
         self.camera_randomization_config = camera_randomization_config
+        self.num_workers = num_workers
         
         self.renderer = MeshRenderer({'near': 1, 'far': 3, 'resolution': render_resolution}, device=self.device)
         
@@ -91,7 +93,7 @@ class PbrVaeTrainer(BasicTrainer):
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size_per_gpu,
-            num_workers=int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
+            num_workers=self.num_workers if self.num_workers is not None else int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,
@@ -227,18 +229,71 @@ class PbrVaeTrainer(BasicTrainer):
         batch_size: int,
         verbose: bool = False,
     ) -> Dict:
+        snapshot_dataset = copy.deepcopy(self.dataset)
         dataloader = DataLoader(
-            copy.deepcopy(self.dataset),
+            snapshot_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=1,
             collate_fn=self.dataset.collate_fn if hasattr(self.dataset, 'collate_fn') else None,
         )
-        dataloader.dataset.with_mesh = True
+        has_pbr_dump = isinstance(getattr(snapshot_dataset, 'roots', None), dict) and all(
+            'pbr_dump' in root for root in snapshot_dataset.roots.values()
+        )
+        if has_pbr_dump:
+            dataloader.dataset.with_mesh = True
 
         # inference
-        gts = []
-        recons = []
+        self.models['encoder'].eval()
+        self.models['decoder'].eval()
+        self.models['encoder'].train()
+        self.models['decoder'].train()
+
+        if has_pbr_dump:
+            gts = []
+            recons = []
+            self.models['encoder'].eval()
+            self.models['decoder'].eval()
+            for i in range(0, num_samples, batch_size):
+                batch = min(batch_size, num_samples - i)
+                data = next(iter(dataloader))
+                args = {k: v[:batch] for k, v in data.items()}
+                args = recursive_to_device(args, self.device)
+                z = self.models['encoder'](args['x'])
+                y = self.models['decoder'](z)
+                gts.extend(args['mesh'])
+                recons.extend([MeshWithVoxel(
+                    m.vertices,
+                    m.faces,
+                    [-0.5, -0.5, -0.5],
+                    1 / self.dataset.resolution,
+                    v.coords[:, 1:],
+                    v.feats * 0.5 + 0.5,
+                    torch.Size([*v.shape, *v.spatial_shape]),
+                    layout={
+                        'base_color': slice(0, 3),
+                        'metallic': slice(3, 4),
+                        'roughness': slice(4, 5),
+                        'alpha': slice(5, 6),
+                    }
+                ) for m, v in zip(args['mesh'], y)])
+            self.models['encoder'].train()
+            self.models['decoder'].train()
+
+            cameras = self._randomize_camera(num_samples)
+            gt_renders = self._render_batch(gts, **cameras)
+            pred_renders = self._render_batch(recons, **cameras)
+
+            sample_dict = {
+                'gt_base_color': {'value': gt_renders['base_color'] * 2 - 1, 'type': 'image'},
+                'pred_base_color': {'value': pred_renders['base_color'] * 2 - 1, 'type': 'image'},
+                'gt_mra': {'value': torch.cat([gt_renders['metallic'], gt_renders['roughness'], gt_renders['alpha']], dim=1) * 2 - 1, 'type': 'image'},
+                'pred_mra': {'value': torch.cat([pred_renders['metallic'], pred_renders['roughness'], pred_renders['alpha']], dim=1) * 2 - 1, 'type': 'image'},
+            }
+            return sample_dict
+
+        gt_images = {}
+        pred_images = {}
         self.models['encoder'].eval()
         self.models['decoder'].eval()
         for i in range(0, num_samples, batch_size):
@@ -248,34 +303,17 @@ class PbrVaeTrainer(BasicTrainer):
             args = recursive_to_device(args, self.device)
             z = self.models['encoder'](args['x'])
             y = self.models['decoder'](z)
-            gts.extend(args['mesh'])
-            recons.extend([MeshWithVoxel(
-                m.vertices,
-                m.faces,
-                [-0.5, -0.5, -0.5],
-                1 / self.dataset.resolution,
-                v.coords[:, 1:],
-                v.feats * 0.5 + 0.5,
-                torch.Size([*v.shape, *v.spatial_shape]),
-                layout={
-                    'base_color': slice(0, 3),
-                    'metallic': slice(3, 4),
-                    'roughness': slice(4, 5),
-                    'alpha': slice(5, 6),
-                }
-            ) for m, v in zip(args['mesh'], y)])
+            gt_vis = self.dataset.visualize_sample({'x': args['x']})
+            pred_vis = self.dataset.visualize_sample({'x': y})
+            for k, v in gt_vis.items():
+                gt_images.setdefault(k, []).append(v[:batch])
+            for k, v in pred_vis.items():
+                pred_images.setdefault(k, []).append(v[:batch])
         self.models['encoder'].train()
         self.models['decoder'].train()
-        
-        cameras = self._randomize_camera(num_samples)
-        gt_renders = self._render_batch(gts, **cameras)
-        pred_renders = self._render_batch(recons, **cameras)
 
-        sample_dict = {
-            'gt_base_color': {'value': gt_renders['base_color'] * 2 - 1, 'type': 'image'},
-            'pred_base_color': {'value': pred_renders['base_color'] * 2 - 1, 'type': 'image'},
-            'gt_mra': {'value': torch.cat([gt_renders['metallic'], gt_renders['roughness'], gt_renders['alpha']], dim=1) * 2 - 1, 'type': 'image'},
-            'pred_mra': {'value': torch.cat([pred_renders['metallic'], pred_renders['roughness'], pred_renders['alpha']], dim=1) * 2 - 1, 'type': 'image'},
-        }
-            
+        sample_dict = {}
+        for k in gt_images:
+            sample_dict[f'gt_{k}'] = {'value': torch.cat(gt_images[k], dim=0)[:num_samples], 'type': 'image'}
+            sample_dict[f'pred_{k}'] = {'value': torch.cat(pred_images[k], dim=0)[:num_samples], 'type': 'image'}
         return sample_dict

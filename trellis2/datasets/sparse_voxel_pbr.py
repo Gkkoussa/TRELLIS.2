@@ -110,12 +110,20 @@ class SparseVoxelPbrDataset(SparseVoxelPbrVisMixin, StandardDatasetBase):
         min_aesthetic_score: float = 5.0,
         attrs: list[str] = ['base_color', 'metallic', 'roughness', 'emissive', 'alpha'],
         with_mesh: bool = True,
+        voxel_root_key: str = 'pbr_voxel',
+        voxel_dirname: str = 'pbr_voxels',
+        voxelized_flag_column: str = 'pbr_voxelized',
+        num_voxels_column: str = 'num_pbr_voxels',
     ):
         self.resolution = resolution
         self.min_aesthetic_score = min_aesthetic_score
         self.max_active_voxels = max_active_voxels
         self.max_num_faces = max_num_faces
         self.with_mesh = with_mesh
+        self.voxel_root_key = voxel_root_key
+        self.voxel_dirname = voxel_dirname
+        self.voxelized_flag_column = voxelized_flag_column
+        self.num_voxels_column = num_voxels_column
         self.value_range = (-1, 1)
         self.channels = {
             'base_color': 3,
@@ -132,24 +140,25 @@ class SparseVoxelPbrDataset(SparseVoxelPbrVisMixin, StandardDatasetBase):
 
         super().__init__(roots)
         
-        self.loads = [self.metadata.loc[sha256, f'num_pbr_voxels'] for _, sha256 in self.instances]
+        self.loads = [self.metadata.loc[sha256, self.num_voxels_column] for _, sha256 in self.instances]
         
     def __str__(self):
         lines = [
             super().__str__(),
             f'  - Resolution: {self.resolution}',
             f'  - Attributes: {list(self.layout.keys())}',
+            f'  - Voxel dirname: {self.voxel_dirname}_{self.resolution}',
         ]
         return '\n'.join(lines)
         
     def filter_metadata(self, metadata):
         stats = {}
-        metadata = metadata[metadata['pbr_voxelized'] == True]
-        stats['PBR Voxelized'] = len(metadata)
+        metadata = metadata[metadata[self.voxelized_flag_column] == True]
+        stats[f'{self.voxelized_flag_column} == True'] = len(metadata)
         if self.min_aesthetic_score is not None:
             metadata = metadata[metadata['aesthetic_score'] >= self.min_aesthetic_score]
             stats[f'Aesthetic score >= {self.min_aesthetic_score}'] = len(metadata)
-        metadata = metadata[metadata['num_pbr_voxels'] <= self.max_active_voxels]
+        metadata = metadata[metadata[self.num_voxels_column] <= self.max_active_voxels]
         stats[f'Active voxels <= {self.max_active_voxels}'] = len(metadata)
         if self.max_num_faces is not None:
             metadata = metadata[metadata['num_faces'] <= self.max_num_faces]
@@ -264,10 +273,10 @@ class SparseVoxelPbrDataset(SparseVoxelPbrVisMixin, StandardDatasetBase):
     def get_instance(self, root, instance):
         if self.with_mesh:
             mesh = self.read_mesh_with_texture(root['pbr_dump'], instance)
-            pbr_voxel = self.read_pbr_voxel(root['pbr_voxel'], instance)
+            pbr_voxel = self.read_pbr_voxel(root[self.voxel_root_key], instance)
             return {**mesh, **pbr_voxel}
         else:
-            return self.read_pbr_voxel(root['pbr_voxel'], instance)
+            return self.read_pbr_voxel(root[self.voxel_root_key], instance)
     
     @staticmethod
     def collate_fn(batch, split_size=None):

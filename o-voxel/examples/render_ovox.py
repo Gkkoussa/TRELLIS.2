@@ -4,10 +4,10 @@ import imageio
 import o_voxel
 import utils3d
 
-RES = 512
+RES = 256
 
 # Load data
-coords, data = o_voxel.io.read("ovoxel_helmet.vxz")
+coords, data = o_voxel.io.read("/home/koussa/scratch/TRELLIS.2/datasets/ObjaverseXL_sketchfab/edge_distance_voxels_256/002ea251c1d736ddeb3927ccdd3167be5690ad4749e7982e607bd7bd013989da.vxz")
 position = (coords / RES - 0.5).cuda()
 base_color = (data['base_color'] / 255).cuda()
 
@@ -36,4 +36,4 @@ output = renderer.render(
 image = np.clip(
     output.attr.permute(1, 2, 0).cpu().numpy() * 255, 0, 255
 ).astype(np.uint8)
-imageio.imwrite("ovoxel_helmet_visualization.png", image)
+imageio.imwrite("test_edf.png", image)
