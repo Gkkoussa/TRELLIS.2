@@ -19,6 +19,7 @@ from plot_edge_distance_hist import (
     nearest_edge_distances,
     normalize_dump,
 )
+from voxelize_gaussian_distance import sanitize_dump_for_volumetric_convert, validate_dump_for_volumetric_convert
 
 
 def encode_base_color(distances, kind, d_max, sigma, log_a):
@@ -73,6 +74,10 @@ def _edge_distance_voxelize(file, metadatum, pbr_dump_root, root, device):
                 with open(os.path.join(pbr_dump_root, 'pbr_dumps', f'{sha256}.pickle'), 'rb') as f:
                     dump = pickle.load(f)
                 dump = normalize_dump(dump)
+                sanitize_dump_for_volumetric_convert(dump)
+                validation = validate_dump_for_volumetric_convert(dump)
+                if validation['errors']:
+                    raise ValueError('volumetric validation failed: ' + '; '.join(validation['errors'][:8]))
                 vertices, edges = build_global_mesh(dump)
                 if vertices.numel() == 0 or edges.numel() == 0:
                     raise ValueError('mesh has no valid edges')

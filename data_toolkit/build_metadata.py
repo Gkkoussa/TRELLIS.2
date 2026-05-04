@@ -70,12 +70,16 @@ if __name__ == '__main__':
                         help='Directory to save the edge-distance voxel files')
     parser.add_argument('--vertex_voxel_root', type=str, default=None,
                         help='Directory to save the vertex-distance voxel files')
+    parser.add_argument('--gaussian_distance_voxel_root', type=str, default=None,
+                        help='Directory to save the gaussian distance voxel files')
     parser.add_argument('--ss_latent_root', type=str, default=None,
                         help='Directory to save the sparse structure latent files')
     parser.add_argument('--shape_latent_root', type=str, default=None,
                         help='Directory to save the shape latent files')
     parser.add_argument('--pbr_latent_root', type=str, default=None,
                         help='Directory to save the pbr latent files')
+    parser.add_argument('--gaussian_distance_latent_root', type=str, default=None,
+                        help='Directory to save the gaussian distance latent files')
     parser.add_argument('--field', type=str, default='all',
                         help='Fields to process, separated by commas')
     parser.add_argument('--from_file', action='store_true',
@@ -98,9 +102,11 @@ if __name__ == '__main__':
     opt.pbr_voxel_root = opt.pbr_voxel_root or opt.root
     opt.edge_voxel_root = opt.edge_voxel_root or opt.root
     opt.vertex_voxel_root = opt.vertex_voxel_root or opt.root
+    opt.gaussian_distance_voxel_root = opt.gaussian_distance_voxel_root or opt.root
     opt.ss_latent_root = opt.ss_latent_root or opt.root
     opt.shape_latent_root = opt.shape_latent_root or opt.root
     opt.pbr_latent_root = opt.pbr_latent_root or opt.root
+    opt.gaussian_distance_latent_root = opt.gaussian_distance_latent_root or opt.root
 
     os.makedirs(opt.root, exist_ok=True)
 
@@ -170,6 +176,18 @@ if __name__ == '__main__':
     vertex_voxel_metadata = {}
     for res in vertex_voxel_resolutions:
         vertex_voxel_metadata[res] = update_metadata(os.path.join(opt.vertex_voxel_root, f'vertex_distance_voxels_{res}'), opt)
+
+    # merge gaussian-distance voxelized
+    gaussian_distance_voxel_resolutions = []
+    for dir in os.listdir(opt.gaussian_distance_voxel_root):
+        if os.path.isdir(os.path.join(opt.gaussian_distance_voxel_root, dir)) and dir.startswith('gaussian_distance_voxels_'):
+            gaussian_distance_voxel_resolutions.append(int(dir.split('_')[-1]))
+    gaussian_distance_voxel_metadata = {}
+    for res in gaussian_distance_voxel_resolutions:
+        gaussian_distance_voxel_metadata[res] = update_metadata(
+            os.path.join(opt.gaussian_distance_voxel_root, f'gaussian_distance_voxels_{res}'),
+            opt,
+        )
         
     # merge ss latents
     ss_latent_models = []
@@ -194,6 +212,17 @@ if __name__ == '__main__':
     pbr_latent_metadata = {}
     for model in pbr_latent_models:
         pbr_latent_metadata[model] = update_metadata(os.path.join(opt.pbr_latent_root, f'pbr_latents/{model}'), opt)
+
+    # merge gaussian-distance latents
+    gaussian_distance_latent_models = []
+    if os.path.exists(os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents')):
+        gaussian_distance_latent_models = os.listdir(os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents'))
+    gaussian_distance_latent_metadata = {}
+    for model in gaussian_distance_latent_models:
+        gaussian_distance_latent_metadata[model] = update_metadata(
+            os.path.join(opt.gaussian_distance_latent_root, f'gaussian_distance_latents/{model}'),
+            opt,
+        )
 
     # statistics
     num_downloaded = downloaded_metadata['local_path'].count() if downloaded_metadata is not None else 0
@@ -233,6 +262,11 @@ if __name__ == '__main__':
             for res in vertex_voxel_resolutions:
                 if vertex_voxel_metadata[res] is not None:
                     f.write(f'    - {res}: {vertex_voxel_metadata[res]["vertex_distance_voxelized"].sum()}\n')
+        if len(gaussian_distance_voxel_resolutions) != 0:
+            f.write(f'  - Number of assets with gaussian-distance voxelization:\n')
+            for res in gaussian_distance_voxel_resolutions:
+                if gaussian_distance_voxel_metadata[res] is not None:
+                    f.write(f'    - {res}: {gaussian_distance_voxel_metadata[res]["gaussian_distance_voxelized"].sum()}\n')
         if len(ss_latent_models) != 0:
             f.write(f'  - Number of assets with sparse structure latents:\n')
             for model in ss_latent_models:
@@ -248,6 +282,11 @@ if __name__ == '__main__':
             for model in pbr_latent_models:
                 if pbr_latent_metadata[model] is not None:
                     f.write(f'    - {model}: {pbr_latent_metadata[model]["pbr_latent_encoded"].sum()}\n')
+        if len(gaussian_distance_latent_models) != 0:
+            f.write(f'  - Number of assets with gaussian-distance latents:\n')
+            for model in gaussian_distance_latent_models:
+                if gaussian_distance_latent_metadata[model] is not None:
+                    f.write(f'    - {model}: {gaussian_distance_latent_metadata[model]["gaussian_distance_latent_encoded"].sum()}\n')
         
     with open(os.path.join(opt.root, 'statistics.txt'), 'r') as f:
         print(f.read())

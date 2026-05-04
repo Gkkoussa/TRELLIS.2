@@ -70,6 +70,7 @@ class PbrVaeTrainer(BasicTrainer):
         },
         **kwargs
     ):
+        self.num_workers = num_workers
         super().__init__(*args, **kwargs)
         self.loss_type = loss_type
         self.lambda_kl = lambda_kl
@@ -77,9 +78,9 @@ class PbrVaeTrainer(BasicTrainer):
         self.lambda_lpips = lambda_lpips
         self.lambda_render = lambda_render
         self.camera_randomization_config = camera_randomization_config
-        self.num_workers = num_workers
-        
-        self.renderer = MeshRenderer({'near': 1, 'far': 3, 'resolution': render_resolution}, device=self.device)
+        self.renderer = None
+        if self.lambda_render != 0.0:
+            self.renderer = MeshRenderer({'near': 1, 'far': 3, 'resolution': render_resolution}, device=self.device)
         
     def prepare_dataloader(self, **kwargs):
         """
@@ -140,6 +141,8 @@ class PbrVaeTrainer(BasicTrainer):
                 roughness : [N x 1 x H x W] tensor of roughness.
                 alpha : [N x 1 x H x W] tensor of alpha.
         """
+        if self.renderer is None:
+            raise RuntimeError("Mesh renderer is not initialized because lambda_render == 0.0.")
         ret = {k : [] for k in ['base_color', 'metallic', 'roughness', 'alpha']}
         for i, rep in enumerate(reps):
             self.renderer.rendering_options['near'] = near[i]

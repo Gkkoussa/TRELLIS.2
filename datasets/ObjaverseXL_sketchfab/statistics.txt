@@ -1,0 +1,9 @@
+Statistics:
+  - Number of assets: 168307
+  - Number of assets downloaded: 10
+  - Number of assets with PBR dumped: 10
+  - Number of assets with asset stats: 10
+  - Number of assets with PBR voxelization:
+    - 256: 10
+  - Number of assets with edge-distance voxelization:
+    - 256: 10

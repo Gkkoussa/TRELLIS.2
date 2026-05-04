@@ -22,6 +22,12 @@ VOXEL_KINDS = {
         "count": "num_vertex_distance_voxels",
         "data_dir_key": "vertex_distance_voxel",
     },
+    "gaussian_distance": {
+        "dirname_prefix": "gaussian_distance_voxels",
+        "flag": "gaussian_distance_voxelized",
+        "count": "num_gaussian_distance_voxels",
+        "data_dir_key": "gaussian_distance_voxel",
+    },
     "pbr": {
         "dirname_prefix": "pbr_voxels",
         "flag": "pbr_voxelized",
@@ -146,12 +152,39 @@ def main() -> None:
         raise FileNotFoundError(f"Voxel directory not found: {canonical_voxel_root}")
 
     metadata = pd.read_csv(metadata_path)
+    voxel_metadata_path = canonical_voxel_root / "metadata.csv"
     if "sha256" not in metadata.columns:
         raise ValueError(f"{metadata_path} must contain a sha256 column.")
     metadata["sha256"] = metadata["sha256"].astype(str)
 
     flag_col = schema["flag"]
     count_col = schema["count"]
+    missing_voxel_cols = [col for col in (flag_col, count_col) if col not in metadata.columns]
+    if missing_voxel_cols:
+        if not voxel_metadata_path.exists():
+            raise ValueError(
+                f"{metadata_path} is missing required columns {missing_voxel_cols}, and "
+                f"{voxel_metadata_path} was not found for fallback merge."
+            )
+        voxel_metadata = pd.read_csv(voxel_metadata_path)
+        if "sha256" not in voxel_metadata.columns:
+            raise ValueError(f"{voxel_metadata_path} must contain a sha256 column.")
+        voxel_metadata["sha256"] = voxel_metadata["sha256"].astype(str)
+        merge_cols = ["sha256"] + [col for col in (flag_col, count_col) if col in voxel_metadata.columns]
+        metadata = metadata.merge(
+            voxel_metadata[merge_cols].drop_duplicates("sha256", keep="first"),
+            on="sha256",
+            how="left",
+            suffixes=("", "_voxel"),
+        )
+        for col in (flag_col, count_col):
+            alt_col = f"{col}_voxel"
+            if col not in metadata.columns and alt_col in metadata.columns:
+                metadata.rename(columns={alt_col: col}, inplace=True)
+            elif alt_col in metadata.columns:
+                metadata[col] = metadata[col].combine_first(metadata[alt_col])
+                metadata.drop(columns=[alt_col], inplace=True)
+
     if not args.allow_unvoxelized:
         if flag_col not in metadata.columns:
             raise ValueError(f"{metadata_path} is missing required column: {flag_col}")
