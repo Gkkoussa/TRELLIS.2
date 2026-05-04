@@ -9,6 +9,7 @@ This README is organized around the full end-to-end path:
 3. Gaussian-distance voxel generation
 4. train/test split creation
 5. Gaussian-distance VAE training + evaluation
+#### 6 & 7 BELOW UNTESTED
 6. shape-latent preprocessing for geometry conditioning
 7. remaining custom steps required for a shape-conditioned Gaussian-distance flow model
 

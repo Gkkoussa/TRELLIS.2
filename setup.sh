@@ -1,4 +1,6 @@
 # Read Arguments
+# SET HUGGING FACE CACHE SO HOME MEMORY DOESNT KILL YOU
+
 TEMP=`getopt -o h --long help,new-env,basic,flash-attn,cumesh,o-voxel,flexgemm,nvdiffrast,nvdiffrec -n 'setup.sh' -- "$@"`
 
 eval set -- "$TEMP"

@@ -254,7 +254,7 @@ def build_global_vertices(dump):
 
 def voxel_coords_to_centers(coords: torch.Tensor, resolution: int) -> torch.Tensor:
     coords = coords.float()
-    return coords / resolution - 0.5
+    return (coords + 0.5) / resolution - 0.5
 
 
 def point_segment_dist2(points: torch.Tensor, seg_a: torch.Tensor, seg_b: torch.Tensor) -> torch.Tensor:
