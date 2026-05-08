@@ -5,18 +5,18 @@ This folder contains helpers for converting a local tree of mesh files into TREL
 This README is organized around the full end-to-end path:
 
 1. local mesh directory
-2. mesh / PBR / dual-grid preprocessing
+2. mesh / PBR preprocessing
 3. Gaussian-distance voxel generation
 4. train/test split creation
 5. Gaussian-distance VAE training + evaluation
-#### 6 & 7 BELOW UNTESTED
-6. shape-latent preprocessing for geometry conditioning
-7. remaining custom steps required for a shape-conditioned Gaussian-distance flow model
+6. Michelangelo-latent preprocessing for geometry conditioning
+7. Gaussian-distance latent preprocessing
+8. Michelangelo-conditioned Gaussian-distance flow training
 
 The important boundary is:
 
 - Everything through the Gaussian-distance VAE is implemented in this repo.
-- The final shape-conditioned Gaussian-distance flow branch is only partially supported by the stock TRELLIS codebase and still needs a few custom files.
+- The Michelangelo-conditioned Gaussian-distance flow training path is also implemented, using precomputed Michelangelo latents as conditioning and precomputed Gaussian-distance VAE latents as the flow target.
 
 ## Expected Root Layout
 
@@ -37,15 +37,25 @@ After preprocessing, the layout should grow to something like:
   pbr_dumps/
   dual_grid_256/
   gaussian_distance_voxels_256/
-  shape_latents/
-    shape_enc_next_dc_f16c32_fp16_256/
+  michelangelo_latents/
+    shapevae256_pretrained/
+  gaussian_distance_latents/
+    gaussian_distance_vae_step0350000_256/
   splits/
     train/
       metadata.csv
       gaussian_distance_voxels_256/
+      michelangelo_latents/
+        shapevae256_pretrained/
+      gaussian_distance_latents/
+        gaussian_distance_vae_step0350000_256/
     test/
       metadata.csv
       gaussian_distance_voxels_256/
+      michelangelo_latents/
+        shapevae256_pretrained/
+      gaussian_distance_latents/
+        gaussian_distance_vae_step0350000_256/
   outputs/
 ```
 
@@ -184,9 +194,10 @@ print("pickle_files:", len([f for f in os.listdir(stage) if f.endswith(".pickle"
 PY
 ```
 
-## 4. Build Dual Grids at 256
+## 4. Build Dual Grids at 256 (Optional / Legacy Shape-Latent Path)
 
-This is the geometry representation required by the repo’s shape encoder and shape VAE tooling.
+This stage is only required if you also want the repo’s legacy sparse shape-latent path (`encode_shape_latent.py`).  
+It is not required for the Michelangelo latent path in this README.
 
 ```bash
 python data_toolkit/dual_grid.py ObjaverseXL \
@@ -396,8 +407,10 @@ sbatch train_gaussian_distance_vae.sh
 That script writes to:
 
 ```text
-$ROOT/outputs/gaussian_distance_vae_<SLURM_JOB_ID>
+$ROOT/outputs/gaussian_distance_vae
 ```
+
+To run multiple independent VAE runs, override `RUN_NAME` manually when submitting the job.
 
 If you want to run it directly:
 
@@ -427,21 +440,21 @@ Important note:
 
 ## 9. Evaluate the Gaussian-Distance VAE on the Test Split
 
-Use the 1-GPU Slurm eval script:
+Use the 1-GPU Slurm eval script. The script defaults to `train`, so set `EVAL_SPLIT=test` for held-out evaluation:
 
 ```bash
-sbatch eval_gaussian_distance_vae.sh \
-  "$ROOT/outputs/gaussian_distance_vae_<TRAIN_JOB_ID>"
+EVAL_SPLIT=test sbatch eval_gaussian_distance_vae.sh \
+  "$ROOT/outputs/gaussian_distance_vae"
 ```
 
 Or run directly:
 
 ```bash
 python eval_pbr_vae.py \
-  --run_dir "$ROOT/outputs/gaussian_distance_vae_<TRAIN_JOB_ID>" \
+  --run_dir "$ROOT/outputs/gaussian_distance_vae" \
   --root "$ROOT" \
   --split test \
-  --num_samples 4 \
+  --num_samples 64 \
   --snapshot_batch_size 4 \
   --deterministic_posterior
 ```
@@ -469,18 +482,29 @@ The key metrics are:
 
 At this point, the Gaussian-distance VAE branch is fully trained and evaluated.
 
-## 10. Encode Shape Latents at 256
+## 10. Encode Michelangelo Latents at 256
 
-This is the geometry-conditioning side needed for a shape-conditioned distance model.
+This is the geometry-conditioning side needed for a pointcloud-conditioned distance model.
 
-Use the repo’s pretrained shape encoder, run at `256`:
+Encode with the pretrained Michelangelo shape model. This writes all latent `.npz` files into the canonical latent root:
+
+```text
+$ROOT/michelangelo_latents/shapevae256_pretrained/
+```
+
+Train/test separation is handled later by `make_latent_split_views.py`, using the existing split `instances.txt` files.
 
 ```bash
-python data_toolkit/encode_shape_latent.py \
+python data_toolkit/encode_michelangelo_latent.py \
   --root "$ROOT" \
-  --dual_grid_root "$ROOT" \
-  --shape_latent_root "$ROOT" \
-  --resolution 256
+  --mesh_dump_root "$ROOT" \
+  --michelangelo_latent_root "$ROOT" \
+  --ckpt_path "$MICHELANGELO_CKPT" \
+  --latent_name shapevae256_pretrained \
+  --batch_size 16 \
+  --max_workers 4 \
+  --saver_workers 4 \
+  --coordinate_scale 2.0
 ```
 
 Merge stage metadata:
@@ -488,8 +512,7 @@ Merge stage metadata:
 ```bash
 python data_toolkit/build_metadata.py ObjaverseXL \
   --root "$ROOT" \
-  --dual_grid_root "$ROOT" \
-  --shape_latent_root "$ROOT"
+  --michelangelo_latent_root "$ROOT"
 ```
 
 ### Validate
@@ -498,9 +521,9 @@ python data_toolkit/build_metadata.py ObjaverseXL \
 python - <<'PY'
 import os, pandas as pd
 root = os.environ["ROOT"]
-stage = os.path.join(root, "shape_latents", "shape_enc_next_dc_f16c32_fp16_256")
+stage = os.path.join(root, "michelangelo_latents", "shapevae256_pretrained")
 df = pd.read_csv(os.path.join(stage, "metadata.csv"))
-print("shape_latent_encoded:", int(df["shape_latent_encoded"].sum()))
+print("michelangelo_latent_encoded:", int(df["michelangelo_latent_encoded"].sum()))
 print("npz_files:", len([f for f in os.listdir(stage) if f.endswith(".npz")]))
 PY
 ```
@@ -511,25 +534,26 @@ Inspect one latent:
 python - <<'PY'
 import os, numpy as np, pandas as pd
 root = os.environ["ROOT"]
-stage = os.path.join(root, "shape_latents", "shape_enc_next_dc_f16c32_fp16_256")
+stage = os.path.join(root, "michelangelo_latents", "shapevae256_pretrained")
 df = pd.read_csv(os.path.join(stage, "metadata.csv"))
-sha = df[df["shape_latent_encoded"] == True].iloc[0]["sha256"]
+sha = df[df["michelangelo_latent_encoded"] == True].iloc[0]["sha256"]
 z = np.load(os.path.join(stage, f"{sha}.npz"))
 print("sha:", sha)
-print("coords:", z["coords"].shape, z["coords"].dtype)
 print("feats:", z["feats"].shape, z["feats"].dtype)
 PY
 ```
 
 You should see:
 
-- `coords`
 - `feats`
-- latent feature width typically `32`
+- token count typically `256`
+- latent feature width typically `64`
+
+`--coordinate_scale 2.0` is intentional: TRELLIS mesh dumps are roughly in `[-0.5, 0.5]`, while Michelangelo training normalizes pointcloud coordinates to approximately `[-1, 1]`.
 
 ## 11. Encode Gaussian-Distance Latents
 
-This is the latent representation that the future shape-conditioned flow model will predict.
+This is the latent representation that the Michelangelo-conditioned flow model predicts.
 
 The script mirrors `encode_pbr_latent.py`, but reads:
 
@@ -546,7 +570,13 @@ If you are using your own trained Gaussian-distance VAE encoder, you should pass
 
 `--ckpt` is required when `--enc_model` is used.
 
-Example using a trained run:
+Example using a trained run. This writes all latent `.npz` files into the canonical latent root:
+
+```text
+$ROOT/gaussian_distance_latents/<GAUSSIAN_DISTANCE_LATENT_NAME>/
+```
+
+Train/test separation is handled later by `make_latent_split_views.py`, using the existing split `instances.txt` files.
 
 ```bash
 python data_toolkit/encode_gaussian_distance_latent.py \
@@ -555,37 +585,17 @@ python data_toolkit/encode_gaussian_distance_latent.py \
   --gaussian_distance_latent_root "$ROOT" \
   --resolution 256 \
   --model_root "$ROOT/outputs" \
-  --enc_model gaussian_distance_vae_<TRAIN_JOB_ID> \
-  --ckpt <STEP>
+  --enc_model gaussian_distance_vae \
+  --ckpt step0350000 \
+  --loader_workers 4 \
+  --read_threads 1 \
+  --saver_workers 4
 ```
 
-To preserve the exact same split membership used for VAE training, encode latents with the existing split instance files rather than creating a new split:
+The encoder writes both:
 
-```bash
-python data_toolkit/encode_gaussian_distance_latent.py \
-  --root "$ROOT" \
-  --gaussian_distance_voxel_root "$ROOT" \
-  --gaussian_distance_latent_root "$ROOT" \
-  --resolution 256 \
-  --model_root "$ROOT/outputs" \
-  --enc_model gaussian_distance_vae_<TRAIN_JOB_ID> \
-  --ckpt <STEP> \
-  --instances "$ROOT/splits/train/instances.txt"
-```
-
-and separately:
-
-```bash
-python data_toolkit/encode_gaussian_distance_latent.py \
-  --root "$ROOT" \
-  --gaussian_distance_voxel_root "$ROOT" \
-  --gaussian_distance_latent_root "$ROOT" \
-  --resolution 256 \
-  --model_root "$ROOT/outputs" \
-  --enc_model gaussian_distance_vae_<TRAIN_JOB_ID> \
-  --ckpt <STEP> \
-  --instances "$ROOT/splits/test/instances.txt"
-```
+- `<sha>.npz`, containing sparse latent `coords` and `feats`
+- `<sha>.cache.pt`, containing the VAE spatial cache needed for decoder-backed flow snapshots
 
 ### Validate
 
@@ -624,26 +634,34 @@ print("finite:", np.isfinite(z["coords"]).all(), np.isfinite(z["feats"]).all())
 PY
 ```
 
+Check that cache sidecars exist too:
+
+```bash
+find "$ROOT/gaussian_distance_latents/gaussian_distance_vae_step0350000_256" \
+  -name '*.cache.pt' | head
+```
+
 ## 12. Create Split-Specific Latent Views
 
 Use the existing split instance files to create split-local latent roots without changing split membership.
+This is the step that makes train/test latent paths explicit, because the encoders write canonical latent roots by default.
 
 First make sure latent-stage metadata has been merged:
 
 ```bash
 python data_toolkit/build_metadata.py ObjaverseXL \
   --root "$ROOT" \
-  --shape_latent_root "$ROOT" \
+  --michelangelo_latent_root "$ROOT" \
   --gaussian_distance_latent_root "$ROOT"
 ```
 
-Then create shape-latent split views:
+Then create Michelangelo-latent split views:
 
 ```bash
 python data_toolkit/dataset_to_trellis/make_latent_split_views.py \
   --root "$ROOT" \
-  --latent-kind shape_latent \
-  --latent-name shape_enc_next_dc_f16c32_fp16_256 \
+  --latent-kind michelangelo_latent \
+  --latent-name shapevae256_pretrained \
   --overwrite-metadata \
   --overwrite-links
 ```
@@ -654,52 +672,50 @@ Then create Gaussian-distance latent split views:
 python data_toolkit/dataset_to_trellis/make_latent_split_views.py \
   --root "$ROOT" \
   --latent-kind gaussian_distance_latent \
-  --latent-name <GAUSSIAN_DISTANCE_LATENT_NAME> \
+  --latent-name gaussian_distance_vae_step0350000_256 \
   --overwrite-metadata \
   --overwrite-links
 ```
+
+For Gaussian-distance latents, this also links the `.cache.pt` sidecars when they exist.
 
 ### Validate
 
 Check for:
 
 ```text
-$ROOT/splits/train/shape_latents/<name>/metadata.csv
-$ROOT/splits/test/shape_latents/<name>/metadata.csv
+$ROOT/splits/train/michelangelo_latents/<name>/metadata.csv
+$ROOT/splits/test/michelangelo_latents/<name>/metadata.csv
 $ROOT/splits/train/gaussian_distance_latents/<name>/metadata.csv
 $ROOT/splits/test/gaussian_distance_latents/<name>/metadata.csv
 ```
 
-## 13. Compute Latent Normalization Statistics
-
-The original latent-flow pipeline uses normalization stats in the dataset config and in the inference pipeline. For this branch, compute them from the **train split only**.
-
-Shape latent stats:
+Also check the Gaussian-distance cache sidecars in the split-local view:
 
 ```bash
-python data_toolkit/compute_latent_normalization.py \
-  --latent-root "$ROOT/splits/train/shape_latents/shape_enc_next_dc_f16c32_fp16_256" \
-  --latent-kind shape_latent
+find "$ROOT/splits/train/gaussian_distance_latents/gaussian_distance_vae_step0350000_256" \
+  -name '*.cache.pt' | head
 ```
+
+## 13. Compute Latent Normalization Statistics
+
+The flow dataset normalizes the Gaussian-distance target latents. Compute these stats from the **train split only**.
 
 Gaussian-distance latent stats:
 
 ```bash
 python data_toolkit/compute_latent_normalization.py \
-  --latent-root "$ROOT/splits/train/gaussian_distance_latents/<GAUSSIAN_DISTANCE_LATENT_NAME>" \
+  --latent-root "$ROOT/splits/train/gaussian_distance_latents/gaussian_distance_vae_step0350000_256" \
   --latent-kind gaussian_distance_latent
 ```
 
-Each command writes:
+This command writes:
 
 ```text
 <latent-root>/normalization.json
 ```
 
-These JSON files should be copied into the future flow config as:
-
-- `shape_slat_normalization`
-- `gaussian_distance_slat_normalization` or equivalent dataset arg naming
+You do not need to paste the stats into the flow config. `MichelangeloConditionedGaussianDistanceSLat` auto-loads `normalization.json` from each `gaussian_distance_latent` root in `data_dir` and raises an error if it is missing.
 
 ### Validate
 
@@ -710,45 +726,50 @@ Inspect the JSON and confirm:
 - `mean` and `std` have the expected latent channel length
 - no `std` entries are zero or NaN
 
-## 14. What Is Still Missing for the Shape-Conditioned Gaussian-Distance Flow
+## 14. Train the Michelangelo-Conditioned Gaussian-Distance Flow
 
-The repo supports the overall pattern, but your exact branch is not fully implemented yet.
+The training path is implemented with:
 
-The remaining custom pieces are:
+- dataset: `trellis2/datasets/structured_latent_gaussian_distance.py`
+- config: `configs/gen/slat_flow_michelangelo2gaussian_distance_dit_1_3B_256_bf16.json`
+- Slurm script: `train_michelangelo2gaussian_distance_flow.sh`
 
-1. `trellis2/datasets/structured_latent_gaussian_distance.py`
-   - analogous to `structured_latent_svpbr.py`
-   - target:
-     - `gaussian_distance_latent`
-   - condition:
-      - `shape_latent`
-   - should support:
-     - latent normalization
-     - coord equality assertion
-     - decoder-backed visualization for snapshots
+Run flow training with:
 
-2. a flow config such as:
-   - `configs/gen/slat_flow_shape2gaussian_distance_dit_1_3B_256_bf16.json`
-   - should include:
-     - shape latent normalization
-     - Gaussian-distance latent normalization
-     - non-image conditioning
+```bash
+sbatch train_michelangelo2gaussian_distance_flow.sh
+```
 
-3. flow-specific eval / inference glue
-   - sampling path from `shape_latent` to `gaussian_distance_latent`
-   - decoding that latent with the Gaussian-distance decoder
+The script writes to:
 
-4. optional CFG support for sparse shape conditioning
-   - the stock CFG path only drops dense `cond`
-   - it does not directly handle sparse `concat_cond`
-   - start without CFG unless you plan to extend that logic
+```text
+$ROOT/outputs/michelangelo2gaussian_distance_flow_<SLURM_JOB_ID>
+```
+
+To reuse or resume a specific output directory, pass the same `RUN_NAME`:
+
+```bash
+RUN_NAME=michelangelo2gaussian_distance_flow sbatch train_michelangelo2gaussian_distance_flow.sh
+```
+
+Resume only works after a checkpoint exists in:
+
+```text
+$ROOT/outputs/<RUN_NAME>/ckpts/
+```
+
+The current flow config saves every `10000` steps.
+
+Flow snapshots decode generated Gaussian-distance latents through the trained Gaussian-distance VAE decoder. That snapshot path depends on the `.cache.pt` sidecars created by `encode_gaussian_distance_latent.py` and linked into the split view by `make_latent_split_views.py`.
+
+What is still not implemented is a separate standalone flow evaluation/inference script for arbitrary new point clouds. Training-time snapshots are implemented.
 
 ## 15. Target End State for the Flow Model
 
 The intended final model is:
 
 ```text
-shape_latent -> gaussian_distance_latent -> gaussian_distance_decoder -> 6-channel distance voxels
+michelangelo_latent -> gaussian_distance_latent -> gaussian_distance_decoder -> 6-channel distance voxels
 ```
 
 That is the shape-conditioned analogue of the repo’s stock texturing branch:
@@ -760,7 +781,7 @@ shape_latent -> pbr_latent -> pbr_decoder
 For your branch:
 
 - target latent = Gaussian-distance latent
-- conditioning latent = shape latent
+- conditioning latent = Michelangelo latent
 - decoder = your trained Gaussian-distance VAE decoder
 
 ## Notes and Compatibility Constraints
@@ -768,7 +789,7 @@ For your branch:
 - This workflow uses `ObjaverseXL` only as the TRELLIS dataset adapter. It does not download Objaverse assets when `metadata.csv` already exists and `local_path` points at local files.
 - OBJ sidecar files such as `.mtl` files and textures should remain next to the OBJ paths referenced in `metadata.csv`.
 - The Gaussian-distance voxelizer currently expects the `pbr_dump` representation as its standardized mesh input.
-- The shape encoder currently expects `dual_grid_256/`.
+- Michelangelo encoding uses `mesh_dumps/` plus sampled pointclouds, not `dual_grid_256/`.
 - The Gaussian-distance latent encoder currently expects either:
   - `--enc_pretrained`, or
   - `--enc_model` together with `--ckpt`
@@ -781,10 +802,7 @@ For your branch:
   - evaluation
   - inference
 - The stock latent-flow path uses normalization for both the target latent and the conditioning latent.
-- The sparse latent flow model requires both:
-  - a dense `cond`
-  - and optionally a sparse `concat_cond`
-  For this branch, `shape_latent` should not only be concatenated sparsely; you also need a dense conditioning representation derived from it.
+- For this branch, only the Gaussian-distance target latent is normalized; Michelangelo latents are used directly as the dense `cond` path.
 - `build_metadata.py` updates stage-local `metadata.csv` files and `statistics.txt`, but it does not reliably propagate every stage column back into root `metadata.csv`. Validate stages using the stage directory’s own `metadata.csv`.
 - The 6-channel Gaussian-distance VAE intentionally uses `lambda_render = 0.0`. The stock render path assumes standard PBR semantics and is not appropriate for arbitrary distance channels.
 - For large datasets, use `--rank` and `--world_size` for:
@@ -792,5 +810,5 @@ For your branch:
   - `dump_pbr.py`
   - `dual_grid.py`
   - `voxelize_gaussian_distance.py`
-  - `encode_shape_latent.py`
+  - `encode_michelangelo_latent.py`
 - If you interrupt voxelization and rerun, the Gaussian-distance script resumes by skipping existing compatible `.vxz` files.

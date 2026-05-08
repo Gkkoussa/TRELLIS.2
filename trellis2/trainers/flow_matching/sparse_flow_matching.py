@@ -51,7 +51,16 @@ class SparseFlowMatchingTrainer(FlowMatchingTrainer):
 
         t_schedule (dict): Time schedule for flow matching.
         sigma_min (float): Minimum noise level.
+        num_workers (int): Number of dataloader workers per process.
     """
+    def __init__(
+        self,
+        *args,
+        num_workers: int = None,
+        **kwargs,
+    ):
+        self.num_workers = num_workers
+        super().__init__(*args, **kwargs)
     
     def prepare_dataloader(self, **kwargs):
         """
@@ -65,7 +74,7 @@ class SparseFlowMatchingTrainer(FlowMatchingTrainer):
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size_per_gpu,
-            num_workers=int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
+            num_workers=self.num_workers if self.num_workers is not None else int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,

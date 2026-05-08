@@ -23,6 +23,15 @@ LATENT_KINDS = {
         "count": "gaussian_distance_latent_tokens",
         "data_dir_key": "gaussian_distance_latent",
         "suffix": ".npz",
+        "sidecar_suffixes": [".cache.pt"],
+    },
+    "michelangelo_latent": {
+        "dirname_prefix": "michelangelo_latents",
+        "flag": "michelangelo_latent_encoded",
+        "count": "michelangelo_latent_tokens",
+        "data_dir_key": "michelangelo_latent",
+        "suffix": ".npz",
+        "sidecar_suffixes": [],
     },
 }
 
@@ -184,13 +193,19 @@ def main() -> None:
         write_text_lines(split_latent_root / "instances.txt", split_meta["sha256"].tolist())
 
         linked = 0
+        sidecars = 0
         for sha256 in split_meta["sha256"]:
             src = canonical_latent_root / f"{sha256}{schema['suffix']}"
             dst = split_latent_root / f"{sha256}{schema['suffix']}"
             linked += int(place_file(src, dst, args.link_mode, args.overwrite_links))
+            for suffix in schema.get("sidecar_suffixes", []):
+                src = canonical_latent_root / f"{sha256}{suffix}"
+                dst = split_latent_root / f"{sha256}{suffix}"
+                if src.exists():
+                    sidecars += int(place_file(src, dst, args.link_mode, args.overwrite_links))
 
         print(
-            f"{split_dir.name}: {len(split_meta)} rows, {linked} latent references, "
+            f"{split_dir.name}: {len(split_meta)} rows, {linked} latent references, {sidecars} sidecar references, "
             f"data_dir key '{schema['data_dir_key']}' -> {split_latent_root}"
         )
 

@@ -80,6 +80,8 @@ if __name__ == '__main__':
                         help='Directory to save the pbr latent files')
     parser.add_argument('--gaussian_distance_latent_root', type=str, default=None,
                         help='Directory to save the gaussian distance latent files')
+    parser.add_argument('--michelangelo_latent_root', type=str, default=None,
+                        help='Directory to save the Michelangelo latent files')
     parser.add_argument('--field', type=str, default='all',
                         help='Fields to process, separated by commas')
     parser.add_argument('--from_file', action='store_true',
@@ -107,6 +109,7 @@ if __name__ == '__main__':
     opt.shape_latent_root = opt.shape_latent_root or opt.root
     opt.pbr_latent_root = opt.pbr_latent_root or opt.root
     opt.gaussian_distance_latent_root = opt.gaussian_distance_latent_root or opt.root
+    opt.michelangelo_latent_root = opt.michelangelo_latent_root or opt.root
 
     os.makedirs(opt.root, exist_ok=True)
 
@@ -224,6 +227,17 @@ if __name__ == '__main__':
             opt,
         )
 
+    # merge Michelangelo latents
+    michelangelo_latent_models = []
+    if os.path.exists(os.path.join(opt.michelangelo_latent_root, 'michelangelo_latents')):
+        michelangelo_latent_models = os.listdir(os.path.join(opt.michelangelo_latent_root, 'michelangelo_latents'))
+    michelangelo_latent_metadata = {}
+    for model in michelangelo_latent_models:
+        michelangelo_latent_metadata[model] = update_metadata(
+            os.path.join(opt.michelangelo_latent_root, f'michelangelo_latents/{model}'),
+            opt,
+        )
+
     # statistics
     num_downloaded = downloaded_metadata['local_path'].count() if downloaded_metadata is not None else 0
     with open(os.path.join(opt.root, 'statistics.txt'), 'w') as f:
@@ -287,6 +301,11 @@ if __name__ == '__main__':
             for model in gaussian_distance_latent_models:
                 if gaussian_distance_latent_metadata[model] is not None:
                     f.write(f'    - {model}: {gaussian_distance_latent_metadata[model]["gaussian_distance_latent_encoded"].sum()}\n')
+        if len(michelangelo_latent_models) != 0:
+            f.write(f'  - Number of assets with Michelangelo latents:\n')
+            for model in michelangelo_latent_models:
+                if michelangelo_latent_metadata[model] is not None:
+                    f.write(f'    - {model}: {michelangelo_latent_metadata[model]["michelangelo_latent_encoded"].sum()}\n')
         
     with open(os.path.join(opt.root, 'statistics.txt'), 'r') as f:
         print(f.read())

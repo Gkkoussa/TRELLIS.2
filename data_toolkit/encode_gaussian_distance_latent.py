@@ -3,6 +3,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import json
 import argparse
+import time
 import torch
 import numpy as np
 import pandas as pd
@@ -10,7 +11,7 @@ import o_voxel
 from tqdm import tqdm
 from easydict import EasyDict as edict
 from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
+from queue import Empty, Queue
 
 import trellis2.models as models
 import trellis2.modules.sparse as sp
@@ -25,6 +26,18 @@ def is_valid_sparse_tensor(tensor):
 def clear_cuda_error():
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
+
+
+def to_cpu_cache(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: to_cpu_cache(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(to_cpu_cache(v) for v in value)
+    if isinstance(value, list):
+        return [to_cpu_cache(v) for v in value]
+    return value
 
 
 if __name__ == '__main__':
@@ -51,6 +64,18 @@ if __name__ == '__main__':
                         help='Instances to process')
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--world_size', type=int, default=1)
+    parser.add_argument('--loader_workers', type=int, default=4,
+                        help='Number of concurrent VXZ loader threads')
+    parser.add_argument('--saver_workers', type=int, default=4,
+                        help='Number of concurrent NPZ saver threads')
+    parser.add_argument('--read_threads', type=int, default=1,
+                        help='num_threads passed to o_voxel.io.read_vxz for each file')
+    parser.add_argument('--queue_size', type=int, default=16,
+                        help='Maximum number of loaded sparse tensors waiting for GPU encoding')
+    parser.add_argument('--load_timeout_s', type=float, default=300.0,
+                        help='Seconds to wait for a loaded item before printing loader status')
+    parser.add_argument('--benchmark', action='store_true',
+                        help='Print per-object read/encode/save-submit timings')
     opt = parser.parse_args()
     opt = edict(vars(opt))
     opt.gaussian_distance_voxel_root = opt.gaussian_distance_voxel_root or opt.root
@@ -89,8 +114,6 @@ if __name__ == '__main__':
         if opt.filter_low_aesthetic_score is not None:
             metadata = metadata[metadata['aesthetic_score'] >= opt.filter_low_aesthetic_score]
         metadata = metadata[metadata['gaussian_distance_voxelized'] == True]
-        if 'gaussian_distance_latent_encoded' in metadata.columns:
-            metadata = metadata[metadata['gaussian_distance_latent_encoded'] != True]
     else:
         if os.path.exists(opt.instances):
             with open(opt.instances, 'r') as f:
@@ -108,7 +131,9 @@ if __name__ == '__main__':
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor, \
         tqdm(total=len(metadata), desc="Filtering existing objects") as pbar:
         def check_sha256(sha256):
-            if os.path.exists(os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents', latent_name, f'{sha256}.npz')):
+            latent_path = os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents', latent_name, f'{sha256}.npz')
+            cache_path = os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents', latent_name, f'{sha256}.cache.pt')
+            if os.path.exists(latent_path) and os.path.exists(cache_path):
                 coords = np.load(os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents', latent_name, f'{sha256}.npz'))['coords']
                 records.append({'sha256': sha256, 'gaussian_distance_latent_encoded': True, 'gaussian_distance_latent_tokens': coords.shape[0]})
             pbar.update()
@@ -121,37 +146,50 @@ if __name__ == '__main__':
     print(f'Processing {len(metadata)} objects...')
 
     sha256s = list(metadata['sha256'].values)
-    load_queue = Queue(maxsize=32)
-    with ThreadPoolExecutor(max_workers=32) as loader_executor, \
-         ThreadPoolExecutor(max_workers=32) as saver_executor:
+    load_queue = Queue(maxsize=opt.queue_size)
+    with ThreadPoolExecutor(max_workers=opt.loader_workers) as loader_executor, \
+         ThreadPoolExecutor(max_workers=opt.saver_workers) as saver_executor:
 
         def loader(sha256):
             try:
+                start_t = time.perf_counter()
                 attrs = ['base_color', 'emissive']
                 coords, attr = o_voxel.io.read_vxz(
                     os.path.join(opt.gaussian_distance_voxel_root, f'gaussian_distance_voxels_{opt.resolution}', f'{sha256}.vxz'),
-                    num_threads=4
+                    num_threads=opt.read_threads
                 )
                 feats = torch.concat([attr[k] for k in attrs], dim=-1) / 255.0 * 2 - 1
                 x = sp.SparseTensor(
                     feats.float(),
                     torch.cat([torch.zeros_like(coords[:, 0:1]), coords], dim=-1),
                 )
-                load_queue.put((sha256, x))
+                load_queue.put((sha256, x, time.perf_counter() - start_t))
             except Exception as e:
                 print(f"[Loader Error] {sha256}: {e}")
-                load_queue.put((sha256, None))
+                load_queue.put((sha256, None, None))
 
-        loader_executor.map(loader, sha256s)
+        loader_futures = [loader_executor.submit(loader, sha256) for sha256 in sha256s]
 
-        def saver(sha256, pack):
+        def saver(sha256, pack, cache_pack):
             save_path = os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents', latent_name, f'{sha256}.npz')
+            cache_path = os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents', latent_name, f'{sha256}.cache.pt')
             np.savez_compressed(save_path, **pack)
+            torch.save(cache_pack, cache_path)
             records.append({'sha256': sha256, 'gaussian_distance_latent_encoded': True, 'gaussian_distance_latent_tokens': pack['coords'].shape[0]})
 
         for _ in tqdm(range(len(sha256s)), desc="Extracting latents"):
             try:
-                sha256, voxels = load_queue.get()
+                while True:
+                    try:
+                        sha256, voxels, read_s = load_queue.get(timeout=opt.load_timeout_s)
+                        break
+                    except Empty:
+                        done = sum(f.done() for f in loader_futures)
+                        print(
+                            f"[Wait] No loaded VXZ after {opt.load_timeout_s:.1f}s; "
+                            f"loader futures done={done}/{len(loader_futures)} "
+                            f"queue_size={load_queue.qsize()}"
+                        )
                 if voxels is None:
                     print(f"[Skip] {sha256}: Failed to load input")
                     continue
@@ -163,19 +201,33 @@ if __name__ == '__main__':
                     print(f"[Skip] {sha256}: NaN/Inf in input")
                     continue
 
+                encode_start_t = time.perf_counter()
                 z = encoder(voxels.cuda())
                 torch.cuda.synchronize()
+                encode_s = time.perf_counter() - encode_start_t
 
                 if not torch.isfinite(z.feats).all():
                     print(f"[Skip] {sha256}: Non-finite latent in z.feats")
                     clear_cuda_error()
                     continue
 
+                save_start_t = time.perf_counter()
                 pack = {
                     'feats': z.feats.cpu().numpy().astype(np.float32),
                     'coords': z.coords[:, 1:].cpu().numpy().astype(np.uint8),
                 }
-                saver_executor.submit(saver, sha256, pack)
+                cache_pack = {
+                    'scale': z._scale,
+                    'spatial_cache': to_cpu_cache(z._spatial_cache),
+                }
+                saver_executor.submit(saver, sha256, pack, cache_pack)
+                save_submit_s = time.perf_counter() - save_start_t
+                if opt.benchmark:
+                    print(
+                        f"[Benchmark] {sha256}: voxels={num_voxels} "
+                        f"latent_tokens={pack['coords'].shape[0]} "
+                        f"read_s={read_s:.3f} encode_s={encode_s:.3f} save_submit_s={save_submit_s:.3f}"
+                    )
 
             except Exception as e:
                 print(f"[Error] {sha256} ({num_voxels} voxels): {e}")

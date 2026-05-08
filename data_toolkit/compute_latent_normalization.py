@@ -22,6 +22,11 @@ LATENT_KINDS = {
         "count": "gaussian_distance_latent_tokens",
         "suffix": ".npz",
     },
+    "michelangelo_latent": {
+        "flag": "michelangelo_latent_encoded",
+        "count": "michelangelo_latent_tokens",
+        "suffix": ".npz",
+    },
     "pbr_latent": {
         "flag": "pbr_latent_encoded",
         "count": "pbr_latent_tokens",
