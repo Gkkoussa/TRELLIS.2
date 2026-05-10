@@ -74,6 +74,12 @@ def parse_args():
         help="Batch size used by trainer.run_snapshot().",
     )
     parser.add_argument(
+        "--render_resolution",
+        type=int,
+        default=None,
+        help="Override snapshot render resolution. Defaults to the trainer config.",
+    )
+    parser.add_argument(
         "--deterministic_posterior",
         action="store_true",
         help="Use posterior mean for reconstruction instead of sampling, for more stable metrics.",
@@ -137,6 +143,8 @@ def main():
     cfg = json.load(open(config_path, "r"))
     dataset_args = copy.deepcopy(cfg["dataset"]["args"])
     trainer_args = copy.deepcopy(cfg["trainer"]["args"])
+    if args.render_resolution is not None:
+        trainer_args["render_resolution"] = args.render_resolution
 
     ckpt_step = find_ckpt_step(run_dir, args.ckpt)
     output_dir = (

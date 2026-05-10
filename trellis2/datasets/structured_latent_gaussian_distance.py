@@ -83,8 +83,9 @@ class GaussianDistanceSLatVisMixin:
             cache_paths = sample.get('gaussian_distance_slat_cache_path', None)
         voxels = self.decode_latent(z.cuda(), cache_paths=cache_paths)
 
+        render_resolution = int(self.snapshot_render_resolution)
         renderer = VoxelRenderer()
-        renderer.rendering_options.resolution = 512
+        renderer.rendering_options.resolution = render_resolution
         renderer.rendering_options.ssaa = 4
 
         # Build camera
@@ -121,12 +122,16 @@ class GaussianDistanceSLatVisMixin:
             )
             feats = (voxel.feats * 0.5 + 0.5).clamp(0, 1)
             for k in self.layout:
-                image = torch.zeros(3, 1024, 1024).cuda()
+                image = torch.zeros(3, render_resolution * 2, render_resolution * 2).cuda()
                 tile = [2, 2]
                 for j, (ext, intr) in enumerate(zip(exts, ints)):
                     attr = feats[:, self.layout[k]]
                     res = renderer.render(rep, ext, intr, colors_overwrite=attr)
-                    image[:, 512 * (j // tile[1]):512 * (j // tile[1] + 1), 512 * (j % tile[1]):512 * (j % tile[1] + 1)] = res['color']
+                    image[
+                        :,
+                        render_resolution * (j // tile[1]):render_resolution * (j // tile[1] + 1),
+                        render_resolution * (j % tile[1]):render_resolution * (j % tile[1] + 1),
+                    ] = res['color']
                 images[k].append(image)
 
         for k in self.layout:
@@ -159,6 +164,7 @@ class MichelangeloConditionedGaussianDistanceSLat(GaussianDistanceSLatVisMixin, 
         pretrained_gaussian_distance_slat_dec: Optional[str] = None,
         gaussian_distance_slat_dec_path: Optional[str] = None,
         gaussian_distance_slat_dec_ckpt: Optional[str] = None,
+        snapshot_render_resolution: int = 512,
     ):
         if gaussian_distance_slat_normalization is not None and gaussian_distance_slat_normalization_path is not None:
             raise ValueError("Provide either gaussian_distance_slat_normalization or gaussian_distance_slat_normalization_path, not both.")
@@ -168,6 +174,7 @@ class MichelangeloConditionedGaussianDistanceSLat(GaussianDistanceSLatVisMixin, 
         self.min_aesthetic_score = min_aesthetic_score
         self.max_tokens = max_tokens
         self.value_range = (0, 1)
+        self.snapshot_render_resolution = snapshot_render_resolution
         self.layout = {
             'edge': slice(0, 3),
             'vertex': slice(3, 6),

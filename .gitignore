@@ -213,7 +213,6 @@ __marimo__/
 *.vxz
 *.mp4
 *.pdf
-*.sh
 *.csv
 *.pickle
 *.pt
