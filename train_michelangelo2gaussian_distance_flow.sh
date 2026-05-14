@@ -18,8 +18,9 @@ eval "$(conda shell.bash hook)"
 conda activate trellis2
 
 export ROOT=/nfs/turbo/coe-jjparkcv-medium/koussa/neuframe
-export LATENT_NAME=gaussian_distance_vae_step0350000_256
-export MICHELANGELO_NAME=shapevae256_pretrained
+export LATENT_NAME="${LATENT_NAME:-gaussian_distance_vae_kl5e3_step0310000_256}"
+export MICHELANGELO_NAME="${MICHELANGELO_NAME:-shapevae256_pretrained}"
+export FLOW_CONFIG="${FLOW_CONFIG:-/home/koussa/scratch/TRELLIS.2/configs/gen/slat_flow_michelangelo2gaussian_distance_kl5e3_dit_1_3B_256_bf16.json}"
 export RUN_NAME="${RUN_NAME:-michelangelo2gaussian_distance_flow_${SLURM_JOB_ID}}"
 
 mkdir -p "$ROOT/outputs/$RUN_NAME"
@@ -31,7 +32,7 @@ export TRELLIS_DIST_TIMEOUT_MINUTES=${TRELLIS_DIST_TIMEOUT_MINUTES:-60}
 DATA_DIR="{\"neuframe_train\":{\"metadata\":\"$ROOT/splits/train\",\"gaussian_distance_latent\":\"$ROOT/splits/train/gaussian_distance_latents/$LATENT_NAME\",\"michelangelo_latent\":\"$ROOT/splits/train/michelangelo_latents/$MICHELANGELO_NAME\"}}"
 
 python /home/koussa/scratch/TRELLIS.2/train.py \
-  --config /home/koussa/scratch/TRELLIS.2/configs/gen/slat_flow_michelangelo2gaussian_distance_dit_1_3B_256_bf16.json \
+  --config "$FLOW_CONFIG" \
   --output_dir "$ROOT/outputs/$RUN_NAME" \
   --data_dir "$DATA_DIR" \
   --num_nodes 1 \

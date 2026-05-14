@@ -131,6 +131,8 @@ class SparseFlowMatchingTrainer(FlowMatchingTrainer):
         num_samples: int,
         batch_size: int,
         verbose: bool = False,
+        steps: int = 12,
+        guidance_strength: float = 3.0,
     ) -> Dict:
         dataloader = DataLoader(
             copy.deepcopy(self.dataset),
@@ -156,7 +158,7 @@ class SparseFlowMatchingTrainer(FlowMatchingTrainer):
                 self.models['denoiser'],
                 noise=noise,
                 **args,
-                steps=12, guidance_strength=3.0, verbose=verbose,
+                steps=steps, guidance_strength=guidance_strength, verbose=verbose,
             )
             sample.append(res.samples)
         sample = sp.sparse_cat(sample)

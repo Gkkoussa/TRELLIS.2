@@ -25,7 +25,7 @@ conda activate trellis2
 
 export ROOT=/nfs/turbo/coe-jjparkcv-medium/koussa/neuframe
 export RUN_DIR="$1"
-export EVAL_SPLIT="${EVAL_SPLIT:-train}"
+export EVAL_SPLIT="${EVAL_SPLIT:-test}"
 export EVAL_RUN_NAME="eval_${EVAL_SPLIT}_${SLURM_JOB_ID}"
 export EVAL_RENDER_RESOLUTION="${EVAL_RENDER_RESOLUTION:-512}"
 

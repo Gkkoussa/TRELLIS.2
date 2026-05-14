@@ -18,8 +18,7 @@ eval "$(conda shell.bash hook)"
 conda activate trellis2
 
 export ROOT=/nfs/turbo/coe-jjparkcv-medium/koussa/neuframe
-# export RUN_NAME=gaussian_distance_vae_${SLURM_JOB_ID}
-export RUN_NAME=gaussian_distance_vae 
+export RUN_NAME="${RUN_NAME:-gaussian_distance_vae}"
 
 mkdir -p "$ROOT/outputs/$RUN_NAME"
 

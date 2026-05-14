@@ -95,6 +95,18 @@ def parse_args():
         help="Override flow snapshot render resolution. Defaults to the dataset config.",
     )
     parser.add_argument(
+        "--sampling_steps",
+        type=int,
+        default=12,
+        help="Number of Euler sampling steps used for visualization snapshots.",
+    )
+    parser.add_argument(
+        "--guidance_strength",
+        type=float,
+        default=3.0,
+        help="Classifier-free guidance strength used for visualization snapshots.",
+    )
+    parser.add_argument(
         "--ema_rate",
         type=str,
         default=None,
@@ -320,6 +332,8 @@ def main():
             suffix=suffix,
             num_samples=args.num_samples,
             batch_size=args.snapshot_batch_size,
+            steps=args.sampling_steps,
+            guidance_strength=args.guidance_strength,
         )
         print(f"Saved visualization samples to {output_dir / 'samples' / suffix}")
 

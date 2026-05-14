@@ -32,7 +32,9 @@ export LATENT_NAME="${LATENT_NAME:-gaussian_distance_vae_step0350000_256}"
 export MICHELANGELO_NAME="${MICHELANGELO_NAME:-shapevae256_pretrained}"
 export EVAL_NUM_SAMPLES="${EVAL_NUM_SAMPLES:-64}"
 export EVAL_SNAPSHOT_BATCH_SIZE="${EVAL_SNAPSHOT_BATCH_SIZE:-4}"
-export EVAL_RENDER_RESOLUTION="${EVAL_RENDER_RESOLUTION:-1024}"
+export EVAL_RENDER_RESOLUTION="${EVAL_RENDER_RESOLUTION:-512}"
+export EVAL_SAMPLING_STEPS="${EVAL_SAMPLING_STEPS:-12}"
+export EVAL_GUIDANCE_STRENGTH="${EVAL_GUIDANCE_STRENGTH:-3.0}"
 
 EXTRA_ARGS=()
 if [ -n "${EVAL_EMA_RATE:-}" ]; then
@@ -59,4 +61,6 @@ python /home/koussa/scratch/TRELLIS.2/eval_gaussian_distance_flow.py \
   --num_samples "$EVAL_NUM_SAMPLES" \
   --snapshot_batch_size "$EVAL_SNAPSHOT_BATCH_SIZE" \
   --render_resolution "$EVAL_RENDER_RESOLUTION" \
+  --sampling_steps "$EVAL_SAMPLING_STEPS" \
+  --guidance_strength "$EVAL_GUIDANCE_STRENGTH" \
   "${EXTRA_ARGS[@]}"

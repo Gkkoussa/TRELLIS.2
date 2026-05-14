@@ -189,6 +189,8 @@ class FlowMatchingTrainer(BasicTrainer):
         num_samples: int,
         batch_size: int,
         verbose: bool = False,
+        steps: int = 50,
+        guidance_strength: float = 3.0,
     ) -> Dict:
         dataloader = DataLoader(
             copy.deepcopy(self.dataset),
@@ -216,7 +218,7 @@ class FlowMatchingTrainer(BasicTrainer):
                 self.models['denoiser'],
                 noise=noise,
                 **args,
-                steps=50, guidance_strength=3.0, verbose=verbose,
+                steps=steps, guidance_strength=guidance_strength, verbose=verbose,
             )
             sample.append(res.samples)
 

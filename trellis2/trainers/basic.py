@@ -519,7 +519,7 @@ class BasicTrainer:
             )
 
     @torch.no_grad()
-    def snapshot(self, suffix=None, num_samples=64, batch_size=4, verbose=False):
+    def snapshot(self, suffix=None, num_samples=64, batch_size=4, verbose=False, **snapshot_kwargs):
         """
         Sample images from the model.
         NOTE: This function should be called by all processes.
@@ -534,7 +534,7 @@ class BasicTrainer:
         num_samples_per_process = int(np.ceil(num_samples / self.world_size))
         amp_context = partial(torch.autocast, device_type='cuda', dtype=self.mix_precision_dtype) if self.mix_precision_mode == 'amp' else nullcontext
         with amp_context():
-            samples = self.run_snapshot(num_samples_per_process, batch_size=batch_size, verbose=verbose)
+            samples = self.run_snapshot(num_samples_per_process, batch_size=batch_size, verbose=verbose, **snapshot_kwargs)
 
         # Preprocess images
         for key in list(samples.keys()):

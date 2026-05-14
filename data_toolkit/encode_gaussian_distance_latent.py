@@ -40,6 +40,31 @@ def to_cpu_cache(value):
     return value
 
 
+def trim_decoder_spatial_cache(spatial_cache):
+    """
+    Keep only cache entries required by pred_subdiv=False decoder upsampling.
+
+    The decoder restores SparseTensor._spatial_cache from this file and uses
+    SparseChannel2Spatial, which looks for channel2spatial_* entries at each
+    scale. Shape entries are kept because they are lightweight and describe the
+    sparse grid at that scale. Expensive conv/attention/layout caches are
+    encoder-side artifacts and are not needed for decoding.
+    """
+    keep_substrings = ('channel2spatial', 'shape')
+    trimmed = {}
+    for scale_key, scale_cache in spatial_cache.items():
+        if not isinstance(scale_cache, dict):
+            continue
+        kept_scale_cache = {
+            key: value
+            for key, value in scale_cache.items()
+            if any(keep in str(key) for keep in keep_substrings)
+        }
+        if kept_scale_cache:
+            trimmed[scale_key] = kept_scale_cache
+    return trimmed
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, required=True,
@@ -154,16 +179,26 @@ if __name__ == '__main__':
             try:
                 start_t = time.perf_counter()
                 attrs = ['base_color', 'emissive']
+                read_start_t = time.perf_counter()
                 coords, attr = o_voxel.io.read_vxz(
                     os.path.join(opt.gaussian_distance_voxel_root, f'gaussian_distance_voxels_{opt.resolution}', f'{sha256}.vxz'),
                     num_threads=opt.read_threads
                 )
+                read_vxz_s = time.perf_counter() - read_start_t
+                tensor_start_t = time.perf_counter()
                 feats = torch.concat([attr[k] for k in attrs], dim=-1) / 255.0 * 2 - 1
                 x = sp.SparseTensor(
                     feats.float(),
                     torch.cat([torch.zeros_like(coords[:, 0:1]), coords], dim=-1),
                 )
-                load_queue.put((sha256, x, time.perf_counter() - start_t))
+                tensor_build_s = time.perf_counter() - tensor_start_t
+                queue_put_start_t = time.perf_counter()
+                load_queue.put((sha256, x, {
+                    'load_total_s': time.perf_counter() - start_t,
+                    'read_vxz_s': read_vxz_s,
+                    'tensor_build_s': tensor_build_s,
+                    'queue_put_wait_s': time.perf_counter() - queue_put_start_t,
+                }))
             except Exception as e:
                 print(f"[Loader Error] {sha256}: {e}")
                 load_queue.put((sha256, None, None))
@@ -173,15 +208,30 @@ if __name__ == '__main__':
         def saver(sha256, pack, cache_pack):
             save_path = os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents', latent_name, f'{sha256}.npz')
             cache_path = os.path.join(opt.gaussian_distance_latent_root, 'gaussian_distance_latents', latent_name, f'{sha256}.cache.pt')
+            save_start_t = time.perf_counter()
+            npz_start_t = time.perf_counter()
             np.savez_compressed(save_path, **pack)
+            save_npz_s = time.perf_counter() - npz_start_t
+            cache_start_t = time.perf_counter()
             torch.save(cache_pack, cache_path)
+            save_cache_s = time.perf_counter() - cache_start_t
             records.append({'sha256': sha256, 'gaussian_distance_latent_encoded': True, 'gaussian_distance_latent_tokens': pack['coords'].shape[0]})
+            if opt.benchmark:
+                print(
+                    f"[Benchmark:save] {sha256}: "
+                    f"save_npz_s={save_npz_s:.3f} "
+                    f"save_cache_s={save_cache_s:.3f} "
+                    f"save_total_s={time.perf_counter() - save_start_t:.3f}",
+                    flush=True,
+                )
 
         for _ in tqdm(range(len(sha256s)), desc="Extracting latents"):
             try:
                 while True:
                     try:
-                        sha256, voxels, read_s = load_queue.get(timeout=opt.load_timeout_s)
+                        queue_get_start_t = time.perf_counter()
+                        sha256, voxels, load_timing = load_queue.get(timeout=opt.load_timeout_s)
+                        queue_get_s = time.perf_counter() - queue_get_start_t
                         break
                     except Empty:
                         done = sum(f.done() for f in loader_futures)
@@ -197,36 +247,61 @@ if __name__ == '__main__':
                 num_voxels = voxels.feats.shape[0]
 
                 # NaN/Inf
+                validate_start_t = time.perf_counter()
                 if not is_valid_sparse_tensor(voxels):
                     print(f"[Skip] {sha256}: NaN/Inf in input")
                     continue
+                validate_s = time.perf_counter() - validate_start_t
 
+                cuda_start_t = time.perf_counter()
+                voxels_cuda = voxels.cuda()
+                torch.cuda.synchronize()
+                cuda_transfer_s = time.perf_counter() - cuda_start_t
                 encode_start_t = time.perf_counter()
-                z = encoder(voxels.cuda())
+                z = encoder(voxels_cuda)
                 torch.cuda.synchronize()
                 encode_s = time.perf_counter() - encode_start_t
 
+                finite_start_t = time.perf_counter()
                 if not torch.isfinite(z.feats).all():
                     print(f"[Skip] {sha256}: Non-finite latent in z.feats")
                     clear_cuda_error()
                     continue
+                finite_check_s = time.perf_counter() - finite_start_t
 
-                save_start_t = time.perf_counter()
+                pack_start_t = time.perf_counter()
                 pack = {
                     'feats': z.feats.cpu().numpy().astype(np.float32),
                     'coords': z.coords[:, 1:].cpu().numpy().astype(np.uint8),
                 }
+                pack_s = time.perf_counter() - pack_start_t
+                cache_pack_start_t = time.perf_counter()
                 cache_pack = {
                     'scale': z._scale,
-                    'spatial_cache': to_cpu_cache(z._spatial_cache),
+                    'spatial_cache': to_cpu_cache(trim_decoder_spatial_cache(z._spatial_cache)),
                 }
+                cache_pack_s = time.perf_counter() - cache_pack_start_t
+                save_submit_start_t = time.perf_counter()
                 saver_executor.submit(saver, sha256, pack, cache_pack)
-                save_submit_s = time.perf_counter() - save_start_t
+                save_submit_s = time.perf_counter() - save_submit_start_t
                 if opt.benchmark:
+                    load_timing = load_timing or {}
                     print(
                         f"[Benchmark] {sha256}: voxels={num_voxels} "
                         f"latent_tokens={pack['coords'].shape[0]} "
-                        f"read_s={read_s:.3f} encode_s={encode_s:.3f} save_submit_s={save_submit_s:.3f}"
+                        f"queue_get_s={queue_get_s:.3f} "
+                        f"load_total_s={load_timing.get('load_total_s', float('nan')):.3f} "
+                        f"read_vxz_s={load_timing.get('read_vxz_s', float('nan')):.3f} "
+                        f"tensor_build_s={load_timing.get('tensor_build_s', float('nan')):.3f} "
+                        f"queue_put_wait_s={load_timing.get('queue_put_wait_s', float('nan')):.3f} "
+                        f"validate_s={validate_s:.3f} "
+                        f"cuda_transfer_s={cuda_transfer_s:.3f} "
+                        f"encode_s={encode_s:.3f} "
+                        f"finite_check_s={finite_check_s:.3f} "
+                        f"pack_s={pack_s:.3f} "
+                        f"cache_pack_s={cache_pack_s:.3f} "
+                        f"save_submit_s={save_submit_s:.3f}",
+                        flush=True,
                     )
 
             except Exception as e:
