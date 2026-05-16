@@ -37,7 +37,10 @@ class StandardDatasetBase(Dataset):
                 self._stats[key] = {}
                 metadata = pd.DataFrame(columns=['sha256']).set_index('sha256')
                 for _, r in root.items():
-                    metadata = metadata.combine_first(pd.read_csv(os.path.join(r, 'metadata.csv')).set_index('sha256'))
+                    part = pd.read_csv(os.path.join(r, 'metadata.csv')).set_index('sha256')
+                    # Later roots override overlapping non-null cells from earlier roots
+                    # (earlier pattern metadata.combine_first(part) made base rows win forever).
+                    metadata = part.combine_first(metadata)
                 self._stats[key]['Total'] = len(metadata)
                 metadata, stats = self.filter_metadata(metadata)
                 self._stats[key].update(stats)
