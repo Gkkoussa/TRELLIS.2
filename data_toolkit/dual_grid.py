@@ -34,7 +34,14 @@ def _dual_grid_mesh(file, metadatum, mesh_dump_root, root):
             # process mesh
             if need_process:
                 if data is None:
-                    with open(os.path.join(mesh_dump_root, 'mesh_dumps', f'{sha256}.pickle'), 'rb') as f:
+                    pickle_path = os.path.join(mesh_dump_root, 'mesh_dumps', f'{sha256}.pickle')
+                    if not os.path.isfile(pickle_path):
+                        raise ValueError(f'mesh pickle missing: {pickle_path}')
+                    if os.path.getsize(pickle_path) < 1:
+                        raise ValueError(
+                            f'mesh pickle is empty (0 bytes); re-run dump_mesh.py for this asset, then dual_grid: {pickle_path}'
+                        )
+                    with open(pickle_path, 'rb') as f:
                         dump = pickle.load(f)
                     start = 0
                     vertices = []

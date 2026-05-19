@@ -20,7 +20,7 @@ eval "$(conda shell.bash hook)"
 conda activate /home/gpranav/pranav_work/scratch/envs/trellis2
 
 export ROOT=/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k
-export RUN_NAME=gaussian_distance_vae
+export RUN_NAME=gaussian_distance_vae_512
 
 export RUN_DIR="${1:-$ROOT/outputs/$RUN_NAME}"
 export EVAL_SPLIT="${EVAL_SPLIT:-test}"

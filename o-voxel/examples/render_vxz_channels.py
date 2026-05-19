@@ -1,7 +1,6 @@
 import argparse
 from pathlib import Path
 
-import imageio
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -135,7 +134,7 @@ def render_file(
 
     sheet = make_contact_sheet(images, resolution)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    imageio.imwrite(output_path, sheet)
+    Image.fromarray(sheet).save(output_path)
 
 
 def collect_vxz_files(input_path: Path, max_num: int | None):

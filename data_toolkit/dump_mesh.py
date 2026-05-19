@@ -110,9 +110,19 @@ if __name__ == '__main__':
     metadata = metadata[start:end]
     records = []
 
-    # filter out objects that are already processed
-    sha256_list = os.listdir(os.path.join(opt.mesh_dump_root, 'mesh_dumps'))
-    sha256_list = [os.path.splitext(f)[0] for f in sha256_list if f.endswith('.pickle')]
+    # filter out objects that are already processed (non-empty pickles only)
+    mesh_dumps_dir = os.path.join(opt.mesh_dump_root, 'mesh_dumps')
+    sha256_list = []
+    for f in os.listdir(mesh_dumps_dir):
+        if not f.endswith('.pickle'):
+            continue
+        path = os.path.join(mesh_dumps_dir, f)
+        try:
+            if os.path.getsize(path) < 1:
+                continue
+        except OSError:
+            continue
+        sha256_list.append(os.path.splitext(f)[0])
     for sha256 in sha256_list:
         records.append({'sha256': sha256, 'mesh_dumped': True})
     print(f'Found {len(sha256_list)} dumped mesh')

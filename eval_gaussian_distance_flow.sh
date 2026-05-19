@@ -20,9 +20,9 @@ cd /home/gpranav/pranav_work/scratch/TRELLIS.2/
 mkdir -p job_logs
 
 export ROOT="/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k"
-export LATENT_NAME="${LATENT_NAME:-gaussian_distance_vae_step0230000_256}"
+export LATENT_NAME="${LATENT_NAME:-gaussian_distance_vae_512_step0220000_512}"
 export MICHELANGELO_NAME="${MICHELANGELO_NAME:-shapevae256_pretrained}"
-export RUN_NAME="${RUN_NAME:-michelangelo2gaussian_distance_flow_50023629}"
+export RUN_NAME="${RUN_NAME:-michelangelo2gaussian_distance_flow_50391241}"
 export RUN_DIR="${1:-$ROOT/outputs/$RUN_NAME}"
 
 export EVAL_SPLIT="${EVAL_SPLIT:-test}"
