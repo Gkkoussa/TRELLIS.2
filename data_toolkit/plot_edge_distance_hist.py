@@ -13,6 +13,11 @@ from tqdm import tqdm
 
 import o_voxel
 
+from voxelize_gaussian_distance import (
+    sanitize_dump_for_volumetric_convert,
+    validate_dump_for_volumetric_convert,
+)
+
 
 def apply_transform(
     distances: np.ndarray,
@@ -233,6 +238,10 @@ def main():
         with open(dump_path, 'rb') as f:
             dump = pickle.load(f)
         dump = normalize_dump(dump)
+        sanitize_dump_for_volumetric_convert(dump)
+        validation = validate_dump_for_volumetric_convert(dump)
+        if validation['errors']:
+            continue
         vertices, edges = build_global_mesh(dump)
         if vertices.numel() == 0 or edges.numel() == 0:
             continue

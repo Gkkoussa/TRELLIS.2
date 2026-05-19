@@ -69,8 +69,8 @@ else
 fi
 
 if [ "$NEW_ENV" = true ] ; then
-    conda create --prefix ~/scratch/envs/trellis2 python=3.10
-    conda activate trellis2
+    conda create --prefix ~/pranav_work/scratch/envs/trellis2 python=3.10 -y
+    conda activate ~/pranav_work/scratch/envs/trellis2
     if [ "$PLATFORM" = "cuda" ] ; then
         pip install torch==2.10 torchvision --index-url https://download.pytorch.org/whl/cu128
     elif [ "$PLATFORM" = "hip" ] ; then
@@ -136,7 +136,15 @@ if [ "$FLEXGEMM" = true ] ; then
 fi
 
 if [ "$OVOXEL" = true ] ; then
+    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     mkdir -p /tmp/extensions
-    cp -r o-voxel /tmp/extensions/o-voxel
+    if [ -d "$REPO_ROOT/.git" ]; then
+        git -C "$REPO_ROOT" submodule update --init --recursive o-voxel/third_party/eigen || true
+    fi
+    cp -r "$REPO_ROOT/o-voxel" /tmp/extensions/o-voxel
+    if [ ! -f /tmp/extensions/o-voxel/third_party/eigen/Eigen/Core ]; then
+        rm -rf /tmp/extensions/o-voxel/third_party/eigen
+        git clone --depth 1 https://gitlab.com/libeigen/eigen.git /tmp/extensions/o-voxel/third_party/eigen
+    fi
     pip install /tmp/extensions/o-voxel --no-build-isolation
 fi
