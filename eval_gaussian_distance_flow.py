@@ -4,6 +4,7 @@ import math
 import copy
 import glob
 import argparse
+import csv
 from pathlib import Path
 from contextlib import nullcontext
 
@@ -15,6 +16,7 @@ from tqdm import tqdm
 
 from trellis2 import models, datasets, trainers
 from trellis2.utils.data_utils import recursive_to_device
+from trellis2.utils.general_utils import dict_reduce
 
 
 def parse_args():
@@ -43,6 +45,12 @@ def parse_args():
         type=str,
         default=None,
         help="Optional JSON data_dir override. If omitted, --root and latent names are used.",
+    )
+    parser.add_argument(
+        "--metadata_filter_csv",
+        type=str,
+        default=None,
+        help="Optional metadata CSV whose sha256 rows define the evaluation subset.",
     )
     parser.add_argument("--root", type=str, default=None, help="Processed dataset root used when --data_dir is omitted.")
     parser.add_argument("--split", type=str, default="test", help="Split name under <root>/splits/.")
@@ -112,8 +120,47 @@ def parse_args():
         default=None,
         help="Optional EMA rate to evaluate, e.g. 0.9999. Defaults to raw denoiser checkpoint.",
     )
+    parser.add_argument(
+        "--mesh_root",
+        type=str,
+        default=None,
+        help="Root directory for metadata local_path mesh files. Defaults to <root>",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for validation timesteps/noise and snapshots.")
     return parser.parse_args()
+
+
+def apply_metadata_filter(dataset, metadata_filter_csv: str) -> dict:
+    with open(metadata_filter_csv, newline="") as f:
+        allowed_sha256 = {row["sha256"] for row in csv.DictReader(f)}
+
+    original_size = len(dataset.instances)
+    old_instances = dataset.instances
+    old_loads = getattr(dataset, "loads", None)
+
+    if old_loads is not None and len(old_loads) == len(old_instances):
+        kept = [
+            (instance, load)
+            for instance, load in zip(old_instances, old_loads)
+            if instance[1] in allowed_sha256
+        ]
+        dataset.instances = [instance for instance, _ in kept]
+        dataset.loads = [load for _, load in kept]
+    else:
+        dataset.instances = [
+            instance for instance in old_instances if instance[1] in allowed_sha256
+        ]
+
+    if hasattr(dataset, "metadata") and len(dataset.metadata) > 0:
+        keep_index = dataset.metadata.index.intersection(allowed_sha256)
+        dataset.metadata = dataset.metadata.loc[keep_index]
+
+    return {
+        "metadata_filter_csv": str(Path(metadata_filter_csv).resolve()),
+        "metadata_filter_allowed_sha256": len(allowed_sha256),
+        "metadata_filter_original_size": original_size,
+        "metadata_filter_removed": original_size - len(dataset.instances),
+    }
 
 
 def find_ckpt_step(run_dir: Path, ckpt: str) -> int:
@@ -155,6 +202,128 @@ def load_denoiser_checkpoint(model, run_dir: Path, step: int, ema_rate: str | No
     state = torch.load(path, map_location=device, weights_only=True)
     model.load_state_dict(state)
     return str(path)
+
+
+def resolve_mesh_path(sha256: str, metadata, dataset_root: Path, mesh_root: Path | None) -> Path | None:
+    """Resolve the original source mesh file from dataset metadata."""
+    if sha256 not in metadata.index:
+        return None
+
+    row = metadata.loc[sha256]
+    if hasattr(row, "ndim") and row.ndim > 1:
+        row = row.iloc[0]
+
+    local_path = row.get("local_path", None)
+    if local_path is None or (isinstance(local_path, float) and np.isnan(local_path)):
+        return None
+    local_path = str(local_path).strip()
+    if not local_path:
+        return None
+
+    mesh_root = mesh_root or (dataset_root)
+    return (mesh_root / local_path).resolve()
+
+
+def print_snapshot_grid_source_paths(
+    snapshot_data: dict,
+    num_samples: int,
+    split_root: Path,
+    dataset_root: Path,
+    metadata,
+    gaussian_distance_latent_name: str,
+    michelangelo_latent_name: str,
+    mesh_root: Path | None = None,
+):
+    """Print source asset paths for each cell in the saved snapshot grid (row-major)."""
+    cache_paths = snapshot_data.get("gaussian_distance_slat_cache_path")
+    if cache_paths is None:
+        print("Warning: snapshot batch has no gaussian_distance_slat_cache_path entries.")
+        return
+
+    if not isinstance(cache_paths, list):
+        cache_paths = [cache_paths]
+
+    nrow = int(math.sqrt(num_samples))
+    gd_latent_root = split_root / "gaussian_distance_latents" / gaussian_distance_latent_name
+    michel_root = split_root / "michelangelo_latents" / michelangelo_latent_name
+    voxel_root = split_root / "gaussian_distance_voxels_256"
+    pbr_dump_root = dataset_root / "pbr_dumps"
+
+    print(f"\nSnapshot grid source paths ({num_samples} cells, {nrow}x{nrow}, row-major):\n")
+    for idx, cache_path in enumerate(cache_paths[:num_samples]):
+        sha256 = Path(cache_path).name.removesuffix(".cache.pt")
+        row, col = idx // nrow, idx % nrow
+        mesh_path = resolve_mesh_path(sha256, metadata, dataset_root, mesh_root)
+        pbr_dump_path = pbr_dump_root / f"{sha256}.pickle"
+        print(f"  grid[{row},{col}] idx={idx:02d} sha256={sha256}")
+        if mesh_path is not None:
+            print(f"    mesh:                     {mesh_path}")
+        else:
+            print("    mesh:                     <missing local_path in metadata>")
+        if pbr_dump_path.exists():
+            print(f"    pbr_dump_mesh:            {pbr_dump_path}")
+        print(f"    gaussian_distance_latent: {gd_latent_root / f'{sha256}.npz'}")
+        print(f"    gaussian_distance_cache:  {cache_path}")
+        print(f"    michelangelo_latent:      {michel_root / f'{sha256}.npz'}")
+        print(f"    gaussian_distance_voxel:  {voxel_root / f'{sha256}.vxz'}")
+    print()
+
+
+def preload_snapshot_batch(trainer, num_samples: int) -> dict:
+    """Load the same single shuffled batch that SparseFlowMatchingTrainer.run_snapshot uses."""
+    snapshot_dataset = copy.deepcopy(trainer.dataset)
+    loader = DataLoader(
+        snapshot_dataset,
+        batch_size=num_samples,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=snapshot_dataset.collate_fn if hasattr(snapshot_dataset, "collate_fn") else None,
+    )
+    return next(iter(loader))
+
+
+def run_snapshot_with_cached_batch(trainer, snapshot_data: dict, num_samples: int, batch_size: int, **kwargs):
+    """Mirror SparseFlowMatchingTrainer.run_snapshot but reuse a preloaded batch."""
+    from trellis2.modules import sparse as sp
+    from trellis2.utils.data_utils import recursive_to_device
+
+    data = snapshot_data
+    sampler = trainer.get_sampler()
+    sample = []
+    cond_vis = []
+    steps = kwargs.get("steps", 12)
+    guidance_strength = kwargs.get("guidance_strength", 3.0)
+    verbose = kwargs.get("verbose", False)
+
+    for i in range(0, num_samples, batch_size):
+        batch_data = {k: v[i:i + batch_size] for k, v in data.items()}
+        batch_data = recursive_to_device(batch_data, "cuda")
+        noise = batch_data["x_0"].replace(torch.randn_like(batch_data["x_0"].feats))
+        cond_vis.append(trainer.vis_cond(**batch_data))
+        del batch_data["x_0"]
+        args = trainer.get_inference_cond(**batch_data)
+        res = sampler.sample(
+            trainer.models["denoiser"],
+            noise=noise,
+            **args,
+            steps=steps,
+            guidance_strength=guidance_strength,
+            verbose=verbose,
+        )
+        sample.append(res.samples)
+    sample = sp.sparse_cat(sample)
+
+    sample_gt = {k: v for k, v in data.items()}
+    sample = {k: v if k != "x_0" else sample for k, v in data.items()}
+    sample_dict = {
+        "sample_gt": {"value": sample_gt, "type": "sample"},
+        "sample": {"value": sample, "type": "sample"},
+    }
+    sample_dict.update(dict_reduce(cond_vis, None, {
+        "value": lambda x: torch.cat(x, dim=0),
+        "type": lambda x: x[0],
+    }))
+    return sample_dict
 
 
 def evaluate_flow_mse(trainer, loader, max_batches: int | None = None) -> dict:
@@ -273,6 +442,20 @@ def main():
             dataset_args["gaussian_distance_slat_normalization_path"] = str(train_norm_path)
 
     dataset = getattr(datasets, cfg["dataset"]["name"])(json.dumps(data_dir), **dataset_args)
+    metadata_filter_info = None
+    if args.metadata_filter_csv is not None:
+        metadata_filter_info = apply_metadata_filter(dataset, args.metadata_filter_csv)
+        print(
+            "Applied metadata filter: "
+            f"{metadata_filter_info['metadata_filter_original_size']} -> {len(dataset)} "
+            f"instances, removed {metadata_filter_info['metadata_filter_removed']}"
+        )
+    split_root = Path(data_dir[args.split]["metadata"]).resolve()
+    if args.root is not None:
+        dataset_root = Path(args.root).resolve()
+    else:
+        dataset_root = split_root.parent.parent
+    mesh_root = Path(args.mesh_root).resolve() if args.mesh_root is not None else None
 
     model_dict = {
         name: getattr(models, model_cfg["name"])(**model_cfg["args"]).cuda()
@@ -318,6 +501,8 @@ def main():
         "dataset_size": len(dataset),
         "max_batches": args.max_batches,
     })
+    if metadata_filter_info is not None:
+        metrics.update(metadata_filter_info)
 
     metrics_path = output_dir / "metrics.json"
     with open(metrics_path, "w") as f:
@@ -328,13 +513,36 @@ def main():
 
     if args.num_samples > 0:
         suffix = f"{args.split}_step{ckpt_step:07d}"
-        trainer.snapshot(
-            suffix=suffix,
-            num_samples=args.num_samples,
-            batch_size=args.snapshot_batch_size,
-            steps=args.sampling_steps,
-            guidance_strength=args.guidance_strength,
+        snapshot_data = preload_snapshot_batch(trainer, args.num_samples)
+        print_snapshot_grid_source_paths(
+            snapshot_data,
+            args.num_samples,
+            split_root,
+            dataset_root,
+            dataset.metadata,
+            args.gaussian_distance_latent_name,
+            args.michelangelo_latent_name,
+            mesh_root=mesh_root,
         )
+
+        orig_run_snapshot = trainer.run_snapshot
+        trainer.run_snapshot = lambda num_samples, batch_size, verbose=False, **kwargs: run_snapshot_with_cached_batch(
+            trainer,
+            snapshot_data,
+            num_samples,
+            batch_size,
+            **kwargs,
+        )
+        try:
+            trainer.snapshot(
+                suffix=suffix,
+                num_samples=args.num_samples,
+                batch_size=args.snapshot_batch_size,
+                steps=args.sampling_steps,
+                guidance_strength=args.guidance_strength,
+            )
+        finally:
+            trainer.run_snapshot = orig_run_snapshot
         print(f"Saved visualization samples to {output_dir / 'samples' / suffix}")
 
 

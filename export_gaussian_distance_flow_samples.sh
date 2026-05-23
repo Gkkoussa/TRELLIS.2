@@ -2,12 +2,12 @@
 #SBATCH --job-name=trellis-gdist-flow-export
 #SBATCH --output=./job_logs/trellis-gdist-flow-export_%j.log
 #SBATCH --nodes=1
-#SBATCH --partition=gpu-rtx6000
+#SBATCH --partition=spgpu2
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=08:00:00
 #SBATCH --mem=96G
-#SBATCH --account=jjparkcv_owned2
+#SBATCH --account=jjparkcv_owned1
 #SBATCH --gres=gpu:1
 
 source ~/.bashrc
@@ -20,9 +20,9 @@ cd /home/gpranav/pranav_work/scratch/TRELLIS.2/
 mkdir -p job_logs
 
 export ROOT="${ROOT:-/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k}"
-export LATENT_NAME="${LATENT_NAME:-gaussian_distance_vae_step0230000_256}"
+export LATENT_NAME="${LATENT_NAME:-gaussian_distance_vae_512_step0220000_512}"
 export MICHELANGELO_NAME="${MICHELANGELO_NAME:-shapevae256_pretrained}"
-export RUN_NAME="${RUN_NAME:-michelangelo2gaussian_distance_flow_50023629}"
+export RUN_NAME="${RUN_NAME:-michelangelo2gaussian_distance_flow_50391241}"
 export RUN_DIR="${1:-$ROOT/outputs/$RUN_NAME}"
 
 export EXPORT_SPLIT="${EXPORT_SPLIT:-test}"
@@ -34,8 +34,12 @@ export EXPORT_SAMPLING_STEPS="${EXPORT_SAMPLING_STEPS:-12}"
 export EXPORT_GUIDANCE_STRENGTH="${EXPORT_GUIDANCE_STRENGTH:-3.0}"
 export EXPORT_RENDER_RESOLUTION="${EXPORT_RENDER_RESOLUTION:-1024}"
 export EXPORT_SEED="${EXPORT_SEED:-0}"
+export EVAL_METADATA_FILTER_CSV=/gpfs/accounts/jjparkcv_root/jjparkcv0/gpranav/TRELLIS.2/metadata_test_no_train_duplicates.csv
 
 EXTRA_ARGS=()
+if [ -n "$EVAL_METADATA_FILTER_CSV" ]; then
+  EXTRA_ARGS+=(--metadata_filter_csv "$EVAL_METADATA_FILTER_CSV")
+fi
 if [ -n "${EXPORT_EMA_RATE:-}" ]; then
   EXTRA_ARGS+=(--ema_rate "$EXPORT_EMA_RATE")
 fi

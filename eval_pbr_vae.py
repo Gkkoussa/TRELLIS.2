@@ -4,6 +4,7 @@ import math
 import copy
 import glob
 import argparse
+import csv
 from pathlib import Path
 
 import torch
@@ -41,6 +42,12 @@ def parse_args():
         type=str,
         default=None,
         help="Optional JSON data_dir override. If omitted, --root and the config dataset args are used.",
+    )
+    parser.add_argument(
+        "--metadata_filter_csv",
+        type=str,
+        default=None,
+        help="Optional metadata CSV whose sha256 rows define the evaluation subset.",
     )
     parser.add_argument(
         "--root",
@@ -86,6 +93,39 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     return parser.parse_args()
+
+
+def apply_metadata_filter(dataset, metadata_filter_csv: str) -> dict:
+    with open(metadata_filter_csv, newline="") as f:
+        allowed_sha256 = {row["sha256"] for row in csv.DictReader(f)}
+
+    original_size = len(dataset.instances)
+    old_instances = dataset.instances
+    old_loads = getattr(dataset, "loads", None)
+
+    if old_loads is not None and len(old_loads) == len(old_instances):
+        kept = [
+            (instance, load)
+            for instance, load in zip(old_instances, old_loads)
+            if instance[1] in allowed_sha256
+        ]
+        dataset.instances = [instance for instance, _ in kept]
+        dataset.loads = [load for _, load in kept]
+    else:
+        dataset.instances = [
+            instance for instance in old_instances if instance[1] in allowed_sha256
+        ]
+
+    if hasattr(dataset, "metadata") and len(dataset.metadata) > 0:
+        keep_index = dataset.metadata.index.intersection(allowed_sha256)
+        dataset.metadata = dataset.metadata.loc[keep_index]
+
+    return {
+        "metadata_filter_csv": str(Path(metadata_filter_csv).resolve()),
+        "metadata_filter_allowed_sha256": len(allowed_sha256),
+        "metadata_filter_original_size": original_size,
+        "metadata_filter_removed": original_size - len(dataset.instances),
+    }
 
 
 def find_ckpt_step(run_dir: Path, ckpt: str) -> int:
@@ -162,6 +202,14 @@ def main():
         data_dir = build_data_dir(Path(args.root).resolve(), args.split, dataset_args)
 
     dataset = getattr(datasets, cfg["dataset"]["name"])(json.dumps(data_dir), **dataset_args)
+    metadata_filter_info = None
+    if args.metadata_filter_csv is not None:
+        metadata_filter_info = apply_metadata_filter(dataset, args.metadata_filter_csv)
+        print(
+            "Applied metadata filter: "
+            f"{metadata_filter_info['metadata_filter_original_size']} -> {len(dataset)} "
+            f"instances, removed {metadata_filter_info['metadata_filter_removed']}"
+        )
 
     model_dict = {
         name: getattr(models, model_cfg["name"])(**model_cfg["args"]).cuda()
@@ -243,6 +291,8 @@ def main():
         "vertex_l1": vertex_sum / vertex_count,
         "kl": kl_sum / kl_count,
     }
+    if metadata_filter_info is not None:
+        metrics.update(metadata_filter_info)
     metrics["total"] = metrics["l1"] + lambda_kl * metrics["kl"]
 
     metrics_path = output_dir / "metrics.json"

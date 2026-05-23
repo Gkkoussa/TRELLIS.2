@@ -154,11 +154,17 @@ class SparseFlowMatchingTrainer(FlowMatchingTrainer):
             cond_vis.append(self.vis_cond(**batch_data))
             del batch_data['x_0']
             args = self.get_inference_cond(**batch_data)
+            sample_kwargs = {
+                'steps': steps,
+                'verbose': verbose,
+            }
+            if 'neg_cond' in args:
+                sample_kwargs['guidance_strength'] = guidance_strength
             res = sampler.sample(
                 self.models['denoiser'],
                 noise=noise,
                 **args,
-                steps=steps, guidance_strength=guidance_strength, verbose=verbose,
+                **sample_kwargs,
             )
             sample.append(res.samples)
         sample = sp.sparse_cat(sample)

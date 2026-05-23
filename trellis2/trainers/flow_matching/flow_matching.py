@@ -214,11 +214,17 @@ class FlowMatchingTrainer(BasicTrainer):
             cond_vis.append(self.vis_cond(**data))
             del data['x_0']
             args = self.get_inference_cond(**data)
+            sample_kwargs = {
+                'steps': steps,
+                'verbose': verbose,
+            }
+            if 'neg_cond' in args:
+                sample_kwargs['guidance_strength'] = guidance_strength
             res = sampler.sample(
                 self.models['denoiser'],
                 noise=noise,
                 **args,
-                steps=steps, guidance_strength=guidance_strength, verbose=verbose,
+                **sample_kwargs,
             )
             sample.append(res.samples)
 
