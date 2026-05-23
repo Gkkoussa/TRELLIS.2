@@ -1,5 +1,6 @@
 import argparse
 import copy
+import csv
 import glob
 import json
 import os
@@ -25,6 +26,12 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for exported samples.")
     parser.add_argument("--root", type=str, required=True, help="Processed dataset root.")
     parser.add_argument("--split", type=str, default="test", help="Dataset split under <root>/splits/.")
+    parser.add_argument(
+        "--metadata_filter_csv",
+        type=str,
+        default=None,
+        help="Optional metadata CSV whose sha256 rows define the export subset.",
+    )
     parser.add_argument("--gaussian_distance_latent_name", type=str, required=True)
     parser.add_argument("--michelangelo_latent_name", type=str, required=True)
     parser.add_argument("--num_samples", type=int, default=16)
@@ -39,6 +46,39 @@ def parse_args():
     parser.add_argument("--render_resolution", type=int, default=None)
     parser.add_argument("--save_decoded_npz", action="store_true", help="Also decode and save dense-ish voxel sparse outputs.")
     return parser.parse_args()
+
+
+def apply_metadata_filter(dataset, metadata_filter_csv: str) -> dict:
+    with open(metadata_filter_csv, newline="") as f:
+        allowed_sha256 = {row["sha256"] for row in csv.DictReader(f)}
+
+    original_size = len(dataset.instances)
+    old_instances = dataset.instances
+    old_loads = getattr(dataset, "loads", None)
+
+    if old_loads is not None and len(old_loads) == len(old_instances):
+        kept = [
+            (instance, load)
+            for instance, load in zip(old_instances, old_loads)
+            if instance[1] in allowed_sha256
+        ]
+        dataset.instances = [instance for instance, _ in kept]
+        dataset.loads = [load for _, load in kept]
+    else:
+        dataset.instances = [
+            instance for instance in old_instances if instance[1] in allowed_sha256
+        ]
+
+    if hasattr(dataset, "metadata") and len(dataset.metadata) > 0:
+        keep_index = dataset.metadata.index.intersection(allowed_sha256)
+        dataset.metadata = dataset.metadata.loc[keep_index]
+
+    return {
+        "metadata_filter_csv": str(Path(metadata_filter_csv).resolve()),
+        "metadata_filter_allowed_sha256": len(allowed_sha256),
+        "metadata_filter_original_size": original_size,
+        "metadata_filter_removed": original_size - len(dataset.instances),
+    }
 
 
 def find_ckpt_step(run_dir: Path, ckpt: str) -> int:
@@ -201,6 +241,14 @@ def main():
         args.michelangelo_latent_name,
     )
     dataset = getattr(datasets, cfg["dataset"]["name"])(json.dumps(data_dir), **dataset_args)
+    metadata_filter_info = None
+    if args.metadata_filter_csv is not None:
+        metadata_filter_info = apply_metadata_filter(dataset, args.metadata_filter_csv)
+        print(
+            "Applied metadata filter: "
+            f"{metadata_filter_info['metadata_filter_original_size']} -> {len(dataset)} "
+            f"instances, removed {metadata_filter_info['metadata_filter_removed']}"
+        )
 
     model_dict = {
         name: getattr(models, model_cfg["name"])(**model_cfg["args"]).cuda()
@@ -253,6 +301,8 @@ def main():
         "guidance_strength": args.guidance_strength,
         "samples": [],
     }
+    if metadata_filter_info is not None:
+        manifest.update(metadata_filter_info)
 
     for batch_start in range(0, len(indices), args.batch_size):
         batch_indices = indices[batch_start:batch_start + args.batch_size]

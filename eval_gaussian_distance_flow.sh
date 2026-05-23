@@ -2,12 +2,12 @@
 #SBATCH --job-name=trellis-gdist-flow-eval
 #SBATCH --output=./job_logs/trellis-gdist-flow-eval_%j.log
 #SBATCH --nodes=1
-#SBATCH --partition=gpu-rtx6000
+#SBATCH --partition=spgpu2
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=08:00:00
 #SBATCH --mem=96G
-#SBATCH --account=jjparkcv_owned2
+#SBATCH --account=jjparkcv_owned1
 #SBATCH --gres=gpu:1
 
 source ~/.bashrc
@@ -44,6 +44,9 @@ if [ -n "${EVAL_NUM_WORKERS:-}" ]; then
 fi
 if [ -n "${EVAL_MAX_BATCHES:-}" ]; then
   EXTRA_ARGS+=(--max_batches "$EVAL_MAX_BATCHES")
+fi
+if [ -n "${EVAL_METADATA_FILTER_CSV:-}" ]; then
+  EXTRA_ARGS+=(--metadata_filter_csv "$EVAL_METADATA_FILTER_CSV")
 fi
 
 python /home/gpranav/pranav_work/scratch/TRELLIS.2/eval_gaussian_distance_flow.py \

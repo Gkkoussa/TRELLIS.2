@@ -3,10 +3,8 @@ import importlib
 __attributes = {
     'FlexiDualGridDataset': 'flexi_dual_grid',
     'SparseVoxelPbrDataset':'sparse_voxel_pbr',
-    'SparseVoxelOccupancyDataset': 'sparse_voxel_occupancy',
-    'SparseVoxelTriangleFieldDataset': 'sparse_voxel_triangle_field',
-    'TriangleFieldSuperResolutionDataset': 'triangle_field_super_resolution',
-    'TriangleFieldLatentSuperResolutionDataset': 'triangle_field_super_resolution',
+    'DenseGaussianPatchDataset':'sparse_voxel_pbr',
+    'SparseGaussianPatchDataset':'sparse_voxel_pbr',
     
     'SparseStructureLatent': 'sparse_structure_latent',
     'TextConditionedSparseStructureLatent': 'sparse_structure_latent',
@@ -19,9 +17,6 @@ __attributes = {
     'SLatPbr': 'structured_latent_svpbr',
     'ImageConditionedSLatPbr': 'structured_latent_svpbr',
     'MichelangeloConditionedGaussianDistanceSLat': 'structured_latent_gaussian_distance',
-    'MichelangeloShapeConditionedGaussianDistanceSLat': 'structured_latent_gaussian_distance',
-    'MichelangeloConditionedTriangleFieldSLat': 'structured_latent_triangle_field',
-    'MichelangeloShapeConditionedTriangleFieldSLat': 'structured_latent_triangle_field',
 }
 
 __submodules = []
@@ -45,15 +40,11 @@ def __getattr__(name):
 # For Pylance
 if __name__ == '__main__':    
     from .flexi_dual_grid import FlexiDualGridDataset
-    from .sparse_voxel_pbr import SparseVoxelPbrDataset
-    from .sparse_voxel_occupancy import SparseVoxelOccupancyDataset
-    from .sparse_voxel_triangle_field import SparseVoxelTriangleFieldDataset
-    from .triangle_field_super_resolution import TriangleFieldSuperResolutionDataset, TriangleFieldLatentSuperResolutionDataset
+    from .sparse_voxel_pbr import SparseVoxelPbrDataset, DenseGaussianPatchDataset, SparseGaussianPatchDataset
     
     from .sparse_structure_latent import SparseStructureLatent, ImageConditionedSparseStructureLatent
     from .structured_latent import SLat, ImageConditionedSLat
     from .structured_latent_shape import SLatShape, ImageConditionedSLatShape
     from .structured_latent_svpbr import SLatPbr, ImageConditionedSLatPbr
-    from .structured_latent_gaussian_distance import MichelangeloConditionedGaussianDistanceSLat, MichelangeloShapeConditionedGaussianDistanceSLat
-    from .structured_latent_triangle_field import MichelangeloConditionedTriangleFieldSLat, MichelangeloShapeConditionedTriangleFieldSLat
+    from .structured_latent_gaussian_distance import MichelangeloConditionedGaussianDistanceSLat
     

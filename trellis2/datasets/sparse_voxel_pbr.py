@@ -74,6 +74,355 @@ class SparseVoxelPbrVisMixin:
         return images
 
 
+class DenseGaussianPatchDataset(StandardDatasetBase):
+    """
+    Dense 6-channel Gaussian-distance patch dataset.
+
+    Reads existing sparse .vxz Gaussian-distance voxel files, samples a local
+    dense patch, and returns it as x_0 for dense flow matching.
+    """
+
+    def __init__(
+        self,
+        roots,
+        resolution: int = 256,
+        patch_size: int = 64,
+        max_active_voxels: int = None,
+        max_num_faces: int = None,
+        min_aesthetic_score: float = 5.0,
+        attrs: list[str] = ['base_color', 'emissive'],
+        voxel_root_key: str = 'gaussian_distance_voxel',
+        voxelized_flag_column: str = 'gaussian_distance_voxelized',
+        num_voxels_column: str = 'num_gaussian_distance_voxels',
+        foreground_patch_prob: float = 0.8,
+        background_value: float = -1.0,
+        num_read_threads: int = 4,
+        cond_as_token: bool = False,
+        zero_cond: bool = False,
+        return_origin: bool = False,
+    ):
+        if patch_size > resolution:
+            raise ValueError(f"patch_size ({patch_size}) must be <= resolution ({resolution})")
+        if not 0.0 <= foreground_patch_prob <= 1.0:
+            raise ValueError("foreground_patch_prob must be in [0, 1]")
+        if max_active_voxels is not None and max_active_voxels > patch_size ** 3:
+            raise ValueError(f"max_active_voxels ({max_active_voxels}) must be <= patch_size^3 ({patch_size ** 3})")
+
+        self.resolution = resolution
+        self.patch_size = patch_size
+        self.min_aesthetic_score = min_aesthetic_score
+        self.max_active_voxels = max_active_voxels
+        self.max_num_faces = max_num_faces
+        self.voxel_root_key = voxel_root_key
+        self.voxelized_flag_column = voxelized_flag_column
+        self.num_voxels_column = num_voxels_column
+        self.foreground_patch_prob = foreground_patch_prob
+        self.background_value = background_value
+        self.num_read_threads = num_read_threads
+        self.cond_as_token = cond_as_token
+        self.zero_cond = zero_cond
+        self.return_origin = return_origin
+        self.value_range = (-1, 1)
+        self.channels = {
+            'base_color': 3,
+            'metallic': 1,
+            'roughness': 1,
+            'emissive': 3,
+            'alpha': 1,
+        }
+        self.layout = {}
+        start = 0
+        for attr in attrs:
+            if attr not in self.channels:
+                raise ValueError(f"Unsupported voxel attribute: {attr}")
+            self.layout[attr] = slice(start, start + self.channels[attr])
+            start += self.channels[attr]
+        self.num_channels = start
+
+        super().__init__(roots)
+
+        self.loads = [self.metadata.loc[sha256, self.num_voxels_column] for _, sha256 in self.instances]
+
+    def __str__(self):
+        lines = [
+            super().__str__(),
+            f'  - Resolution: {self.resolution}',
+            f'  - Patch size: {self.patch_size}',
+            f'  - Attributes: {list(self.layout.keys())}',
+            f'  - Max patch active voxels: {self.max_active_voxels}',
+            f'  - Foreground patch probability: {self.foreground_patch_prob}',
+            f'  - Background value: {self.background_value}',
+            f'  - Cond as token: {self.cond_as_token}',
+            f'  - Zero cond: {self.zero_cond}',
+            f'  - Return origin: {self.return_origin}',
+        ]
+        return '\n'.join(lines)
+
+    def filter_metadata(self, metadata):
+        stats = {}
+        metadata = metadata[metadata[self.voxelized_flag_column] == True]
+        stats[f'{self.voxelized_flag_column} == True'] = len(metadata)
+        if self.min_aesthetic_score is not None:
+            metadata = metadata[metadata['aesthetic_score'] >= self.min_aesthetic_score]
+            stats[f'Aesthetic score >= {self.min_aesthetic_score}'] = len(metadata)
+        if self.max_num_faces is not None:
+            metadata = metadata[metadata['num_faces'] <= self.max_num_faces]
+            stats[f'Faces <= {self.max_num_faces}'] = len(metadata)
+        return metadata, stats
+
+    def _sample_patch_origin(self, coords: torch.Tensor) -> torch.Tensor:
+        max_origin = self.resolution - self.patch_size
+        if coords.numel() == 0 or np.random.rand() >= self.foreground_patch_prob:
+            return torch.randint(0, max_origin + 1, (3,), dtype=torch.long)
+
+        coord = coords[torch.randint(0, coords.shape[0], (1,)).item()].long()
+        low = torch.clamp(coord - self.patch_size + 1, min=0, max=max_origin)
+        high = torch.clamp(coord, min=0, max=max_origin)
+        origin = torch.stack([
+            torch.randint(low[i].item(), high[i].item() + 1, (1,), dtype=torch.long)[0]
+            for i in range(3)
+        ])
+        return origin
+
+    def _read_gaussian_voxel(self, root, instance):
+        coords, attr = o_voxel.io.read_vxz(
+            os.path.join(root[self.voxel_root_key], f'{instance}.vxz'),
+            num_threads=self.num_read_threads,
+        )
+        feats = torch.concat([attr[k] for k in self.layout], dim=-1).float() / 255.0 * 2 - 1
+        return coords.long(), feats
+
+    def get_instance(self, root, instance):
+        coords, feats = self._read_gaussian_voxel(root, instance)
+        origin = self._sample_patch_origin(coords)
+        patch_max = origin + self.patch_size
+        mask = torch.all((coords >= origin) & (coords < patch_max), dim=1)
+
+        patch = torch.full(
+            (self.num_channels, self.patch_size, self.patch_size, self.patch_size),
+            self.background_value,
+            dtype=torch.float32,
+        )
+        if mask.any():
+            selected = mask.nonzero(as_tuple=False).flatten()
+            if self.max_active_voxels is not None and selected.numel() > self.max_active_voxels:
+                selected = selected[torch.randperm(selected.numel())[:self.max_active_voxels]]
+            local_coords = coords[selected] - origin
+            patch[
+                :,
+                local_coords[:, 0],
+                local_coords[:, 1],
+                local_coords[:, 2],
+            ] = feats[selected].t()
+
+        denom = max(self.resolution - self.patch_size, 1)
+        cond = torch.zeros(3, dtype=torch.float32) if self.zero_cond else origin.float() / denom
+        if self.cond_as_token:
+            cond = cond.unsqueeze(0)
+
+        pack = {
+            'x_0': patch,
+            'cond': cond,
+        }
+        if self.return_origin:
+            pack['patch_origin'] = origin.float()
+        return pack
+
+    @staticmethod
+    def collate_fn(batch):
+        return {
+            key: torch.stack([b[key] for b in batch])
+            for key in batch[0].keys()
+        }
+
+    @torch.no_grad()
+    def visualize_sample(self, x: Union[torch.Tensor, dict]):
+        x = x if isinstance(x, torch.Tensor) else x['x_0']
+        x = x.detach().float().cpu()
+        mid = x.shape[2] // 2
+
+        def to_rgb(channels):
+            image = x[:, channels, mid, :, :]
+            if image.shape[1] == 1:
+                image = image.expand(-1, 3, -1, -1)
+            elif image.shape[1] > 3:
+                image = image[:, :3]
+            image = (image + 1) * 0.5
+            return image.clamp(0, 1)
+
+        images = {}
+        if self.num_channels >= 3:
+            images['edge'] = to_rgb(slice(0, 3))
+        if self.num_channels >= 6:
+            images['vertex'] = to_rgb(slice(3, 6))
+        if not images:
+            images['patch'] = to_rgb(slice(0, 1))
+        return images
+
+
+class SparseGaussianPatchDataset(DenseGaussianPatchDataset):
+    """
+    Sparse 6-channel Gaussian-distance patch dataset.
+
+    Uses the active .vxz voxel coordinates inside a sampled local patch as the
+    sparse support, matching the original sparse latent flow setup: coordinates
+    are provided, and flow matching denoises only the features on those coords.
+    """
+
+    def __init__(
+        self,
+        *args,
+        min_patch_active_voxels: int = 1,
+        max_resample_attempts: int = 16,
+        **kwargs,
+    ):
+        self.min_patch_active_voxels = min_patch_active_voxels
+        self.max_resample_attempts = max_resample_attempts
+        super().__init__(*args, **kwargs)
+
+    def __str__(self):
+        lines = [
+            super().__str__(),
+            f'  - Min patch active voxels: {self.min_patch_active_voxels}',
+            f'  - Max resample attempts: {self.max_resample_attempts}',
+        ]
+        return '\n'.join(lines)
+
+    def _select_patch(self, coords: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        origin = None
+        selected = torch.empty(0, dtype=torch.long)
+        for _ in range(max(self.max_resample_attempts, 1)):
+            origin = self._sample_patch_origin(coords)
+            patch_max = origin + self.patch_size
+            mask = torch.all((coords >= origin) & (coords < patch_max), dim=1)
+            selected = mask.nonzero(as_tuple=False).flatten()
+            if selected.numel() >= self.min_patch_active_voxels:
+                break
+
+        if selected.numel() < self.min_patch_active_voxels and coords.numel() != 0:
+            old_foreground_patch_prob = self.foreground_patch_prob
+            self.foreground_patch_prob = 1.0
+            origin = self._sample_patch_origin(coords)
+            self.foreground_patch_prob = old_foreground_patch_prob
+            patch_max = origin + self.patch_size
+            mask = torch.all((coords >= origin) & (coords < patch_max), dim=1)
+            selected = mask.nonzero(as_tuple=False).flatten()
+
+        if self.max_active_voxels is not None and selected.numel() > self.max_active_voxels:
+            selected = selected[torch.randperm(selected.numel())[:self.max_active_voxels]]
+        return origin, selected
+
+    def get_instance(self, root, instance):
+        coords, feats = self._read_gaussian_voxel(root, instance)
+        origin, selected = self._select_patch(coords)
+        if origin is None:
+            origin = torch.zeros(3, dtype=torch.long)
+
+        local_coords = coords[selected] - origin if selected.numel() != 0 else torch.empty(0, 3, dtype=torch.long)
+        sparse_coords = torch.cat([
+            torch.zeros(local_coords.shape[0], 1, dtype=torch.int32),
+            local_coords.int(),
+        ], dim=1)
+        sparse_feats = feats[selected].float() if selected.numel() != 0 else torch.empty(0, self.num_channels, dtype=torch.float32)
+        x_0 = sp.SparseTensor(sparse_feats, sparse_coords)
+
+        denom = max(self.resolution - self.patch_size, 1)
+        cond = torch.zeros(3, dtype=torch.float32) if self.zero_cond else origin.float() / denom
+        if self.cond_as_token:
+            cond = cond.unsqueeze(0)
+
+        pack = {
+            'x_0': x_0,
+            'cond': cond,
+        }
+        if self.return_origin:
+            pack['patch_origin'] = origin.float()
+        return pack
+
+    @staticmethod
+    def collate_fn(batch, split_size=None):
+        if split_size is None:
+            group_idx = [list(range(len(batch)))]
+        else:
+            group_idx = load_balanced_group_indices([b['x_0'].feats.shape[0] for b in batch], split_size)
+
+        packs = []
+        for group in group_idx:
+            sub_batch = [batch[i] for i in group]
+            pack = {}
+            for key in sub_batch[0].keys():
+                if isinstance(sub_batch[0][key], torch.Tensor):
+                    pack[key] = torch.stack([b[key] for b in sub_batch])
+                elif isinstance(sub_batch[0][key], sp.SparseTensor):
+                    pack[key] = sp.sparse_cat([b[key] for b in sub_batch], dim=0)
+                elif isinstance(sub_batch[0][key], list):
+                    pack[key] = sum([b[key] for b in sub_batch], [])
+                else:
+                    pack[key] = [b[key] for b in sub_batch]
+            packs.append(pack)
+
+        if split_size is None:
+            return packs[0]
+        return packs
+
+    @torch.no_grad()
+    def visualize_sample(self, x: Union[sp.SparseTensor, dict]):
+        x = x if isinstance(x, sp.SparseTensor) else x['x_0']
+
+        renderer = VoxelRenderer()
+        renderer.rendering_options.resolution = 512
+        renderer.rendering_options.ssaa = 4
+
+        yaws = [0, np.pi / 2, np.pi, 3 * np.pi / 2]
+        yaws_offset = np.random.uniform(-np.pi / 4, np.pi / 4)
+        yaws = [y + yaws_offset for y in yaws]
+        pitch = [np.random.uniform(-np.pi / 4, np.pi / 4) for _ in range(4)]
+
+        exts = []
+        ints = []
+        for yaw, pitch_i in zip(yaws, pitch):
+            orig = torch.tensor([
+                np.sin(yaw) * np.cos(pitch_i),
+                np.cos(yaw) * np.cos(pitch_i),
+                np.sin(pitch_i),
+            ]).float().cuda() * 2
+            fov = torch.deg2rad(torch.tensor(30)).cuda()
+            extrinsics = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().cuda(), torch.tensor([0, 0, 1]).float().cuda())
+            intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
+            exts.append(extrinsics)
+            ints.append(intrinsics)
+
+        images = {k: [] for k in self.layout}
+        x = x.cuda()
+        for i in range(x.shape[0]):
+            rep = Voxel(
+                origin=[-0.5, -0.5, -0.5],
+                voxel_size=1 / self.patch_size,
+                coords=x[i].coords[:, 1:].contiguous(),
+                attrs=None,
+                layout={
+                    'color': slice(0, 3),
+                }
+            )
+            for k in self.layout:
+                image = torch.zeros(3, 1024, 1024).cuda()
+                tile = [2, 2]
+                for j, (ext, intr) in enumerate(zip(exts, ints)):
+                    attr = x[i].feats[:, self.layout[k]]
+                    if attr.shape[1] == 1:
+                        attr = attr.expand(-1, 3)
+                    elif attr.shape[1] > 3:
+                        attr = attr[:, :3]
+                    res = renderer.render(rep, ext, intr, colors_overwrite=attr)
+                    image[:, 512 * (j // tile[1]):512 * (j // tile[1] + 1), 512 * (j % tile[1]):512 * (j % tile[1] + 1)] = res['color']
+                images[k].append(image)
+
+        for k in self.layout:
+            images[k] = torch.stack(images[k])
+
+        return images
+
+
 class SparseVoxelPbrDataset(SparseVoxelPbrVisMixin, StandardDatasetBase):
     """
     Sparse Voxel PBR dataset.

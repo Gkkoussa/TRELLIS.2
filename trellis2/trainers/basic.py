@@ -82,6 +82,7 @@ class BasicTrainer:
         log_param_stats=False,
         prefetch_data=True,
         snapshot_batch_size=4,
+        skip_startup_snapshot=False,
         i_print=1000,
         i_log=500,
         i_sample=10000,
@@ -110,6 +111,7 @@ class BasicTrainer:
         self.log_param_stats = log_param_stats
         self.prefetch_data = prefetch_data
         self.snapshot_batch_size = snapshot_batch_size
+        self.skip_startup_snapshot = skip_startup_snapshot
         self.log = []
         if self.prefetch_data:
             self._data_prefetched = None
@@ -190,6 +192,7 @@ class BasicTrainer:
         if self.mix_precision_mode == 'amp' and self.mix_precision_dtype == torch.float16:
             lines.append(f'  - FP16 scale growth: {self.fp16_scale_growth}')
         lines.append(f'  - Parallel mode: {self.parallel_mode}')
+        lines.append(f'  - Skip startup snapshot: {self.skip_startup_snapshot}')
         return '\n'.join(lines)
 
     @property
@@ -550,14 +553,15 @@ class BasicTrainer:
         # Gather results
         if self.world_size > 1:
             for key in samples.keys():
-                samples[key]['value'] = samples[key]['value'].contiguous()
+                if isinstance(samples[key]['value'], torch.Tensor):
+                    samples[key]['value'] = samples[key]['value'].to(self.device).contiguous()
                 if self.is_master:
                     all_images = [torch.empty_like(samples[key]['value']) for _ in range(self.world_size)]
                 else:
                     all_images = []
                 dist.gather(samples[key]['value'], all_images, dst=0)
                 if self.is_master:
-                    samples[key]['value'] = torch.cat(all_images, dim=0)[:num_samples]
+                    samples[key]['value'] = torch.cat(all_images, dim=0)[:num_samples].cpu()
 
         # Save images
         if self.is_master:
@@ -818,11 +822,15 @@ class BasicTrainer:
         """
         if self.is_master:
             print('\nStarting training...')
-            self.snapshot_dataset(batch_size=self.snapshot_batch_size)
-        if self.step == 0:
-            self.snapshot(suffix='init', batch_size=self.snapshot_batch_size)
-        else: # resume
-            self.snapshot(suffix=f'resume_step{self.step:07d}', batch_size=self.snapshot_batch_size)
+            if self.skip_startup_snapshot:
+                print('Skipping startup snapshots.')
+            else:
+                self.snapshot_dataset(batch_size=self.snapshot_batch_size)
+        if not self.skip_startup_snapshot:
+            if self.step == 0:
+                self.snapshot(suffix='init', batch_size=self.snapshot_batch_size)
+            else: # resume
+                self.snapshot(suffix=f'resume_step{self.step:07d}', batch_size=self.snapshot_batch_size)
 
         time_last_print = 0.0
         time_elapsed = 0.0

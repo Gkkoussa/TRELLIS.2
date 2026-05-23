@@ -1,0 +1,93 @@
+{
+    "models": {
+        "denoiser": {
+            "name": "ElasticSLatFlowModel",
+            "args": {
+                "resolution": 32,
+                "in_channels": 6,
+                "out_channels": 6,
+                "model_channels": 1536,
+                "cond_channels": 3,
+                "num_blocks": 30,
+                "num_heads": 12,
+                "mlp_ratio": 5.3334,
+                "pe_mode": "rope",
+                "share_mod": true,
+                "initialization": "scaled",
+                "qk_rms_norm": true,
+                "qk_rms_norm_cross": true
+            }
+        }
+    },
+    "dataset": {
+        "name": "SparseGaussianPatchDataset",
+        "args": {
+            "resolution": 256,
+            "patch_size": 32,
+            "min_aesthetic_score": 4.5,
+            "max_active_voxels": 32768,
+            "min_patch_active_voxels": 1,
+            "max_resample_attempts": 16,
+            "max_num_faces": null,
+            "attrs": [
+                "base_color",
+                "emissive"
+            ],
+            "voxel_root_key": "gaussian_distance_voxel",
+            "voxelized_flag_column": "gaussian_distance_voxelized",
+            "num_voxels_column": "num_gaussian_distance_voxels",
+            "foreground_patch_prob": 1.0,
+            "background_value": -1.0,
+            "num_read_threads": 4,
+            "cond_as_token": true,
+            "zero_cond": true
+        }
+    },
+    "trainer": {
+        "name": "SparseFlowMatchingTrainer",
+        "args": {
+            "max_steps": 1000000,
+            "batch_size_per_gpu": 8,
+            "batch_split": 2,
+            "num_workers": 2,
+            "optimizer": {
+                "name": "AdamW",
+                "args": {
+                    "lr": 1e-4,
+                    "weight_decay": 0.01,
+                    "betas": [0.9, 0.95],
+                    "eps": 1e-8
+                }
+            },
+            "ema_rate": [
+                0.9999
+            ],
+            "mix_precision_mode": "amp",
+            "mix_precision_dtype": "bfloat16",
+            "elastic": {
+                "name": "LinearMemoryController",
+                "args": {
+                    "target_ratio": 0.75,
+                    "max_mem_ratio_start": 0.5
+                }
+            },
+            "grad_clip": {
+                "name": "AdaptiveGradClipper",
+                "args": {
+                    "max_norm": 1.0,
+                    "clip_percentile": 95
+                }
+            },
+            "i_log": 500,
+            "i_sample": 10000,
+            "i_save": 10000,
+            "t_schedule": {
+                "name": "uniform",
+                "args": {}
+            },
+            "sigma_min": 1e-5,
+            "skip_startup_snapshot": true,
+            "snapshot_batch_size": 1
+        }
+    }
+}
