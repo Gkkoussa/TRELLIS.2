@@ -59,6 +59,12 @@ def parse_args():
         help="Latent directory name under split michelangelo_latents/.",
     )
     parser.add_argument(
+        "--shape_latent_name",
+        type=str,
+        default=None,
+        help="Optional latent directory name under split shape_latents/. Required for shape-concat flow configs.",
+    )
+    parser.add_argument(
         "--batch_size",
         type=int,
         default=None,
@@ -130,9 +136,15 @@ def find_ckpt_step(run_dir: Path, ckpt: str) -> int:
     return int(ckpt)
 
 
-def build_data_dir(root: Path, split: str, gaussian_distance_latent_name: str, michelangelo_latent_name: str) -> dict:
+def build_data_dir(
+    root: Path,
+    split: str,
+    gaussian_distance_latent_name: str,
+    michelangelo_latent_name: str,
+    shape_latent_name: str | None = None,
+) -> dict:
     split_root = root / "splits" / split
-    return {
+    data_dir = {
         split: {
             "metadata": str(split_root),
             "gaussian_distance_latent": str(
@@ -143,6 +155,9 @@ def build_data_dir(root: Path, split: str, gaussian_distance_latent_name: str, m
             ),
         }
     }
+    if shape_latent_name is not None:
+        data_dir[split]["shape_latent"] = str(split_root / "shape_latents" / shape_latent_name)
+    return data_dir
 
 
 def load_denoiser_checkpoint(model, run_dir: Path, step: int, ema_rate: str | None, device: torch.device) -> str:
@@ -260,6 +275,7 @@ def main():
             args.split,
             args.gaussian_distance_latent_name,
             args.michelangelo_latent_name,
+            args.shape_latent_name,
         )
         train_norm_path = (
             root
@@ -271,6 +287,17 @@ def main():
         )
         if train_norm_path.exists():
             dataset_args["gaussian_distance_slat_normalization_path"] = str(train_norm_path)
+        if args.shape_latent_name is not None:
+            shape_train_norm_path = (
+                root
+                / "splits"
+                / "train"
+                / "shape_latents"
+                / args.shape_latent_name
+                / "normalization.json"
+            )
+            if shape_train_norm_path.exists():
+                dataset_args["shape_slat_normalization_path"] = str(shape_train_norm_path)
 
     dataset = getattr(datasets, cfg["dataset"]["name"])(json.dumps(data_dir), **dataset_args)
 

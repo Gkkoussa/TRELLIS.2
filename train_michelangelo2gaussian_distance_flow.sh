@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
+#SBATCH --time=96:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --partition=gpu-rtx6000
@@ -21,7 +21,8 @@ export ROOT=/nfs/turbo/coe-jjparkcv-medium/koussa/neuframe
 export LATENT_NAME="${LATENT_NAME:-gaussian_distance_vae_kl5e3_step0310000_256}"
 export MICHELANGELO_NAME="${MICHELANGELO_NAME:-shapevae256_pretrained}"
 export FLOW_CONFIG="${FLOW_CONFIG:-/home/koussa/scratch/TRELLIS.2/configs/gen/slat_flow_michelangelo2gaussian_distance_kl5e3_dit_1_3B_256_bf16.json}"
-export RUN_NAME="${RUN_NAME:-michelangelo2gaussian_distance_flow_${SLURM_JOB_ID}}"
+# export RUN_NAME="${RUN_NAME:-michelangelo2gaussian_distance_flow_${SLURM_JOB_ID}}"
+export RUN_NAME="${RUN_NAME:-michelangelo2gaussian_distance_flow_kl5e3}"
 
 mkdir -p "$ROOT/outputs/$RUN_NAME"
 

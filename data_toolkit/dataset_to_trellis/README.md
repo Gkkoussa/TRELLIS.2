@@ -9,9 +9,10 @@ This README is organized around the full end-to-end path:
 3. Gaussian-distance voxel generation
 4. train/test split creation
 5. Gaussian-distance VAE training + evaluation
-6. Michelangelo-latent preprocessing for geometry conditioning
-7. Gaussian-distance latent preprocessing
-8. Michelangelo-conditioned Gaussian-distance flow training
+6. optional occupancy shape-latent VAE training for TRELLIS-style subdivision conditioning
+7. Michelangelo-latent preprocessing for geometry conditioning
+8. Gaussian-distance latent preprocessing
+9. Michelangelo-conditioned Gaussian-distance flow training
 
 The important boundary is:
 
@@ -482,7 +483,117 @@ The key metrics are:
 
 At this point, the Gaussian-distance VAE branch is fully trained and evaluated.
 
-## 10. Encode Michelangelo Latents at 256
+## 10. Optional: Train an Occupancy Shape-Latent VAE
+
+This is the simplified shape-latent path for later TRELLIS-style conditioning.
+
+Purpose:
+
+- Train a sparse shape latent whose decoder learns subdivision / upsampling coordinates.
+- Use constant occupancy features rather than full mesh/surface reconstruction targets.
+- Eventually use these shape latents as `concat_cond` for Gaussian-distance flow, and use the shape decoder's `return_subs=True` output as `guide_subs` for the Gaussian-distance decoder.
+
+This is **not** the stock TRELLIS2 `ShapeVaeTrainer` setup. The stock setup uses FlexiDualGrid inputs, mesh reconstruction, render losses, vertex losses, and intersected-voxel losses. This simplified setup uses:
+
+- existing sparse voxel coordinates from `gaussian_distance_voxels_256`
+- one feature channel with value `1.0` at every active voxel
+- `SparseUnetVaeEncoder`
+- `SparseUnetVaeDecoder` with `pred_subdiv=true`
+- subdivision BCE loss plus KL loss
+
+Run training:
+
+```bash
+sbatch train_occupancy_shape_vae.sh
+```
+
+That script writes to:
+
+```text
+$ROOT/outputs/occupancy_shape_vae
+```
+
+To run a separate experiment:
+
+```bash
+RUN_NAME=occupancy_shape_vae_test1 sbatch train_occupancy_shape_vae.sh
+```
+
+### Validate
+
+During training, inspect:
+
+- `log.txt`
+- `tb_logs/`
+- `samples/`
+- `ckpts/`
+
+inside:
+
+```text
+$ROOT/outputs/occupancy_shape_vae
+```
+
+Snapshots are saved every `10000` steps. The important snapshot outputs are:
+
+- `sample_gt_occupancy_*`: original active sparse voxel support
+- `sample_rec_occupancy_*`: reconstruction using cached GT subdivision structure
+- `sample_pred_subdiv_occupancy_*`: reconstruction after clearing the cache, so the decoder must use predicted subdivisions
+
+The useful diagnostic is whether `pred_subdiv_occupancy` recovers the sparse support well. Occupancy snapshots render active voxels from four viewpoints and color them by normalized distance from the origin to make structure easier to see.
+
+Run standalone eval on the held-out split with:
+
+```bash
+EVAL_SPLIT=test sbatch eval_occupancy_shape_vae.sh "$ROOT/outputs/occupancy_shape_vae"
+```
+
+This writes `metrics.json` and snapshot images into:
+
+```text
+$ROOT/outputs/occupancy_shape_vae/eval_test_<SLURM_JOB_ID>/
+```
+
+The main support metrics are:
+
+- `exact_support_match_rate`: fraction of evaluated instances where predicted sparse coordinates exactly match GT sparse coordinates
+- `all_gt_locations_captured_rate`: fraction of evaluated instances where every GT coordinate is present in the prediction, even if extra coordinates were also predicted
+- `mean_iou`, `mean_recall`, `mean_precision`: per-instance sparse support metrics
+- `micro_iou`, `micro_recall`, `micro_precision`: pooled coordinate-count metrics over the whole eval run
+
+### Encode Occupancy Shape Latents
+
+After the occupancy shape VAE is trained, encode its latents so they can be used as sparse `concat_cond` for the Gaussian-distance flow model.
+
+```bash
+python data_toolkit/encode_occupancy_shape_latent.py \
+  --root "$ROOT" \
+  --gaussian_distance_voxel_root "$ROOT" \
+  --shape_latent_root "$ROOT" \
+  --resolution 256 \
+  --model_root "$ROOT/outputs" \
+  --enc_model occupancy_shape_vae \
+  --ckpt step0090000 \
+  --loader_workers 4 \
+  --read_threads 1 \
+  --saver_workers 4
+```
+
+This writes:
+
+```text
+$ROOT/shape_latents/occupancy_shape_vae_step0090000_256/
+```
+
+Merge metadata:
+
+```bash
+python data_toolkit/build_metadata.py ObjaverseXL \
+  --root "$ROOT" \
+  --shape_latent_root "$ROOT"
+```
+
+## 11. Encode Michelangelo Latents at 256
 
 This is the geometry-conditioning side needed for a pointcloud-conditioned distance model.
 
@@ -551,7 +662,7 @@ You should see:
 
 `--coordinate_scale 2.0` is intentional: TRELLIS mesh dumps are roughly in `[-0.5, 0.5]`, while Michelangelo training normalizes pointcloud coordinates to approximately `[-1, 1]`.
 
-## 11. Encode Gaussian-Distance Latents
+## 12. Encode Gaussian-Distance Latents
 
 This is the latent representation that the Michelangelo-conditioned flow model predicts.
 
@@ -641,7 +752,7 @@ find "$ROOT/gaussian_distance_latents/gaussian_distance_vae_step0350000_256" \
   -name '*.cache.pt' | head
 ```
 
-## 12. Create Split-Specific Latent Views
+## 13. Create Split-Specific Latent Views
 
 Use the existing split instance files to create split-local latent roots without changing split membership.
 This is the step that makes train/test latent paths explicit, because the encoders write canonical latent roots by default.
@@ -679,6 +790,17 @@ python data_toolkit/dataset_to_trellis/make_latent_split_views.py \
 
 For Gaussian-distance latents, this also links the `.cache.pt` sidecars when they exist.
 
+If you are using the occupancy shape-latent conditioning path, also create shape-latent split views:
+
+```bash
+python data_toolkit/dataset_to_trellis/make_latent_split_views.py \
+  --root "$ROOT" \
+  --latent-kind shape_latent \
+  --latent-name occupancy_shape_vae_step0090000_256 \
+  --overwrite-metadata \
+  --overwrite-links
+```
+
 ### Validate
 
 Check for:
@@ -688,6 +810,8 @@ $ROOT/splits/train/michelangelo_latents/<name>/metadata.csv
 $ROOT/splits/test/michelangelo_latents/<name>/metadata.csv
 $ROOT/splits/train/gaussian_distance_latents/<name>/metadata.csv
 $ROOT/splits/test/gaussian_distance_latents/<name>/metadata.csv
+$ROOT/splits/train/shape_latents/<name>/metadata.csv
+$ROOT/splits/test/shape_latents/<name>/metadata.csv
 ```
 
 Also check the Gaussian-distance cache sidecars in the split-local view:
@@ -697,7 +821,7 @@ find "$ROOT/splits/train/gaussian_distance_latents/gaussian_distance_vae_step035
   -name '*.cache.pt' | head
 ```
 
-## 13. Compute Latent Normalization Statistics
+## 14. Compute Latent Normalization Statistics
 
 The flow dataset normalizes the Gaussian-distance target latents. Compute these stats from the **train split only**.
 
@@ -709,13 +833,21 @@ python data_toolkit/compute_latent_normalization.py \
   --latent-kind gaussian_distance_latent
 ```
 
+Shape latent stats for the occupancy shape-conditioned flow path:
+
+```bash
+python data_toolkit/compute_latent_normalization.py \
+  --latent-root "$ROOT/splits/train/shape_latents/occupancy_shape_vae_step0090000_256" \
+  --latent-kind shape_latent
+```
+
 This command writes:
 
 ```text
 <latent-root>/normalization.json
 ```
 
-You do not need to paste the stats into the flow config. `MichelangeloConditionedGaussianDistanceSLat` auto-loads `normalization.json` from each `gaussian_distance_latent` root in `data_dir` and raises an error if it is missing.
+You do not need to paste the stats into the flow config. `MichelangeloConditionedGaussianDistanceSLat` auto-loads `normalization.json` from each `gaussian_distance_latent` root in `data_dir` and raises an error if it is missing. The shape-conditioned variant also requires `normalization.json` under the `shape_latent` root.
 
 ### Validate
 
@@ -726,7 +858,7 @@ Inspect the JSON and confirm:
 - `mean` and `std` have the expected latent channel length
 - no `std` entries are zero or NaN
 
-## 14. Train the Michelangelo-Conditioned Gaussian-Distance Flow
+## 15. Train the Michelangelo-Conditioned Gaussian-Distance Flow
 
 The training path is implemented with:
 
@@ -764,7 +896,43 @@ Flow snapshots decode generated Gaussian-distance latents through the trained Ga
 
 What is still not implemented is a separate standalone flow evaluation/inference script for arbitrary new point clouds. Training-time snapshots are implemented.
 
-## 15. Target End State for the Flow Model
+### Shape-Latent Conditioned Variant
+
+To train the TRELLIS-style variant that uses occupancy shape latents as sparse `concat_cond`, run:
+
+```bash
+sbatch train_michelangelo_shape2gaussian_distance_flow.sh
+```
+
+This path uses:
+
+- dataset: `MichelangeloShapeConditionedGaussianDistanceSLat`
+- config: `configs/gen/slat_flow_michelangelo_shape2gaussian_distance_kl5e3_dit_1_3B_256_bf16.json`
+- Slurm script: `train_michelangelo_shape2gaussian_distance_flow.sh`
+
+The denoiser input channels are `64`:
+
+```text
+32 noisy Gaussian-distance latent channels + 32 occupancy shape latent channels
+```
+
+The output channels remain `32`, because the flow only predicts the Gaussian-distance latent velocity.
+
+Evaluate this variant with:
+
+```bash
+sbatch eval_michelangelo_shape2gaussian_distance_flow.sh \
+  "$ROOT/outputs/michelangelo_shape2gaussian_distance_flow_kl5e3"
+```
+
+Snapshots for this variant decode with:
+
+```text
+occupancy shape latent -> occupancy shape decoder(return_subs=True) -> guide_subs
+generated Gaussian-distance latent -> Gaussian-distance decoder(guide_subs=guide_subs)
+```
+
+## 16. Target End State for the Flow Model
 
 The intended final model is:
 
