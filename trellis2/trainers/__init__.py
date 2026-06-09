@@ -6,6 +6,7 @@ __attributes = {
     'SparseStructureVaeTrainer': 'vae.sparse_structure_vae',
     'ShapeVaeTrainer': 'vae.shape_vae',
     'PbrVaeTrainer': 'vae.pbr_vae',
+    'TriangleFieldVaeTrainer': 'vae.triangle_field_vae',
     'OccupancyShapeVaeTrainer': 'vae.occupancy_shape_vae',
     
     'FlowMatchingTrainer': 'flow_matching.flow_matching',
@@ -48,6 +49,7 @@ if __name__ == '__main__':
     from .vae.sparse_structure_vae import SparseStructureVaeTrainer
     from .vae.shape_vae import ShapeVaeTrainer
     from .vae.pbr_vae import PbrVaeTrainer
+    from .vae.triangle_field_vae import TriangleFieldVaeTrainer
     from .vae.occupancy_shape_vae import OccupancyShapeVaeTrainer
     
     from .flow_matching.flow_matching import (

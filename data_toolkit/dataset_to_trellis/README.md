@@ -1,6 +1,6 @@
-# Local Mesh Directory to TRELLIS Gaussian-Distance Flow Pipeline
+# Local Mesh Directory to TRELLIS Gaussian-Distance / Triangle-Field Flow Pipeline
 
-This folder contains helpers for converting a local tree of mesh files into TRELLIS-compatible data and training the custom 6-channel Gaussian-distance branch discussed in this repo.
+This folder contains helpers for converting a local tree of mesh files into TRELLIS-compatible data and training the custom Gaussian-distance and triangle-field branches discussed in this repo.
 
 This README is organized around the full end-to-end path:
 
@@ -13,11 +13,13 @@ This README is organized around the full end-to-end path:
 7. Michelangelo-latent preprocessing for geometry conditioning
 8. Gaussian-distance latent preprocessing
 9. Michelangelo-conditioned Gaussian-distance flow training
+10. optional triangle-field voxel / VAE / latent / flow training
 
 The important boundary is:
 
 - Everything through the Gaussian-distance VAE is implemented in this repo.
 - The Michelangelo-conditioned Gaussian-distance flow training path is also implemented, using precomputed Michelangelo latents as conditioning and precomputed Gaussian-distance VAE latents as the flow target.
+- The triangle-field path is implemented as a parallel target representation: sparse triangle-field voxels -> triangle-field VAE latents -> Michelangelo + shape conditioned triangle-field latent flow.
 
 ## Expected Root Layout
 
@@ -38,25 +40,34 @@ After preprocessing, the layout should grow to something like:
   pbr_dumps/
   dual_grid_256/
   gaussian_distance_voxels_256/
+  triangle_field_voxels_256/
   michelangelo_latents/
     shapevae256_pretrained/
   gaussian_distance_latents/
     gaussian_distance_vae_step0350000_256/
+  triangle_field_latents/
+    triangle_field_vae_51483691_step0060000_256/
   splits/
     train/
       metadata.csv
       gaussian_distance_voxels_256/
+      triangle_field_voxels_256/
       michelangelo_latents/
         shapevae256_pretrained/
       gaussian_distance_latents/
         gaussian_distance_vae_step0350000_256/
+      triangle_field_latents/
+        triangle_field_vae_51483691_step0060000_256/
     test/
       metadata.csv
       gaussian_distance_voxels_256/
+      triangle_field_voxels_256/
       michelangelo_latents/
         shapevae256_pretrained/
       gaussian_distance_latents/
         gaussian_distance_vae_step0350000_256/
+      triangle_field_latents/
+        triangle_field_vae_51483691_step0060000_256/
   outputs/
 ```
 
@@ -932,7 +943,361 @@ occupancy shape latent -> occupancy shape decoder(return_subs=True) -> guide_sub
 generated Gaussian-distance latent -> Gaussian-distance decoder(guide_subs=guide_subs)
 ```
 
-## 16. Target End State for the Flow Model
+## 16. Triangle-Field Pipeline: OBJ to VAE to Flow
+
+This is the newer triangle-field target path. It starts from the same `metadata.csv`, `mesh_dumps/`, and `pbr_dumps/` produced above.
+
+The sparse voxel file stores 20 input channels:
+
+- `d_tri`: scalar triangle/interior field
+- `d_vert`: scalar vertex field
+- `offset_to_v0`, `offset_to_v1`, `offset_to_v2`
+- `offset_to_centroid`
+- `face_normal`
+- `offset_to_projection`
+
+The triangle-field VAE uses all 20 channels as encoder input, but only reconstructs two target channels:
+
+```text
+d_tri, d_vert
+```
+
+The flow model predicts triangle-field VAE latents. Its conditioning matches the TRELLIS-style setup:
+
+```text
+Michelangelo latent -> cross-attention cond
+occupancy shape latent -> sparse concat_cond and decoder guide_subs
+triangle-field latent -> flow target x_0
+```
+
+### 16.1 Voxelize Triangle-Field Features
+
+Run from the TRELLIS repo root in the `trellis2` environment:
+
+```bash
+export ROOT=/nfs/turbo/coe-jjparkcv-medium/koussa/neuframe
+```
+
+Voxelize from PBR dumps:
+
+```bash
+python data_toolkit/voxelize_triangle_field.py ObjaverseXL \
+  --root "$ROOT" \
+  --pbr_dump_root "$ROOT" \
+  --triangle_field_voxel_root "$ROOT" \
+  --resolution 256 \
+  --feature_dtype float16 \
+  --npz_compression zstd \
+  --zstd_level 3 \
+  --candidate_source native \
+  --projection_mode inside_barycentric \
+  --max_workers 8
+```
+
+For timing/debugging:
+
+```bash
+python data_toolkit/voxelize_triangle_field.py ObjaverseXL \
+  --root "$ROOT" \
+  --pbr_dump_root "$ROOT" \
+  --triangle_field_voxel_root "$ROOT" \
+  --resolution 256 \
+  --feature_dtype float16 \
+  --npz_compression zstd \
+  --zstd_level 3 \
+  --candidate_source native \
+  --projection_mode inside_barycentric \
+  --max_workers 1 \
+  --benchmark
+```
+
+Merge stage metadata:
+
+```bash
+python data_toolkit/build_metadata.py ObjaverseXL \
+  --root "$ROOT" \
+  --pbr_dump_root "$ROOT" \
+  --triangle_field_voxel_root "$ROOT"
+```
+
+Validate the processed feature statistics:
+
+```bash
+python data_toolkit/check_triangle_field_dataset.py \
+  --voxel_root "$ROOT/triangle_field_voxels_256" \
+  --num_workers 8 \
+  --output_json "$ROOT/triangle_field_voxels_256/check_stats.json"
+```
+
+### 16.2 Create Train/Test Split Views for Triangle-Field Voxels
+
+If this is the first split you are creating, make split-local triangle-field voxel views:
+
+```bash
+python data_toolkit/dataset_to_trellis/make_split_views.py \
+  --root "$ROOT" \
+  --resolution 256 \
+  --voxel-kind triangle_field \
+  --test-frac 0.10 \
+  --seed 42 \
+  --overwrite-metadata \
+  --overwrite-links
+```
+
+This creates:
+
+```text
+$ROOT/splits/train/triangle_field_voxels_256/
+$ROOT/splits/test/triangle_field_voxels_256/
+```
+
+If you already created split membership for another representation and need identical membership, verify that the resulting `splits/train/instances.txt` and `splits/test/instances.txt` still match your intended split before training.
+
+### 16.3 Train the Triangle-Field VAE
+
+Use the Slurm wrapper:
+
+```bash
+sbatch train_triangle_field_vae.sh
+```
+
+The script uses:
+
+- config: `configs/scvae/triangle_field_vae_next_dc_f16c32_fp16.json`
+- dataset: `SparseVoxelTriangleFieldDataset`
+- trainer: `TriangleFieldVaeTrainer`
+- train data: `$ROOT/splits/train/triangle_field_voxels_256`
+
+The output directory defaults to:
+
+```text
+$ROOT/outputs/triangle_field_vae_<SLURM_JOB_ID>
+```
+
+To force a specific output name:
+
+```bash
+RUN_NAME=triangle_field_vae_test sbatch train_triangle_field_vae.sh
+```
+
+Inspect:
+
+```text
+$ROOT/outputs/<RUN_NAME>/log.txt
+$ROOT/outputs/<RUN_NAME>/samples/
+$ROOT/outputs/<RUN_NAME>/ckpts/
+```
+
+For the current flow defaults in this repo, the triangle-field VAE run/checkpoint is:
+
+```text
+$ROOT/outputs/triangle_field_vae_51483691
+step0060000
+```
+
+### 16.4 Encode Triangle-Field VAE Latents
+
+Once the VAE checkpoint exists, encode canonical triangle-field latents:
+
+```bash
+export ROOT=/nfs/turbo/coe-jjparkcv-medium/koussa/neuframe
+export TRIANGLE_FIELD_VAE_RUN=triangle_field_vae_51483691
+export TRIANGLE_FIELD_VAE_CKPT=step0060000
+export TRIANGLE_FIELD_LATENT_NAME=${TRIANGLE_FIELD_VAE_RUN}_${TRIANGLE_FIELD_VAE_CKPT}_256
+
+export FLEX_GEMM_USE_AUTOTUNE_CACHE=0
+export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE=0
+
+python data_toolkit/encode_triangle_field_latent.py \
+  --root "$ROOT" \
+  --triangle_field_voxel_root "$ROOT" \
+  --triangle_field_latent_root "$ROOT" \
+  --resolution 256 \
+  --model_root "$ROOT/outputs" \
+  --enc_model "$TRIANGLE_FIELD_VAE_RUN" \
+  --ckpt "$TRIANGLE_FIELD_VAE_CKPT" \
+  --loader_workers 4 \
+  --saver_workers 4
+```
+
+This writes:
+
+```text
+$ROOT/triangle_field_latents/$TRIANGLE_FIELD_LATENT_NAME/
+```
+
+Each encoded object has:
+
+- `<sha>.npz`: sparse latent `coords` and `feats`
+- `<sha>.cache.pt`: trimmed sparse spatial cache for decoder-backed snapshots when guide subdivisions are not provided
+
+Merge latent metadata:
+
+```bash
+python data_toolkit/build_metadata.py ObjaverseXL \
+  --root "$ROOT" \
+  --triangle_field_voxel_root "$ROOT" \
+  --triangle_field_latent_root "$ROOT" \
+  --michelangelo_latent_root "$ROOT" \
+  --shape_latent_root "$ROOT"
+```
+
+### 16.5 Create Triangle-Field Latent Split Views
+
+Create train/test split-local latent roots:
+
+```bash
+python data_toolkit/dataset_to_trellis/make_latent_split_views.py \
+  --root "$ROOT" \
+  --latent-kind triangle_field_latent \
+  --latent-name "$TRIANGLE_FIELD_LATENT_NAME" \
+  --overwrite-metadata \
+  --overwrite-links
+```
+
+This creates:
+
+```text
+$ROOT/splits/train/triangle_field_latents/$TRIANGLE_FIELD_LATENT_NAME/
+$ROOT/splits/test/triangle_field_latents/$TRIANGLE_FIELD_LATENT_NAME/
+```
+
+Compute normalization from the train split only:
+
+```bash
+python data_toolkit/compute_latent_normalization.py \
+  --latent-root "$ROOT/splits/train/triangle_field_latents/$TRIANGLE_FIELD_LATENT_NAME" \
+  --latent-kind triangle_field_latent
+```
+
+The flow dataset auto-loads this `normalization.json`. Do not compute it from the test split.
+
+### 16.6 Ensure Conditioning Latents Exist
+
+The triangle-field flow path assumes these split-local conditioning roots already exist:
+
+```text
+$ROOT/splits/train/michelangelo_latents/shapevae256_pretrained/
+$ROOT/splits/test/michelangelo_latents/shapevae256_pretrained/
+$ROOT/splits/train/shape_latents/occupancy_shape_vae_step0110000_256/
+$ROOT/splits/test/shape_latents/occupancy_shape_vae_step0110000_256/
+```
+
+The shape-latent root must also have train normalization:
+
+```text
+$ROOT/splits/train/shape_latents/occupancy_shape_vae_step0110000_256/normalization.json
+```
+
+If missing, run the Michelangelo and occupancy-shape latent sections above, then create split views and compute shape-latent normalization.
+
+For the current triangle-field flow defaults, the expected shape latent name is:
+
+```bash
+export SHAPE_LATENT_NAME=occupancy_shape_vae_step0110000_256
+```
+
+If that canonical shape latent already exists but split views or normalization are missing, run:
+
+```bash
+python data_toolkit/dataset_to_trellis/make_latent_split_views.py \
+  --root "$ROOT" \
+  --latent-kind shape_latent \
+  --latent-name "$SHAPE_LATENT_NAME" \
+  --overwrite-metadata \
+  --overwrite-links
+
+python data_toolkit/compute_latent_normalization.py \
+  --latent-root "$ROOT/splits/train/shape_latents/$SHAPE_LATENT_NAME" \
+  --latent-kind shape_latent
+```
+
+### 16.7 Train the Michelangelo + Shape Conditioned Triangle-Field Flow
+
+The training path uses:
+
+- dataset: `MichelangeloShapeConditionedTriangleFieldSLat`
+- config: `configs/gen/slat_flow_michelangelo_shape2triangle_field_dit_1_3B_256_bf16.json`
+- Slurm script: `train_michelangelo_shape2triangle_field_flow.sh`
+- target: `triangle_field_latent`
+- cross-attention condition: `michelangelo_latent`
+- sparse concat condition: `shape_latent`
+
+The default script values currently target:
+
+```text
+TRIANGLE_FIELD_LATENT_NAME=triangle_field_vae_51483691_step0060000_256
+MICHELANGELO_NAME=shapevae256_pretrained
+SHAPE_LATENT_NAME=occupancy_shape_vae_step0110000_256
+```
+
+Start training:
+
+```bash
+RUN_NAME=michelangelo_shape2triangle_field_flow_51483691_step0060000 \
+sbatch train_michelangelo_shape2triangle_field_flow.sh
+```
+
+The denoiser dimensions are:
+
+```text
+32 noisy triangle-field latent channels + 32 occupancy shape latent channels -> in_channels=64
+32 predicted velocity channels -> out_channels=32
+Michelangelo token width -> cond_channels=64
+latent token grid resolution -> 16
+```
+
+The dataset checks that triangle-field latent coordinates and shape latent coordinates match exactly before concatenating. If they differ, training raises instead of silently corrupting the conditioning.
+
+### 16.8 Evaluate Triangle-Field Flow
+
+Run:
+
+```bash
+sbatch eval_michelangelo_shape2triangle_field_flow.sh \
+  "$ROOT/outputs/michelangelo_shape2triangle_field_flow_51483691_step0060000"
+```
+
+Useful overrides:
+
+```bash
+EVAL_SPLIT=test \
+EVAL_CKPT=latest \
+EVAL_NUM_SAMPLES=64 \
+EVAL_SAMPLING_STEPS=12 \
+EVAL_GUIDANCE_STRENGTH=1.0 \
+sbatch eval_michelangelo_shape2triangle_field_flow.sh \
+  "$ROOT/outputs/michelangelo_shape2triangle_field_flow_51483691_step0060000"
+```
+
+Evaluation writes:
+
+```text
+$ROOT/outputs/<FLOW_RUN>/eval_test_<SLURM_JOB_ID>/metrics.json
+$ROOT/outputs/<FLOW_RUN>/eval_test_<SLURM_JOB_ID>/samples/
+```
+
+Snapshots decode generated triangle-field latents with:
+
+```text
+shape latent -> occupancy shape decoder(return_subs=True) -> guide_subs
+generated triangle-field latent -> triangle-field decoder(guide_subs=guide_subs)
+```
+
+### 16.9 Switching Triangle-Field VAE Checkpoints
+
+If you train flow against a different triangle-field VAE checkpoint, treat it as a new target distribution:
+
+1. Re-encode triangle-field latents with the new `--ckpt`.
+2. Rebuild metadata.
+3. Recreate triangle-field latent split views.
+4. Recompute train normalization.
+5. Update `triangle_field_slat_dec_ckpt` in the flow config to the same checkpoint.
+6. Start a new flow run.
+
+Do not resume a flow trained on one VAE checkpoint using latents from another checkpoint.
+
+## 17. Target End State for the Flow Model
 
 The intended final model is:
 
@@ -951,6 +1316,13 @@ For your branch:
 - target latent = Gaussian-distance latent
 - conditioning latent = Michelangelo latent
 - decoder = your trained Gaussian-distance VAE decoder
+
+For the triangle-field branch:
+
+- target latent = Triangle-field latent
+- conditioning latents = Michelangelo latent plus occupancy shape latent
+- decoder = your trained triangle-field VAE decoder
+- guide subdivisions = occupancy shape decoder `return_subs=True`
 
 ## Notes and Compatibility Constraints
 

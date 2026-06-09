@@ -1,0 +1,307 @@
+import io
+import os
+from typing import Union
+
+import numpy as np
+import torch
+import utils3d
+
+from .components import StandardDatasetBase
+from ..modules import sparse as sp
+from ..renderers import VoxelRenderer
+from ..representations import Voxel
+from ..utils.data_utils import load_balanced_group_indices
+
+
+INPUT_LAYOUT = {
+    'd_tri': slice(0, 1),
+    'd_vert': slice(1, 2),
+    'offset_to_v0': slice(2, 5),
+    'offset_to_v1': slice(5, 8),
+    'offset_to_v2': slice(8, 11),
+    'offset_to_centroid': slice(11, 14),
+    'face_normal': slice(14, 17),
+    'offset_to_projection': slice(17, 20),
+}
+
+TARGET_LAYOUT = {
+    'd_tri': slice(0, 1),
+    'd_vert': slice(1, 2),
+}
+
+
+def load_triangle_field_npz(path: str):
+    if path.endswith('.zst'):
+        try:
+            import zstandard as zstd
+        except ImportError as exc:
+            raise ImportError('Reading .npz.zst triangle fields requires the zstandard package') from exc
+        with open(path, 'rb') as f:
+            payload = zstd.ZstdDecompressor().decompress(f.read())
+        return np.load(io.BytesIO(payload), allow_pickle=False)
+    return np.load(path, allow_pickle=False)
+
+
+def find_triangle_field_path(root: str, instance: str) -> str:
+    for suffix in ('.npz.zst', '.npz'):
+        path = os.path.join(root, f'{instance}{suffix}')
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f'No triangle-field voxel file found for {instance} in {root}')
+
+
+class SparseVoxelTriangleFieldVisMixin:
+    @staticmethod
+    def _scalar_to_color(values: torch.Tensor) -> torch.Tensor:
+        values = values.reshape(-1, 1).clamp(0, 1)
+        return values.expand(-1, 3)
+
+    @staticmethod
+    def _signed_vector_to_color(values: torch.Tensor) -> torch.Tensor:
+        if values.shape[1] >= 3:
+            return (values[:, :3] * 0.5 + 0.5).clamp(0, 1)
+        return SparseVoxelTriangleFieldVisMixin._scalar_to_color(values.norm(dim=1))
+
+    @staticmethod
+    def _magnitude_to_color(values: torch.Tensor) -> torch.Tensor:
+        mag = torch.linalg.norm(values, dim=1, keepdim=True)
+        denom = torch.quantile(mag.detach().float(), 0.99).clamp_min(1e-6)
+        mag = (mag / denom).clamp(0, 1)
+        return torch.cat([mag, 1.0 - mag, 0.25 * torch.ones_like(mag)], dim=1)
+
+    @torch.no_grad()
+    def visualize_sample(self, sample: Union[sp.SparseTensor, dict]):
+        if isinstance(sample, sp.SparseTensor):
+            x = sample
+        elif 'target' in sample:
+            x = sample['target']
+        else:
+            x = sample['x']
+
+        renderer = VoxelRenderer()
+        renderer.rendering_options.resolution = 512
+        renderer.rendering_options.ssaa = 4
+
+        yaws = [0, np.pi / 2, np.pi, 3 * np.pi / 2]
+        yaws_offset = np.random.uniform(-np.pi / 4, np.pi / 4)
+        yaws = [y + yaws_offset for y in yaws]
+        pitch = [np.random.uniform(-np.pi / 4, np.pi / 4) for _ in range(4)]
+
+        exts = []
+        ints = []
+        for yaw, pitch_i in zip(yaws, pitch):
+            orig = torch.tensor([
+                np.sin(yaw) * np.cos(pitch_i),
+                np.cos(yaw) * np.cos(pitch_i),
+                np.sin(pitch_i),
+            ]).float().cuda() * 2
+            fov = torch.deg2rad(torch.tensor(30)).cuda()
+            extrinsics = utils3d.torch.extrinsics_look_at(
+                orig,
+                torch.tensor([0, 0, 0]).float().cuda(),
+                torch.tensor([0, 0, 1]).float().cuda(),
+            )
+            intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
+            exts.append(extrinsics)
+            ints.append(intrinsics)
+
+        x = x.cuda()
+        images = {}
+        layout = TARGET_LAYOUT if x.feats.shape[1] == 2 else INPUT_LAYOUT
+        for key, slc in layout.items():
+            if slc.stop > x.feats.shape[1]:
+                continue
+            rendered = []
+            for i in range(x.shape[0]):
+                rep = Voxel(
+                    origin=[-0.5, -0.5, -0.5],
+                    voxel_size=1 / self.resolution,
+                    coords=x[i].coords[:, 1:].contiguous(),
+                    attrs=None,
+                    layout={'color': slice(0, 3)},
+                )
+                values = x[i].feats[:, slc]
+                if key in ('d_tri', 'd_vert'):
+                    if getattr(self, 'distance_transform', 'none') == 'minus_one_one':
+                        values = values * 0.5 + 0.5
+                    attr = self._scalar_to_color(values)
+                elif key == 'face_normal':
+                    attr = self._signed_vector_to_color(values)
+                else:
+                    attr = self._magnitude_to_color(values)
+                attr = attr.float()
+
+                image = torch.zeros(3, 1024, 1024, dtype=torch.float32).cuda()
+                tile = [2, 2]
+                for j, (ext, intr) in enumerate(zip(exts, ints)):
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        res = renderer.render(rep, ext.float(), intr.float(), colors_overwrite=attr)
+                    image[
+                        :,
+                        512 * (j // tile[1]):512 * (j // tile[1] + 1),
+                        512 * (j % tile[1]):512 * (j % tile[1] + 1),
+                    ] = res['color'].float()
+                rendered.append(image)
+            images[key] = torch.stack(rendered)
+
+        return images
+
+
+class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, StandardDatasetBase):
+    """
+    Sparse triangle-field voxel dataset.
+
+    The encoder input `x` contains all stored triangle-field features. The
+    reconstruction target contains only d_tri and d_vert.
+    """
+
+    def __init__(
+        self,
+        roots,
+        resolution: int = 256,
+        max_active_voxels: int = 1000000,
+        max_num_faces: int = None,
+        min_aesthetic_score: float = 4.5,
+        voxel_root_key: str = 'triangle_field_voxel',
+        voxel_dirname: str = 'triangle_field_voxels',
+        voxelized_flag_column: str = 'triangle_field_voxelized',
+        num_voxels_column: str = 'num_triangle_field_voxels',
+        input_feature_scale: Union[float, list[float], None] = None,
+        distance_transform: str = 'none',
+    ):
+        self.resolution = resolution
+        self.max_active_voxels = max_active_voxels
+        self.max_num_faces = max_num_faces
+        self.min_aesthetic_score = min_aesthetic_score
+        self.voxel_root_key = voxel_root_key
+        self.voxel_dirname = voxel_dirname
+        self.voxelized_flag_column = voxelized_flag_column
+        self.num_voxels_column = num_voxels_column
+        self.input_layout = INPUT_LAYOUT
+        self.target_layout = TARGET_LAYOUT
+        self.value_range = (0, 1)
+        self.distance_transform = distance_transform
+        if self.distance_transform not in ('none', 'minus_one_one'):
+            raise ValueError(
+                f"distance_transform must be 'none' or 'minus_one_one', got {self.distance_transform}"
+            )
+
+        if input_feature_scale is None:
+            self.input_feature_scale = None
+        else:
+            self.input_feature_scale = torch.tensor(input_feature_scale, dtype=torch.float32)
+
+        super().__init__(roots)
+        self.loads = [self.metadata.loc[sha256, self.num_voxels_column] for _, sha256 in self.instances]
+
+    def __str__(self):
+        lines = [
+            super().__str__(),
+            f'  - Resolution: {self.resolution}',
+            f'  - Voxel dirname: {self.voxel_dirname}_{self.resolution}',
+            f'  - Input channels: {self.num_input_channels}',
+            f'  - Target channels: {self.num_target_channels}',
+            f'  - Input feature scale: {None if self.input_feature_scale is None else "explicit"}',
+            f'  - Distance transform: {self.distance_transform}',
+        ]
+        return '\n'.join(lines)
+
+    @property
+    def num_input_channels(self) -> int:
+        return max(slc.stop for slc in self.input_layout.values())
+
+    @property
+    def num_target_channels(self) -> int:
+        return max(slc.stop for slc in self.target_layout.values())
+
+    def filter_metadata(self, metadata):
+        stats = {}
+        metadata = metadata[metadata[self.voxelized_flag_column] == True]
+        stats[f'{self.voxelized_flag_column} == True'] = len(metadata)
+        if self.min_aesthetic_score is not None:
+            metadata = metadata[metadata['aesthetic_score'] >= self.min_aesthetic_score]
+            stats[f'Aesthetic score >= {self.min_aesthetic_score}'] = len(metadata)
+        metadata = metadata[metadata[self.num_voxels_column] > 0]
+        stats['Active voxels > 0'] = len(metadata)
+        metadata = metadata[metadata[self.num_voxels_column] <= self.max_active_voxels]
+        stats[f'Active voxels <= {self.max_active_voxels}'] = len(metadata)
+        if self.max_num_faces is not None:
+            metadata = metadata[metadata['num_faces'] <= self.max_num_faces]
+            stats[f'Faces <= {self.max_num_faces}'] = len(metadata)
+        return metadata, stats
+
+    def _scale_input_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.input_feature_scale is None:
+            return features
+        scale = self.input_feature_scale.to(features.device)
+        if scale.numel() == 1:
+            return features / scale.clamp_min(1e-12)
+        if scale.numel() != features.shape[1]:
+            raise ValueError(
+                f'input_feature_scale must be scalar or length {features.shape[1]}, got {scale.numel()}'
+            )
+        return features / scale.reshape(1, -1).clamp_min(1e-12)
+
+    def _transform_distance_channels(self, features: torch.Tensor) -> torch.Tensor:
+        if self.distance_transform == 'none':
+            return features
+        features = features.clone()
+        features[:, :self.num_target_channels] = features[:, :self.num_target_channels] * 2.0 - 1.0
+        return features
+
+    def read_triangle_field_voxel(self, root, instance):
+        path = find_triangle_field_path(root, instance)
+        with load_triangle_field_npz(path) as data:
+            coords = torch.from_numpy(data['coords'].astype(np.int32, copy=False))
+            features = torch.from_numpy(data['features'].astype(np.float32, copy=False))
+
+        if features.ndim != 2 or features.shape[1] < self.num_target_channels:
+            raise ValueError(f'{path} has invalid feature shape {tuple(features.shape)}')
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            raise ValueError(f'{path} has invalid coords shape {tuple(coords.shape)}')
+        if coords.shape[0] != features.shape[0]:
+            raise ValueError(f'{path} coords/features length mismatch: {coords.shape[0]} vs {features.shape[0]}')
+
+        sparse_coords = torch.cat([torch.zeros_like(coords[:, 0:1]), coords], dim=-1)
+        input_features = self._transform_distance_channels(features)
+        target_features = input_features[:, :self.num_target_channels]
+        x = sp.SparseTensor(
+            self._scale_input_features(input_features).float(),
+            sparse_coords,
+        )
+        target = sp.SparseTensor(
+            target_features.float(),
+            sparse_coords,
+        )
+        return {'x': x, 'target': target}
+
+    def get_instance(self, root, instance):
+        return self.read_triangle_field_voxel(root[self.voxel_root_key], instance)
+
+    @staticmethod
+    def collate_fn(batch, split_size=None):
+        if split_size is None:
+            group_idx = [list(range(len(batch)))]
+        else:
+            group_idx = load_balanced_group_indices([b['x'].feats.shape[0] for b in batch], split_size)
+        packs = []
+        for group in group_idx:
+            sub_batch = [batch[i] for i in group]
+            pack = {}
+
+            keys = [k for k in sub_batch[0].keys()]
+            for k in keys:
+                if isinstance(sub_batch[0][k], torch.Tensor):
+                    pack[k] = torch.stack([b[k] for b in sub_batch])
+                elif isinstance(sub_batch[0][k], sp.SparseTensor):
+                    pack[k] = sp.sparse_cat([b[k] for b in sub_batch], dim=0)
+                elif isinstance(sub_batch[0][k], list):
+                    pack[k] = sum([b[k] for b in sub_batch], [])
+                else:
+                    pack[k] = [b[k] for b in sub_batch]
+
+            packs.append(pack)
+
+        if split_size is None:
+            return packs[0]
+        return packs

@@ -120,3 +120,26 @@ textured_mesh_to_volumetric_attr_cpu(
     const float mipLevelOffset,
     const bool timing
 );
+
+
+/**
+ * Voxelizes triangle geometry and returns voxel-triangle candidate matchings.
+ *
+ * @param voxel_size                    [3] tensor containing the size of a voxel
+ * @param grid_range                    [6] tensor containing the min/max grid range
+ * @param triangles                     [N_tri, 3, 3] tensor containing triangle vertices
+ * @param timing                        boolean flag to print timing information
+ *
+ * @return tuple containing:
+ *   - coords: int32 tensor of shape [N, 3] containing voxel coordinates
+ *   - candidate_offsets: int64 tensor of shape [N + 1] indexing into candidate arrays
+ *   - candidate_triangle_ids: int32 tensor of shape [M] containing triangle ids
+ *   - candidate_barycentric: float32 tensor of shape [M, 4] containing (u, v, w, signed_plane_distance)
+ */
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mesh_to_voxel_triangle_candidates_cpu(
+    const torch::Tensor& voxel_size,
+    const torch::Tensor& grid_range,
+    const torch::Tensor& triangles,
+    const bool timing
+);

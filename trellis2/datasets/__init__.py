@@ -4,6 +4,7 @@ __attributes = {
     'FlexiDualGridDataset': 'flexi_dual_grid',
     'SparseVoxelPbrDataset':'sparse_voxel_pbr',
     'SparseVoxelOccupancyDataset': 'sparse_voxel_occupancy',
+    'SparseVoxelTriangleFieldDataset': 'sparse_voxel_triangle_field',
     
     'SparseStructureLatent': 'sparse_structure_latent',
     'TextConditionedSparseStructureLatent': 'sparse_structure_latent',
@@ -17,6 +18,7 @@ __attributes = {
     'ImageConditionedSLatPbr': 'structured_latent_svpbr',
     'MichelangeloConditionedGaussianDistanceSLat': 'structured_latent_gaussian_distance',
     'MichelangeloShapeConditionedGaussianDistanceSLat': 'structured_latent_gaussian_distance',
+    'MichelangeloShapeConditionedTriangleFieldSLat': 'structured_latent_triangle_field',
 }
 
 __submodules = []
@@ -42,10 +44,12 @@ if __name__ == '__main__':
     from .flexi_dual_grid import FlexiDualGridDataset
     from .sparse_voxel_pbr import SparseVoxelPbrDataset
     from .sparse_voxel_occupancy import SparseVoxelOccupancyDataset
+    from .sparse_voxel_triangle_field import SparseVoxelTriangleFieldDataset
     
     from .sparse_structure_latent import SparseStructureLatent, ImageConditionedSparseStructureLatent
     from .structured_latent import SLat, ImageConditionedSLat
     from .structured_latent_shape import SLatShape, ImageConditionedSLatShape
     from .structured_latent_svpbr import SLatPbr, ImageConditionedSLatPbr
     from .structured_latent_gaussian_distance import MichelangeloConditionedGaussianDistanceSLat, MichelangeloShapeConditionedGaussianDistanceSLat
+    from .structured_latent_triangle_field import MichelangeloShapeConditionedTriangleFieldSLat
     

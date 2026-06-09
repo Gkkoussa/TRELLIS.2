@@ -151,6 +151,179 @@ static Eigen::Vector4f project_onto_triangle(
 }
 
 
+static void collect_intersected_voxels_for_triangle(
+    const Eigen::Vector3f& v0,
+    const Eigen::Vector3f& v1,
+    const Eigen::Vector3f& v2,
+    const float* voxel_size,
+    const Eigen::Vector3i& grid_min,
+    const Eigen::Vector3i& grid_max,
+    std::unordered_set<VoxelCoord>& intersected_voxels
+) {
+    auto scan_line_fill = [&] (const int ax2) {
+        int ax0 = (ax2 + 1) % 3;
+        int ax1 = (ax2 + 2) % 3;
+
+        std::array<Eigen::Vector3d, 3> t = {
+            Eigen::Vector3d(v0[ax0], v0[ax1], v0[ax2]),
+            Eigen::Vector3d(v1[ax0], v1[ax1], v1[ax2]),
+            Eigen::Vector3d(v2[ax0], v2[ax1], v2[ax2])
+        };
+        std::sort(t.begin(), t.end(), [](const Eigen::Vector3d& a, const Eigen::Vector3d& b) { return a.y() < b.y(); });
+
+        int start = std::clamp(int(t[0].y() / voxel_size[ax1]), grid_min[ax1], grid_max[ax1] - 1);
+        int mid = std::clamp(int(t[1].y() / voxel_size[ax1]), grid_min[ax1], grid_max[ax1] - 1);
+        int end = std::clamp(int(t[2].y() / voxel_size[ax1]), grid_min[ax1], grid_max[ax1] - 1);
+
+        auto scan_line_half = [&] (const int row_start, const int row_end, const Eigen::Vector3d t0, const Eigen::Vector3d t1, const Eigen::Vector3d t2) {
+            for (int y_idx = row_start; y_idx < row_end; ++y_idx) {
+                double y = (y_idx + 1) * voxel_size[ax1];
+                Eigen::Vector2d t3 = lerp(t0.y(), t1.y(), y, Eigen::Vector2d(t0.x(), t0.z()), Eigen::Vector2d(t1.x(), t1.z()));
+                Eigen::Vector2d t4 = lerp(t0.y(), t2.y(), y, Eigen::Vector2d(t0.x(), t0.z()), Eigen::Vector2d(t2.x(), t2.z()));
+                if (t3.x() > t4.x()) std::swap(t3, t4);
+                int line_start = std::clamp(int(t3.x() / voxel_size[ax0]), grid_min[ax0], grid_max[ax0] - 1);
+                int line_end = std::clamp(int(t4.x() / voxel_size[ax0]), grid_min[ax0], grid_max[ax0] - 1);
+                for (int x_idx = line_start; x_idx < line_end; ++x_idx) {
+                    double x = (x_idx + 1) * voxel_size[ax0];
+                    double z = lerp(t3.x(), t4.x(), x, t3.y(), t4.y());
+                    int z_idx = int(z / voxel_size[ax2]);
+                    if (z_idx >= grid_min[ax2] && z_idx < grid_max[ax2]) {
+                        for (int dx = 0; dx < 2; ++dx) {
+                            for (int dy = 0; dy < 2; ++dy) {
+                                VoxelCoord coord;
+                                coord[ax0] = x_idx + dx; coord[ax1] = y_idx + dy; coord[ax2] = z_idx;
+                                intersected_voxels.insert(coord);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        scan_line_half(start, mid, t[0], t[1], t[2]);
+        scan_line_half(mid, end, t[2], t[1], t[0]);
+    };
+
+    scan_line_fill(0);
+    scan_line_fill(1);
+    scan_line_fill(2);
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mesh_to_voxel_triangle_candidates_cpu(
+    const torch::Tensor& voxel_size,
+    const torch::Tensor& grid_range,
+    const torch::Tensor& triangles,
+    const bool timing
+) {
+    clock_t start, end;
+    start = clock();
+
+    TORCH_CHECK(voxel_size.device().is_cpu(), "voxel_size must be a CPU tensor");
+    TORCH_CHECK(grid_range.device().is_cpu(), "grid_range must be a CPU tensor");
+    TORCH_CHECK(triangles.device().is_cpu(), "triangles must be a CPU tensor");
+    TORCH_CHECK(voxel_size.dtype() == torch::kFloat32, "voxel_size must be float32");
+    TORCH_CHECK(grid_range.dtype() == torch::kInt32, "grid_range must be int32");
+    TORCH_CHECK(triangles.dtype() == torch::kFloat32, "triangles must be float32");
+    TORCH_CHECK(voxel_size.numel() == 3, "voxel_size must have shape [3]");
+    TORCH_CHECK(grid_range.numel() == 6, "grid_range must have shape [6]");
+    TORCH_CHECK(triangles.dim() == 3 && triangles.size(1) == 3 && triangles.size(2) == 3, "triangles must have shape [N, 3, 3]");
+
+    const float* voxel_size_ptr = voxel_size.contiguous().data_ptr<float>();
+    const int* grid_range_ptr = grid_range.contiguous().data_ptr<int>();
+    const float* triangles_ptr = triangles.contiguous().data_ptr<float>();
+    const int N_tri = triangles.size(0);
+
+    Eigen::Vector3f delta_p(voxel_size_ptr[0], voxel_size_ptr[1], voxel_size_ptr[2]);
+    Eigen::Vector3i grid_min(grid_range_ptr[0], grid_range_ptr[1], grid_range_ptr[2]);
+    Eigen::Vector3i grid_max(grid_range_ptr[3], grid_range_ptr[4], grid_range_ptr[5]);
+
+    std::unordered_map<VoxelCoord, size_t> hash_table;
+    std::vector<VoxelCoord> coords;
+    std::vector<std::vector<int>> voxel_triangle_ids;
+    std::vector<std::vector<Eigen::Vector4f>> voxel_barycentrics;
+
+    for (int tid = 0; tid < N_tri; tid++) {
+        size_t ptr = tid * 9;
+        Eigen::Vector3f v0(triangles_ptr[ptr], triangles_ptr[ptr + 1], triangles_ptr[ptr + 2]);
+        Eigen::Vector3f v1(triangles_ptr[ptr + 3], triangles_ptr[ptr + 4], triangles_ptr[ptr + 5]);
+        Eigen::Vector3f v2(triangles_ptr[ptr + 6], triangles_ptr[ptr + 7], triangles_ptr[ptr + 8]);
+        Eigen::Vector3f n = (v1 - v0).cross(v2 - v0).normalized();
+
+        std::unordered_set<VoxelCoord> intersected_voxels;
+        collect_intersected_voxels_for_triangle(v0, v1, v2, voxel_size_ptr, grid_min, grid_max, intersected_voxels);
+
+        for (auto voxel : intersected_voxels) {
+            int x = voxel.x;
+            int y = voxel.y;
+            int z = voxel.z;
+            Eigen::Vector4f barycentric = project_onto_triangle(
+                Eigen::Vector3f((x + 0.5f) * delta_p.x(), (y + 0.5f) * delta_p.y(), (z + 0.5f) * delta_p.z()),
+                v0, v1, v2, n
+            );
+
+            auto coord = VoxelCoord{x - grid_min.x(), y - grid_min.y(), z - grid_min.z()};
+            auto kv = hash_table.find(coord);
+            size_t voxel_idx;
+            if (kv == hash_table.end()) {
+                voxel_idx = coords.size();
+                hash_table[coord] = voxel_idx;
+                coords.push_back({coord.x, coord.y, coord.z});
+                voxel_triangle_ids.emplace_back();
+                voxel_barycentrics.emplace_back();
+            }
+            else {
+                voxel_idx = kv->second;
+            }
+            voxel_triangle_ids[voxel_idx].push_back(tid);
+            voxel_barycentrics[voxel_idx].push_back(barycentric);
+        }
+    }
+
+    std::vector<int> out_coord(coords.size() * 3);
+    std::vector<int64_t> out_offsets(coords.size() + 1);
+    size_t num_candidates = 0;
+    for (size_t i = 0; i < coords.size(); i++) {
+        out_coord[i * 3 + 0] = coords[i].x;
+        out_coord[i * 3 + 1] = coords[i].y;
+        out_coord[i * 3 + 2] = coords[i].z;
+        out_offsets[i] = num_candidates;
+        num_candidates += voxel_triangle_ids[i].size();
+    }
+    out_offsets[coords.size()] = num_candidates;
+
+    std::vector<int> out_triangle_ids(num_candidates);
+    std::vector<float> out_barycentric(num_candidates * 4);
+    size_t candidate_idx = 0;
+    for (size_t i = 0; i < coords.size(); i++) {
+        for (size_t j = 0; j < voxel_triangle_ids[i].size(); j++) {
+            out_triangle_ids[candidate_idx] = voxel_triangle_ids[i][j];
+            Eigen::Vector4f b = voxel_barycentrics[i][j];
+            out_barycentric[candidate_idx * 4 + 0] = b.x();
+            out_barycentric[candidate_idx * 4 + 1] = b.y();
+            out_barycentric[candidate_idx * 4 + 2] = b.z();
+            out_barycentric[candidate_idx * 4 + 3] = b.w();
+            candidate_idx++;
+        }
+    }
+
+    auto coords_tensor = torch::from_blob(out_coord.data(), {int(coords.size()), 3}, torch::kInt32).clone();
+    auto offsets_tensor = torch::from_blob(out_offsets.data(), {int(coords.size()) + 1}, torch::kInt64).clone();
+    auto triangle_ids_tensor = torch::from_blob(out_triangle_ids.data(), {int(num_candidates)}, torch::kInt32).clone();
+    auto barycentric_tensor = torch::from_blob(out_barycentric.data(), {int(num_candidates), 4}, torch::kFloat32).clone();
+
+    end = clock();
+    if (timing) std::cout << "Triangle candidate voxelization took " << double(end - start) / CLOCKS_PER_SEC << " seconds." << std::endl;
+
+    return std::make_tuple(
+        coords_tensor,
+        offsets_tensor,
+        triangle_ids_tensor,
+        barycentric_tensor
+    );
+}
+
+
 static inline int wrap_texcoord(const int& x, const int& W, const int& filter) {
     if (filter == 0) {          // REPEAT
         return (x % W + W) % W;
@@ -869,4 +1042,3 @@ textured_mesh_to_volumetric_attr_cpu(
         out_normals
     );
 }
-

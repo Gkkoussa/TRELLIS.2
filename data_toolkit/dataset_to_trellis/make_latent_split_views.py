@@ -25,6 +25,14 @@ LATENT_KINDS = {
         "suffix": ".npz",
         "sidecar_suffixes": [".cache.pt"],
     },
+    "triangle_field_latent": {
+        "dirname_prefix": "triangle_field_latents",
+        "flag": "triangle_field_latent_encoded",
+        "count": "triangle_field_latent_tokens",
+        "data_dir_key": "triangle_field_latent",
+        "suffix": ".npz",
+        "sidecar_suffixes": [".cache.pt"],
+    },
     "michelangelo_latent": {
         "dirname_prefix": "michelangelo_latents",
         "flag": "michelangelo_latent_encoded",

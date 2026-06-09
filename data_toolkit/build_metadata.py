@@ -72,6 +72,8 @@ if __name__ == '__main__':
                         help='Directory to save the vertex-distance voxel files')
     parser.add_argument('--gaussian_distance_voxel_root', type=str, default=None,
                         help='Directory to save the gaussian distance voxel files')
+    parser.add_argument('--triangle_field_voxel_root', type=str, default=None,
+                        help='Directory to save the triangle-field voxel files')
     parser.add_argument('--ss_latent_root', type=str, default=None,
                         help='Directory to save the sparse structure latent files')
     parser.add_argument('--shape_latent_root', type=str, default=None,
@@ -80,6 +82,8 @@ if __name__ == '__main__':
                         help='Directory to save the pbr latent files')
     parser.add_argument('--gaussian_distance_latent_root', type=str, default=None,
                         help='Directory to save the gaussian distance latent files')
+    parser.add_argument('--triangle_field_latent_root', type=str, default=None,
+                        help='Directory to save the triangle-field latent files')
     parser.add_argument('--michelangelo_latent_root', type=str, default=None,
                         help='Directory to save the Michelangelo latent files')
     parser.add_argument('--field', type=str, default='all',
@@ -105,10 +109,12 @@ if __name__ == '__main__':
     opt.edge_voxel_root = opt.edge_voxel_root or opt.root
     opt.vertex_voxel_root = opt.vertex_voxel_root or opt.root
     opt.gaussian_distance_voxel_root = opt.gaussian_distance_voxel_root or opt.root
+    opt.triangle_field_voxel_root = opt.triangle_field_voxel_root or opt.root
     opt.ss_latent_root = opt.ss_latent_root or opt.root
     opt.shape_latent_root = opt.shape_latent_root or opt.root
     opt.pbr_latent_root = opt.pbr_latent_root or opt.root
     opt.gaussian_distance_latent_root = opt.gaussian_distance_latent_root or opt.root
+    opt.triangle_field_latent_root = opt.triangle_field_latent_root or opt.root
     opt.michelangelo_latent_root = opt.michelangelo_latent_root or opt.root
 
     os.makedirs(opt.root, exist_ok=True)
@@ -191,6 +197,18 @@ if __name__ == '__main__':
             os.path.join(opt.gaussian_distance_voxel_root, f'gaussian_distance_voxels_{res}'),
             opt,
         )
+
+    # merge triangle-field voxelized
+    triangle_field_voxel_resolutions = []
+    for dir in os.listdir(opt.triangle_field_voxel_root):
+        if os.path.isdir(os.path.join(opt.triangle_field_voxel_root, dir)) and dir.startswith('triangle_field_voxels_'):
+            triangle_field_voxel_resolutions.append(int(dir.split('_')[-1]))
+    triangle_field_voxel_metadata = {}
+    for res in triangle_field_voxel_resolutions:
+        triangle_field_voxel_metadata[res] = update_metadata(
+            os.path.join(opt.triangle_field_voxel_root, f'triangle_field_voxels_{res}'),
+            opt,
+        )
         
     # merge ss latents
     ss_latent_models = []
@@ -224,6 +242,17 @@ if __name__ == '__main__':
     for model in gaussian_distance_latent_models:
         gaussian_distance_latent_metadata[model] = update_metadata(
             os.path.join(opt.gaussian_distance_latent_root, f'gaussian_distance_latents/{model}'),
+            opt,
+        )
+
+    # merge triangle-field latents
+    triangle_field_latent_models = []
+    if os.path.exists(os.path.join(opt.triangle_field_latent_root, 'triangle_field_latents')):
+        triangle_field_latent_models = os.listdir(os.path.join(opt.triangle_field_latent_root, 'triangle_field_latents'))
+    triangle_field_latent_metadata = {}
+    for model in triangle_field_latent_models:
+        triangle_field_latent_metadata[model] = update_metadata(
+            os.path.join(opt.triangle_field_latent_root, f'triangle_field_latents/{model}'),
             opt,
         )
 
@@ -281,6 +310,11 @@ if __name__ == '__main__':
             for res in gaussian_distance_voxel_resolutions:
                 if gaussian_distance_voxel_metadata[res] is not None:
                     f.write(f'    - {res}: {gaussian_distance_voxel_metadata[res]["gaussian_distance_voxelized"].sum()}\n')
+        if len(triangle_field_voxel_resolutions) != 0:
+            f.write(f'  - Number of assets with triangle-field voxelization:\n')
+            for res in triangle_field_voxel_resolutions:
+                if triangle_field_voxel_metadata[res] is not None:
+                    f.write(f'    - {res}: {triangle_field_voxel_metadata[res]["triangle_field_voxelized"].sum()}\n')
         if len(ss_latent_models) != 0:
             f.write(f'  - Number of assets with sparse structure latents:\n')
             for model in ss_latent_models:
@@ -301,6 +335,11 @@ if __name__ == '__main__':
             for model in gaussian_distance_latent_models:
                 if gaussian_distance_latent_metadata[model] is not None:
                     f.write(f'    - {model}: {gaussian_distance_latent_metadata[model]["gaussian_distance_latent_encoded"].sum()}\n')
+        if len(triangle_field_latent_models) != 0:
+            f.write(f'  - Number of assets with triangle-field latents:\n')
+            for model in triangle_field_latent_models:
+                if triangle_field_latent_metadata[model] is not None:
+                    f.write(f'    - {model}: {triangle_field_latent_metadata[model]["triangle_field_latent_encoded"].sum()}\n')
         if len(michelangelo_latent_models) != 0:
             f.write(f'  - Number of assets with Michelangelo latents:\n')
             for model in michelangelo_latent_models:

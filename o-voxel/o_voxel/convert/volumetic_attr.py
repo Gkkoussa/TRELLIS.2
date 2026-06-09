@@ -11,7 +11,8 @@ from .. import _C
 
 __all__ = [
     "textured_mesh_to_volumetric_attr",
-    "blender_dump_to_volumetric_attr"
+    "blender_dump_to_volumetric_attr",
+    "blender_dump_to_voxel_triangle_candidates",
 ]
 
 
@@ -372,14 +373,14 @@ def blender_dump_to_volumetric_attr(
 
     # Auto adjust aabb
     if aabb is None:
-        min_xyz = np.min([
+        min_xyz = torch.tensor(np.min([
             object['vertices'].min(axis=0)
             for object in dump['objects']
-        ], axis=0)
-        max_xyz = np.max([
+        ], axis=0), dtype=torch.float32)
+        max_xyz = torch.tensor(np.max([
             object['vertices'].max(axis=0)
             for object in dump['objects']
-        ], axis=0)
+        ], axis=0), dtype=torch.float32)
 
         if voxel_size is not None:
             padding = torch.ceil((max_xyz - min_xyz) / voxel_size) * voxel_size - (max_xyz - min_xyz)
@@ -581,3 +582,103 @@ def blender_dump_to_volumetric_attr(
     }
     
     return coord, attr
+
+
+def blender_dump_to_voxel_triangle_candidates(
+    dump: Dict[str, Any],
+    voxel_size: Union[float, list, tuple, np.ndarray, torch.Tensor] = None,
+    grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
+    aabb: Union[list, tuple, np.ndarray, torch.Tensor] = None,
+    verbose: bool = False,
+    timing: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Voxelize a Blender dump and return sparse voxel to source-triangle candidate matchings.
+
+    Returns:
+        coords: int32 tensor of shape [N, 3]
+        candidate_offsets: int64 tensor of shape [N + 1]
+        candidate_triangle_ids: int32 tensor of shape [M]
+        candidate_barycentric: float32 tensor of shape [M, 4], containing (u, v, w, signed_plane_distance)
+    """
+    assert voxel_size is not None or grid_size is not None, "Either voxel_size or grid_size must be provided"
+
+    if voxel_size is not None:
+        if isinstance(voxel_size, float):
+            voxel_size = [voxel_size, voxel_size, voxel_size]
+        if isinstance(voxel_size, (list, tuple)):
+            voxel_size = np.array(voxel_size)
+        if isinstance(voxel_size, np.ndarray):
+            voxel_size = torch.tensor(voxel_size, dtype=torch.float32)
+        assert isinstance(voxel_size, torch.Tensor), f"voxel_size must be a float, list, tuple, np.ndarray, or torch.Tensor, but got {type(voxel_size)}"
+        assert voxel_size.dim() == 1, f"voxel_size must be a 1D tensor, but got {voxel_size.shape}"
+        assert voxel_size.size(0) == 3, f"voxel_size must have 3 elements, but got {voxel_size.size(0)}"
+
+    if grid_size is not None:
+        if isinstance(grid_size, int):
+            grid_size = [grid_size, grid_size, grid_size]
+        if isinstance(grid_size, (list, tuple)):
+            grid_size = np.array(grid_size)
+        if isinstance(grid_size, np.ndarray):
+            grid_size = torch.tensor(grid_size, dtype=torch.int32)
+        assert isinstance(grid_size, torch.Tensor), f"grid_size must be an int, list, tuple, np.ndarray, or torch.Tensor, but got {type(grid_size)}"
+        assert grid_size.dim() == 1, f"grid_size must be a 1D tensor, but got {grid_size.shape}"
+        assert grid_size.size(0) == 3, f"grid_size must have 3 elements, but got {grid_size.size(0)}"
+
+    if aabb is not None:
+        if isinstance(aabb, (list, tuple)):
+            aabb = np.array(aabb)
+        if isinstance(aabb, np.ndarray):
+            aabb = torch.tensor(aabb, dtype=torch.float32)
+        assert isinstance(aabb, torch.Tensor), f"aabb must be a list, tuple, np.ndarray, or torch.Tensor, but got {type(aabb)}"
+        assert aabb.dim() == 2, f"aabb must be a 2D tensor, but got {aabb.shape}"
+        assert aabb.size(0) == 2, f"aabb must have 2 rows, but got {aabb.size(0)}"
+        assert aabb.size(1) == 3, f"aabb must have 3 columns, but got {aabb.size(1)}"
+
+    if aabb is None:
+        min_xyz = np.min([
+            object['vertices'].min(axis=0)
+            for object in dump['objects']
+        ], axis=0)
+        max_xyz = np.max([
+            object['vertices'].max(axis=0)
+            for object in dump['objects']
+        ], axis=0)
+
+        if voxel_size is not None:
+            padding = torch.ceil((max_xyz - min_xyz) / voxel_size) * voxel_size - (max_xyz - min_xyz)
+            min_xyz -= padding * 0.5
+            max_xyz += padding * 0.5
+        if grid_size is not None:
+            padding = (max_xyz - min_xyz) / (grid_size - 1)
+            min_xyz -= padding * 0.5
+            max_xyz += padding * 0.5
+
+        aabb = torch.stack([min_xyz, max_xyz], dim=0).float()
+
+    if voxel_size is None:
+        voxel_size = (aabb[1] - aabb[0]) / grid_size
+    if grid_size is None:
+        grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
+
+    grid_range = torch.stack([torch.zeros_like(grid_size), grid_size], dim=0).int()
+
+    if verbose:
+        print(f"Voxelize settings:")
+        print(f"  Voxel size: {voxel_size}")
+        print(f"  Grid size: {grid_size}")
+        print(f"  AABB: {aabb}")
+
+    triangles = []
+    for object in dump['objects']:
+        tri = torch.tensor(object['vertices'][object['faces']], dtype=torch.float32).reshape(-1, 3, 3)
+        tri = tri - aabb[0].reshape(1, 1, 3)
+        triangles.append(tri)
+    triangles = torch.cat(triangles, dim=0)
+
+    return _C.mesh_to_voxel_triangle_candidates_cpu(
+        voxel_size,
+        grid_range.reshape(-1),
+        triangles,
+        timing,
+    )

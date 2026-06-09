@@ -27,14 +27,26 @@ VOXEL_KINDS = {
         "flag": "gaussian_distance_voxelized",
         "count": "num_gaussian_distance_voxels",
         "data_dir_key": "gaussian_distance_voxel",
+        "extensions": [".vxz"],
+    },
+    "triangle_field": {
+        "dirname_prefix": "triangle_field_voxels",
+        "flag": "triangle_field_voxelized",
+        "count": "num_triangle_field_voxels",
+        "data_dir_key": "triangle_field_voxel",
+        "extensions": [".npz.zst", ".npz"],
     },
     "pbr": {
         "dirname_prefix": "pbr_voxels",
         "flag": "pbr_voxelized",
         "count": "num_pbr_voxels",
         "data_dir_key": "pbr_voxel",
+        "extensions": [".vxz"],
     },
 }
+
+for schema in VOXEL_KINDS.values():
+    schema.setdefault("extensions", [".vxz"])
 
 
 def truthy_series(series):
@@ -73,6 +85,14 @@ def place_voxel(src: Path, dst: Path, mode: str, overwrite: bool) -> bool:
     else:
         raise ValueError(f"Unsupported link mode: {mode}")
     return True
+
+
+def find_voxel_file(root: Path, sha256: str, extensions: list[str]) -> Path | None:
+    for ext in extensions:
+        candidate = root / f"{sha256}{ext}"
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,8 +259,14 @@ def main() -> None:
 
         linked = 0
         for sha256 in split_meta["sha256"]:
-            src = canonical_voxel_root / f"{sha256}.vxz"
-            dst = split_voxel_root / f"{sha256}.vxz"
+            src = find_voxel_file(canonical_voxel_root, sha256, schema["extensions"])
+            if src is None:
+                print(
+                    f"Missing voxel file for {sha256}; tried "
+                    + ", ".join(str(canonical_voxel_root / f"{sha256}{ext}") for ext in schema["extensions"])
+                )
+                continue
+            dst = split_voxel_root / src.name
             linked += int(place_voxel(src, dst, args.link_mode, args.overwrite_links))
 
         print(
