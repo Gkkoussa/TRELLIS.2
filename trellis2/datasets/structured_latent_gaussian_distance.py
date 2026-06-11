@@ -194,7 +194,10 @@ class MichelangeloConditionedGaussianDistanceSLat(GaussianDistanceSLatVisMixin, 
             raise ValueError("Provide either gaussian_distance_slat_normalization or gaussian_distance_slat_normalization_path, not both.")
         self.resolution = resolution
         self.gaussian_distance_slat_normalization = gaussian_distance_slat_normalization
-        self.gaussian_distance_slat_normalization_path = gaussian_distance_slat_normalization_path
+        self.gaussian_distance_slat_normalization_path = (
+            gaussian_distance_slat_normalization_path
+            or os.environ.get('TRELLIS_GAUSSIAN_DISTANCE_SLAT_NORMALIZATION_PATH')
+        )
         self.min_aesthetic_score = min_aesthetic_score
         self.max_tokens = max_tokens
         self.value_range = (0, 1)

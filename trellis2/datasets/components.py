@@ -18,10 +18,17 @@ class StandardDatasetBase(Dataset):
         roots (str): paths to the dataset
     """
 
+    METADATA_FILTER_KEYS = {'_metadata_filter_csv', 'metadata_filter_csv'}
+
     def __init__(self,
         roots: str,
     ):
         super().__init__()
+        self._metadata_filter_cache = {}
+        self._metadata_filter_csv = (
+            os.environ.get('TRELLIS_METADATA_FILTER_CSV')
+            or os.environ.get('METADATA_FILTER_CSV')
+        )
         try:
             self.roots = json.loads(roots)
             root_type = 'obj'
@@ -36,12 +43,20 @@ class StandardDatasetBase(Dataset):
             for key, root in self.roots.items():
                 self._stats[key] = {}
                 metadata = pd.DataFrame(columns=['sha256']).set_index('sha256')
-                for _, r in root.items():
+                for root_key, r in root.items():
+                    if root_key in self.METADATA_FILTER_KEYS:
+                        continue
                     part = pd.read_csv(os.path.join(r, 'metadata.csv')).set_index('sha256')
                     # Later roots override overlapping non-null cells from earlier roots
                     # (earlier pattern metadata.combine_first(part) made base rows win forever).
                     metadata = part.combine_first(metadata)
                 self._stats[key]['Total'] = len(metadata)
+                metadata, filter_stats = self._apply_metadata_filter(
+                    metadata,
+                    root.get('_metadata_filter_csv') or root.get('metadata_filter_csv') or self._metadata_filter_csv,
+                    index_is_sha256=True,
+                )
+                self._stats[key].update(filter_stats)
                 metadata, stats = self.filter_metadata(metadata)
                 self._stats[key].update(stats)
                 self.instances.extend([(root, sha256) for sha256 in metadata.index.values])
@@ -52,11 +67,82 @@ class StandardDatasetBase(Dataset):
                 self._stats[key] = {}
                 metadata = pd.read_csv(os.path.join(root, 'metadata.csv'))
                 self._stats[key]['Total'] = len(metadata)
+                metadata, filter_stats = self._apply_metadata_filter(
+                    metadata,
+                    self._metadata_filter_csv,
+                    index_is_sha256=False,
+                )
+                self._stats[key].update(filter_stats)
                 metadata, stats = self.filter_metadata(metadata)
                 self._stats[key].update(stats)
                 self.instances.extend([(root, sha256) for sha256 in metadata['sha256'].values])
                 metadata.set_index('sha256', inplace=True)
                 self.metadata = pd.concat([self.metadata, metadata])
+
+    @staticmethod
+    def _truthy(value):
+        return str(value).strip().lower() in {'1', 'true', 't', 'yes', 'y'}
+
+    def _load_one_metadata_filter(self, metadata_filter_csv: str) -> Set[str]:
+        if metadata_filter_csv in self._metadata_filter_cache:
+            return self._metadata_filter_cache[metadata_filter_csv]
+        if not os.path.exists(metadata_filter_csv):
+            raise FileNotFoundError(f'Metadata filter CSV not found: {metadata_filter_csv}')
+
+        filter_metadata = pd.read_csv(metadata_filter_csv)
+        if 'sha256' not in filter_metadata.columns:
+            raise ValueError(f'{metadata_filter_csv} must contain a sha256 column.')
+        if 'local_density_filter_keep' in filter_metadata.columns:
+            filter_metadata = filter_metadata[
+                filter_metadata['local_density_filter_keep'].map(self._truthy)
+            ]
+        elif 'has_local_dense_region' in filter_metadata.columns:
+            filter_metadata = filter_metadata[
+                ~filter_metadata['has_local_dense_region'].map(self._truthy)
+            ]
+        allowed = set(filter_metadata['sha256'].astype(str).values)
+        self._metadata_filter_cache[metadata_filter_csv] = allowed
+        return allowed
+
+    def _load_metadata_filter(self, metadata_filter_csv: str) -> Set[str]:
+        filters = [
+            path.strip()
+            for path in metadata_filter_csv.split(',')
+            if path.strip()
+        ]
+        if len(filters) == 0:
+            return set()
+        allowed = self._load_one_metadata_filter(filters[0])
+        for path in filters[1:]:
+            allowed = allowed & self._load_one_metadata_filter(path)
+        return allowed
+
+    def _apply_metadata_filter(
+        self,
+        metadata: pd.DataFrame,
+        metadata_filter_csv: Optional[str],
+        *,
+        index_is_sha256: bool,
+    ) -> Tuple[pd.DataFrame, Dict[str, int]]:
+        if metadata_filter_csv is None or str(metadata_filter_csv).strip() == '':
+            return metadata, {}
+
+        metadata_filter_csv = str(metadata_filter_csv)
+        total_before = len(metadata)
+        allowed = self._load_metadata_filter(metadata_filter_csv)
+        if index_is_sha256:
+            metadata = metadata[metadata.index.astype(str).isin(allowed)]
+        else:
+            metadata = metadata[metadata['sha256'].astype(str).isin(allowed)]
+        filter_label = '+'.join(
+            os.path.basename(path.strip())
+            for path in metadata_filter_csv.split(',')
+            if path.strip()
+        )
+        return metadata, {
+            f'Metadata filter ({filter_label})': len(metadata),
+            'Metadata filter removed': total_before - len(metadata),
+        }
             
     @abstractmethod
     def filter_metadata(self, metadata: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:

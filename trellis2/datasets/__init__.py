@@ -3,6 +3,7 @@ import importlib
 __attributes = {
     'FlexiDualGridDataset': 'flexi_dual_grid',
     'SparseVoxelPbrDataset':'sparse_voxel_pbr',
+    'SparseVoxelShapeDataset':'sparse_voxel_pbr',
     'DenseGaussianPatchDataset':'sparse_voxel_pbr',
     'SparseGaussianPatchDataset':'sparse_voxel_pbr',
     
@@ -40,7 +41,7 @@ def __getattr__(name):
 # For Pylance
 if __name__ == '__main__':    
     from .flexi_dual_grid import FlexiDualGridDataset
-    from .sparse_voxel_pbr import SparseVoxelPbrDataset, DenseGaussianPatchDataset, SparseGaussianPatchDataset
+    from .sparse_voxel_pbr import SparseVoxelPbrDataset, SparseVoxelShapeDataset, DenseGaussianPatchDataset, SparseGaussianPatchDataset
     
     from .sparse_structure_latent import SparseStructureLatent, ImageConditionedSparseStructureLatent
     from .structured_latent import SLat, ImageConditionedSLat

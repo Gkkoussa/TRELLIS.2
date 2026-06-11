@@ -14,32 +14,38 @@ class FlowEulerSampler(Sampler):
 
     Args:
         sigma_min: The minimum scale of noise in flow.
+        noise_scale: Multiplier on the noise term in the flow path.
     """
     def __init__(
         self,
         sigma_min: float,
+        noise_scale: float = 1.0,
     ):
         self.sigma_min = sigma_min
+        self.noise_scale = noise_scale
+
+    def _sigma(self, t):
+        return self.sigma_min + (1 - self.sigma_min) * t
 
     def _eps_to_xstart(self, x_t, t, eps):
         assert x_t.shape == eps.shape
-        return (x_t - (self.sigma_min + (1 - self.sigma_min) * t) * eps) / (1 - t)
+        return (x_t - self.noise_scale * self._sigma(t) * eps) / (1 - t)
 
     def _xstart_to_eps(self, x_t, t, x_0):
         assert x_t.shape == x_0.shape
-        return (x_t - (1 - t) * x_0) / (self.sigma_min + (1 - self.sigma_min) * t)
+        return (x_t - (1 - t) * x_0) / (self.noise_scale * self._sigma(t))
 
     def _v_to_xstart_eps(self, x_t, t, v):
         assert x_t.shape == v.shape
-        eps = (1 - t) * v + x_t
-        x_0 = (1 - self.sigma_min) * x_t - (self.sigma_min + (1 - self.sigma_min) * t) * v
+        eps = ((1 - t) * v + x_t) / self.noise_scale
+        x_0 = (1 - self.sigma_min) * x_t - self._sigma(t) * v
         return x_0, eps
     
     def _pred_to_xstart(self, x_t, t, pred):
-        return (1 - self.sigma_min) * x_t - (self.sigma_min + (1 - self.sigma_min) * t) * pred
+        return (1 - self.sigma_min) * x_t - self._sigma(t) * pred
 
     def _xstart_to_pred(self, x_t, t, x_0):
-        return ((1 - self.sigma_min) * x_t - x_0) / (self.sigma_min + (1 - self.sigma_min) * t)
+        return ((1 - self.sigma_min) * x_t - x_0) / self._sigma(t)
 
     def _inference_model(self, model, x_t, t, cond=None, **kwargs):
         t = torch.tensor([1000 * t] * x_t.shape[0], device=x_t.device, dtype=torch.float32)
@@ -111,7 +117,7 @@ class FlowEulerSampler(Sampler):
             - 'pred_x_t': a list of prediction of x_t.
             - 'pred_x_0': a list of prediction of x_0.
         """
-        sample = noise
+        sample = noise * self.noise_scale
         t_seq = np.linspace(1, 0, steps + 1)
         t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
         t_seq = t_seq.tolist()

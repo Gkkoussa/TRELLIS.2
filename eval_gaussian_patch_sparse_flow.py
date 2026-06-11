@@ -46,10 +46,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def parse_t_values(value: str) -> list[float]:
+def parse_t_values(value: str | None) -> list[float]:
+    if value is None or value.strip().lower() in {"", "none", "skip", "off"}:
+        return []
     values = [float(v.strip()) for v in value.split(",") if v.strip()]
-    if not values:
-        raise ValueError("At least one reconstruction timestep is required.")
     bad = [v for v in values if v < 0.0 or v > 1.0]
     if bad:
         raise ValueError(f"Reconstruction timesteps must be in [0, 1], got {bad}")
@@ -178,6 +178,146 @@ def evaluate_flow_mse(trainer, loader, max_batches: int | None = None) -> dict:
             }
             for i in range(10)
         },
+    }
+
+
+@torch.no_grad()
+def evaluate_reconstruction_feature_mse(
+    trainer,
+    loader,
+    t_values: list[float],
+    steps: int,
+    max_batches: int | None = None,
+) -> dict:
+    denoiser = trainer.training_models["denoiser"]
+    denoiser.eval()
+    sampler = trainer.get_sampler()
+    amp_context = get_amp_context(trainer)
+    metrics = {}
+
+    for t_value in t_values:
+        total_mse_sum = 0.0
+        total_mse_count = 0
+        edge_mse_sum = 0.0
+        edge_mse_count = 0
+        vertex_mse_sum = 0.0
+        vertex_mse_count = 0
+        total_instances = 0
+        total_tokens = 0
+
+        for batch_idx, data in enumerate(tqdm(loader, desc=f"Evaluating reconstruction feature MSE t={t_value:.3f}")):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            data = recursive_to_device(data, trainer.device)
+            x_0 = data["x_0"]
+            cond = data.get("cond", None)
+            kwargs = {k: v for k, v in data.items() if k not in {"x_0", "cond"}}
+            model_cond = trainer.get_cond(cond, **kwargs)
+
+            noise = x_0.replace(torch.randn_like(x_0.feats))
+            t = torch.full((x_0.shape[0],), t_value, device=x_0.device, dtype=torch.float32)
+            sample = trainer.diffuse(x_0, t, noise=noise)
+
+            t_seq = np.linspace(t_value, 0.0, steps + 1).tolist()
+            for t_cur, t_prev in zip(t_seq[:-1], t_seq[1:]):
+                with amp_context:
+                    out = sampler.sample_once(
+                        trainer.models["denoiser"],
+                        sample,
+                        t_cur,
+                        t_prev,
+                        model_cond,
+                        **kwargs,
+                    )
+                sample = out.pred_x_prev
+
+            diff = (sample.feats.float() - x_0.feats.float()).pow(2)
+            total_mse_sum += diff.sum().item()
+            total_mse_count += diff.numel()
+            total_instances += x_0.shape[0]
+            total_tokens += sample.feats.shape[0]
+
+            if diff.shape[1] >= 3:
+                edge = diff[:, :3]
+                edge_mse_sum += edge.sum().item()
+                edge_mse_count += edge.numel()
+            if diff.shape[1] >= 6:
+                vertex = diff[:, 3:6]
+                vertex_mse_sum += vertex.sum().item()
+                vertex_mse_count += vertex.numel()
+
+        metrics[f"t_{t_value:.3f}"] = {
+            "mse": total_mse_sum / total_mse_count if total_mse_count else None,
+            "edge_mse": edge_mse_sum / edge_mse_count if edge_mse_count else None,
+            "vertex_mse": vertex_mse_sum / vertex_mse_count if vertex_mse_count else None,
+            "num_instances": total_instances,
+            "num_tokens": total_tokens,
+            "sampling_steps": steps,
+        }
+
+    return metrics
+
+
+@torch.no_grad()
+def evaluate_pure_noise_feature_mse(
+    trainer,
+    loader,
+    steps: int,
+    max_batches: int | None = None,
+) -> dict:
+    denoiser = trainer.training_models["denoiser"]
+    denoiser.eval()
+    sampler = trainer.get_sampler()
+    total_mse_sum = 0.0
+    total_mse_count = 0
+    edge_mse_sum = 0.0
+    edge_mse_count = 0
+    vertex_mse_sum = 0.0
+    vertex_mse_count = 0
+    total_instances = 0
+    total_tokens = 0
+
+    for batch_idx, data in enumerate(tqdm(loader, desc="Evaluating pure-noise feature MSE")):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        data = recursive_to_device(data, trainer.device)
+        x_0 = data["x_0"]
+        cond = data.get("cond", None)
+        kwargs = {k: v for k, v in data.items() if k not in {"x_0", "cond"}}
+        model_cond = trainer.get_cond(cond, **kwargs)
+
+        noise = x_0.replace(torch.randn_like(x_0.feats))
+        sample = sampler.sample(
+            trainer.models["denoiser"],
+            noise=noise,
+            cond=model_cond,
+            steps=steps,
+            verbose=False,
+            **kwargs,
+        ).samples
+
+        diff = (sample.feats.float() - x_0.feats.float()).pow(2)
+        total_mse_sum += diff.sum().item()
+        total_mse_count += diff.numel()
+        total_instances += x_0.shape[0]
+        total_tokens += sample.feats.shape[0]
+
+        if diff.shape[1] >= 3:
+            edge = diff[:, :3]
+            edge_mse_sum += edge.sum().item()
+            edge_mse_count += edge.numel()
+        if diff.shape[1] >= 6:
+            vertex = diff[:, 3:6]
+            vertex_mse_sum += vertex.sum().item()
+            vertex_mse_count += vertex.numel()
+
+    return {
+        "mse": total_mse_sum / total_mse_count if total_mse_count else None,
+        "edge_mse": edge_mse_sum / edge_mse_count if edge_mse_count else None,
+        "vertex_mse": vertex_mse_sum / vertex_mse_count if vertex_mse_count else None,
+        "num_instances": total_instances,
+        "num_tokens": total_tokens,
+        "sampling_steps": steps,
     }
 
 
@@ -407,12 +547,30 @@ def main():
         collate_fn=dataset.collate_fn,
     )
     metrics = evaluate_flow_mse(trainer, loader, max_batches=args.max_batches)
+    reconstruction_t_values = parse_t_values(args.reconstruction_ts)
+    if reconstruction_t_values:
+        metrics["full_reconstruction_feature_mse"] = evaluate_reconstruction_feature_mse(
+            trainer,
+            loader,
+            reconstruction_t_values,
+            args.sampling_steps,
+            max_batches=args.max_batches,
+        )
+    else:
+        metrics["full_reconstruction_feature_mse"] = {}
+    metrics["pure_noise_feature_mse"] = evaluate_pure_noise_feature_mse(
+        trainer,
+        loader,
+        args.sampling_steps,
+        max_batches=args.max_batches,
+    )
     metrics.update({
         "checkpoint_step": ckpt_step,
         "checkpoint_path": ckpt_path,
         "ema_rate": args.ema_rate,
         "split": args.split,
         "dataset_size": len(dataset),
+        "dataset_stats": getattr(dataset, "_stats", None),
         "max_batches": args.max_batches,
     })
     if metadata_filter_info is not None:
@@ -421,7 +579,7 @@ def main():
     metrics_path = output_dir / "metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
-    print(f"Saved flow MSE metrics to {metrics_path}")
+    print(f"Saved flow/pure-noise metrics to {metrics_path}")
 
     recon_metrics = save_visualizations(
         trainer,
@@ -429,7 +587,7 @@ def main():
         output_dir,
         args.num_samples,
         args.generated_samples,
-        parse_t_values(args.reconstruction_ts),
+        reconstruction_t_values,
         args.sampling_steps,
         args.render_resolution,
         args.render_ssaa,
