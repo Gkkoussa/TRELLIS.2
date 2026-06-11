@@ -988,7 +988,7 @@ python data_toolkit/voxelize_triangle_field.py ObjaverseXL \
   --resolution 256 \
   --feature_dtype float16 \
   --npz_compression zstd \
-  --zstd_level 3 \
+  --zstd_level 5 \
   --candidate_source native \
   --projection_mode inside_barycentric \
   --max_workers 8
