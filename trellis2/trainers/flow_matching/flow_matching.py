@@ -48,6 +48,7 @@ class FlowMatchingTrainer(BasicTrainer):
 
         t_schedule (dict): Time schedule for flow matching.
         sigma_min (float): Minimum noise level.
+        noise_scale (float): Multiplier on the noise term in the flow path.
     """
     def __init__(
         self,
@@ -60,11 +61,16 @@ class FlowMatchingTrainer(BasicTrainer):
             }
         },
         sigma_min: float = 1e-5,
+        noise_scale: float = 1.0,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.t_schedule = t_schedule
         self.sigma_min = sigma_min
+        self.noise_scale = noise_scale
+
+    def _noise_coeff(self, t: torch.Tensor) -> torch.Tensor:
+        return self.noise_scale * (self.sigma_min + (1 - self.sigma_min) * t)
 
     def diffuse(self, x_0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -84,7 +90,7 @@ class FlowMatchingTrainer(BasicTrainer):
         assert noise.shape == x_0.shape, "noise must have same shape as x_0"
 
         t = t.view(-1, *[1 for _ in range(len(x_0.shape) - 1)])
-        x_t = (1 - t) * x_0 + (self.sigma_min + (1 - self.sigma_min) * t) * noise
+        x_t = (1 - t) * x_0 + self._noise_coeff(t) * noise
 
         return x_t
 
@@ -94,14 +100,14 @@ class FlowMatchingTrainer(BasicTrainer):
         """
         assert noise.shape == x_t.shape, "noise must have same shape as x_t"
         t = t.view(-1, *[1 for _ in range(len(x_t.shape) - 1)])
-        x_0 = (x_t - (self.sigma_min + (1 - self.sigma_min) * t) * noise) / (1 - t)
+        x_0 = (x_t - self._noise_coeff(t) * noise) / (1 - t)
         return x_0
 
     def get_v(self, x_0: torch.Tensor, noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         Compute the velocity of the diffusion process at time t.
         """
-        return (1 - self.sigma_min) * noise - x_0
+        return self.noise_scale * (1 - self.sigma_min) * noise - x_0
 
     def get_cond(self, cond, **kwargs):
         """
@@ -119,7 +125,7 @@ class FlowMatchingTrainer(BasicTrainer):
         """
         Get the sampler for the diffusion process.
         """
-        return samplers.FlowEulerSampler(self.sigma_min)
+        return samplers.FlowEulerSampler(self.sigma_min, noise_scale=self.noise_scale)
     
     def vis_cond(self, **kwargs):
         """

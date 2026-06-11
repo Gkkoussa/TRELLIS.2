@@ -56,4 +56,4 @@ class ClassifierFreeGuidanceMixin:
         """
         Get the sampler for the diffusion process.
         """
-        return samplers.FlowEulerCfgSampler(self.sigma_min)
+        return samplers.FlowEulerCfgSampler(self.sigma_min, noise_scale=self.noise_scale)

@@ -2,14 +2,14 @@
 #SBATCH --job-name=voxelize_6channel_512
 #SBATCH --output=./job_logs/voxelize_gdist_512_%A_%a.log
 #SBATCH --nodes=1
-#SBATCH --partition=spgpu2
+#SBATCH --partition=gpu-rtx6000
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=2-00:00:00
 #SBATCH --mem=64G
-#SBATCH --account=jjparkcv_owned1
+#SBATCH --account=jjparkcv_owned2
 #SBATCH --gpus-per-task=1
-#SBATCH --array=0-31%16
+#SBATCH --array=0-31%8
 
 source ~/.bashrc
 module load cuda/12.8
@@ -25,7 +25,7 @@ python data_toolkit/voxelize_gaussian_distance.py ObjaverseXL \
   --root "$ROOT" \
   --pbr_dump_root "$ROOT" \
   --gaussian_distance_voxel_root "$ROOT" \
-  --resolution 512 \
+  --resolution 64 \
   --sigma_multipliers 0.5,3.0,10.0 \
   --max_workers 1 \
   --rank "$SLURM_ARRAY_TASK_ID" \

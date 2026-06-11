@@ -1,33 +1,60 @@
 {
     "models": {
         "denoiser": {
-            "name": "ElasticSLatFlowModel",
+            "name": "SparseUNetDiTFlowModel",
             "args": {
-                "resolution": 32,
                 "in_channels": 6,
                 "out_channels": 6,
-                "model_channels": 1536,
-                "cond_channels": 3,
-                "num_blocks": 30,
-                "num_heads": 12,
-                "mlp_ratio": 5.3334,
+                "model_channels": [64, 128, 512],
+                "num_blocks": [1, 2, 4],
+                "block_type": [
+                    "SparseConvNeXtBlock3d",
+                    "SparseConvNeXtBlock3d",
+                    "SparseConvNeXtBlock3d"
+                ],
+                "down_block_type": [
+                    "SparseResBlockS2C3d",
+                    "SparseResBlockS2C3d"
+                ],
+                "up_block_type": [
+                    "SparseResBlockC2S3d",
+                    "SparseResBlockC2S3d"
+                ],
+                "block_args": [
+                    {
+                        "use_checkpoint": true
+                    },
+                    {
+                        "use_checkpoint": true
+                    },
+                    {
+                        "use_checkpoint": false
+                    }
+                ],
+                "latent_channels": 512,
+                "dit_model_channels": 768,
+                "dit_num_blocks": 8,
+                "dit_num_heads": 12,
+                "dit_mlp_ratio": 4.0,
                 "pe_mode": "rope",
-                "share_mod": true,
+                "dit_share_mod": true,
                 "initialization": "scaled",
                 "qk_rms_norm": true,
-                "qk_rms_norm_cross": true
+                "dtype": "bfloat16",
+                "dit_use_checkpoint": true,
+                "use_fp16": false
             }
         }
     },
     "dataset": {
         "name": "SparseGaussianPatchDataset",
         "args": {
-            "resolution": 256,
-            "patch_size": 32,
+            "resolution": 64,
+            "patch_size": 64,
             "min_aesthetic_score": 4.5,
-            "max_active_voxels": 32768,
+            "max_active_voxels": null,
             "min_patch_active_voxels": 1,
-            "max_resample_attempts": 16,
+            "max_resample_attempts": 1,
             "max_num_faces": null,
             "attrs": [
                 "base_color",
@@ -39,7 +66,7 @@
             "foreground_patch_prob": 1.0,
             "background_value": -1.0,
             "num_read_threads": 4,
-            "cond_as_token": true,
+            "cond_as_token": false,
             "zero_cond": true
         }
     },
@@ -47,8 +74,8 @@
         "name": "SparseFlowMatchingTrainer",
         "args": {
             "max_steps": 1000000,
-            "batch_size_per_gpu": 8,
-            "batch_split": 2,
+            "batch_size_per_gpu": 16,
+            "batch_split": 1,
             "num_workers": 2,
             "optimizer": {
                 "name": "AdamW",
@@ -64,13 +91,6 @@
             ],
             "mix_precision_mode": "amp",
             "mix_precision_dtype": "bfloat16",
-            "elastic": {
-                "name": "LinearMemoryController",
-                "args": {
-                    "target_ratio": 0.75,
-                    "max_mem_ratio_start": 0.5
-                }
-            },
             "grad_clip": {
                 "name": "AdaptiveGradClipper",
                 "args": {

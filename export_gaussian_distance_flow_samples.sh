@@ -2,12 +2,12 @@
 #SBATCH --job-name=trellis-gdist-flow-export
 #SBATCH --output=./job_logs/trellis-gdist-flow-export_%j.log
 #SBATCH --nodes=1
-#SBATCH --partition=spgpu2
+#SBATCH --partition=gpu-rtx6000
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=08:00:00
 #SBATCH --mem=96G
-#SBATCH --account=jjparkcv_owned1
+#SBATCH --account=jjparkcv_owned2
 #SBATCH --gres=gpu:1
 
 source ~/.bashrc
@@ -20,13 +20,22 @@ cd /home/gpranav/pranav_work/scratch/TRELLIS.2/
 mkdir -p job_logs
 
 export ROOT="${ROOT:-/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k}"
+
+# 512^3 flow (default)
 export LATENT_NAME="${LATENT_NAME:-gaussian_distance_vae_512_step0220000_512}"
 export MICHELANGELO_NAME="${MICHELANGELO_NAME:-shapevae256_pretrained}"
 export RUN_NAME="${RUN_NAME:-michelangelo2gaussian_distance_flow_50391241}"
-export RUN_DIR="${1:-$ROOT/outputs/$RUN_NAME}"
+export RUN_DIR="${RUN_DIR:-${1:-$ROOT/outputs/$RUN_NAME}}"
+
+# 256^3 comparison flow (same selected sha256s, subdirectory under EXPORT_RUN_NAME)
+export EXPORT_ALSO_256="${EXPORT_ALSO_256:-1}"
+export LATENT_NAME_256="${LATENT_NAME_256:-gaussian_distance_vae_step0230000_256}"
+export RUN_NAME_256="${RUN_NAME_256:-michelangelo2gaussian_distance_flow_50023629}"
+export RUN_DIR_256="${RUN_DIR_256:-$ROOT/outputs/$RUN_NAME_256}"
 
 export EXPORT_SPLIT="${EXPORT_SPLIT:-test}"
 export EXPORT_CKPT="${EXPORT_CKPT:-latest}"
+export EXPORT_CKPT_256="${EXPORT_CKPT_256:-$EXPORT_CKPT}"
 export EXPORT_RUN_NAME="${EXPORT_RUN_NAME:-sample_debug_${EXPORT_SPLIT}_${SLURM_JOB_ID}}"
 export EXPORT_NUM_SAMPLES="${EXPORT_NUM_SAMPLES:-16}"
 export EXPORT_BATCH_SIZE="${EXPORT_BATCH_SIZE:-4}"
@@ -59,18 +68,42 @@ if [ "${EXPORT_SAVE_DECODED_NPZ:-0}" = "1" ]; then
   EXTRA_ARGS+=(--save_decoded_npz)
 fi
 
-python /home/gpranav/pranav_work/scratch/TRELLIS.2/export_gaussian_distance_flow_samples.py \
-  --run_dir "$RUN_DIR" \
-  --root "$ROOT" \
-  --split "$EXPORT_SPLIT" \
-  --ckpt "$EXPORT_CKPT" \
-  --output_dir "$RUN_DIR/$EXPORT_RUN_NAME" \
-  --gaussian_distance_latent_name "$LATENT_NAME" \
-  --michelangelo_latent_name "$MICHELANGELO_NAME" \
-  --num_samples "$EXPORT_NUM_SAMPLES" \
-  --batch_size "$EXPORT_BATCH_SIZE" \
-  --sampling_steps "$EXPORT_SAMPLING_STEPS" \
-  --guidance_strength "$EXPORT_GUIDANCE_STRENGTH" \
-  --render_resolution "$EXPORT_RENDER_RESOLUTION" \
-  --seed "$EXPORT_SEED" \
-  "${EXTRA_ARGS[@]}"
+run_export() {
+  local output_dir="$RUN_DIR/$EXPORT_RUN_NAME"
+
+  local COMPARE_ARGS=()
+  if [ "${EXPORT_ALSO_256}" = "1" ]; then
+    COMPARE_ARGS+=(
+      --name "$RUN_NAME"
+      --compare_run_dir "$RUN_DIR_256"
+      --compare_name "$RUN_NAME_256"
+      --compare_ckpt "$EXPORT_CKPT_256"
+      --compare_gaussian_distance_latent_name "$LATENT_NAME_256"
+    )
+    if [ -n "${EXPORT_EMA_RATE_256:-}" ]; then
+      COMPARE_ARGS+=(--compare_ema_rate "$EXPORT_EMA_RATE_256")
+    fi
+    echo "=== Exporting comparison from ${RUN_DIR} and ${RUN_DIR_256} -> ${output_dir} ==="
+  else
+    echo "=== Exporting from ${RUN_DIR} (latent=${LATENT_NAME}) -> ${output_dir} ==="
+  fi
+
+  python /home/gpranav/pranav_work/scratch/TRELLIS.2/export_gaussian_distance_flow_samples.py \
+    --run_dir "$RUN_DIR" \
+    --root "$ROOT" \
+    --split "$EXPORT_SPLIT" \
+    --ckpt "$EXPORT_CKPT" \
+    --output_dir "$output_dir" \
+    --gaussian_distance_latent_name "$LATENT_NAME" \
+    --michelangelo_latent_name "$MICHELANGELO_NAME" \
+    --num_samples "$EXPORT_NUM_SAMPLES" \
+    --batch_size "$EXPORT_BATCH_SIZE" \
+    --sampling_steps "$EXPORT_SAMPLING_STEPS" \
+    --guidance_strength "$EXPORT_GUIDANCE_STRENGTH" \
+    --render_resolution "$EXPORT_RENDER_RESOLUTION" \
+    --seed "$EXPORT_SEED" \
+    "${COMPARE_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}"
+}
+
+run_export

@@ -1,5 +1,6 @@
 import os
 import io
+import csv
 from typing import Union
 import numpy as np
 import pickle
@@ -91,6 +92,111 @@ class SparseVoxelPbrVisMixin:
         return images
 
 
+class SparseVoxelShapeDataset(SparseVoxelPbrVisMixin, StandardDatasetBase):
+    """
+    Sparse voxel occupancy dataset.
+
+    Reads existing sparse .vxz voxel files and returns only the active voxel
+    coordinates with a single occupancy feature set to 1.
+    """
+
+    def __init__(
+        self,
+        roots,
+        resolution: int = 1024,
+        max_active_voxels: int = 1000000,
+        max_num_faces: int = None,
+        min_aesthetic_score: float = 5.0,
+        voxel_root_key: str = 'shape_voxel',
+        voxel_dirname: str = 'shape_voxels',
+        voxelized_flag_column: str = 'shape_voxelized',
+        num_voxels_column: str = 'num_shape_voxels',
+        num_read_threads: int = 4,
+    ):
+        self.resolution = resolution
+        self.min_aesthetic_score = min_aesthetic_score
+        self.max_active_voxels = max_active_voxels
+        self.max_num_faces = max_num_faces
+        self.voxel_root_key = voxel_root_key
+        self.voxel_dirname = voxel_dirname
+        self.voxelized_flag_column = voxelized_flag_column
+        self.num_voxels_column = num_voxels_column
+        self.num_read_threads = num_read_threads
+        self.value_range = (0, 1)
+        self.layout = {
+            'occupancy': slice(0, 1),
+        }
+
+        super().__init__(roots)
+
+        self.loads = [self.metadata.loc[sha256, self.num_voxels_column] for _, sha256 in self.instances]
+
+    def __str__(self):
+        lines = [
+            super().__str__(),
+            f'  - Resolution: {self.resolution}',
+            f'  - Voxel dirname: {self.voxel_dirname}_{self.resolution}',
+        ]
+        return '\n'.join(lines)
+
+    def filter_metadata(self, metadata):
+        stats = {}
+        metadata = metadata[metadata[self.voxelized_flag_column] == True]
+        stats[f'{self.voxelized_flag_column} == True'] = len(metadata)
+        if self.min_aesthetic_score is not None:
+            metadata = metadata[metadata['aesthetic_score'] >= self.min_aesthetic_score]
+            stats[f'Aesthetic score >= {self.min_aesthetic_score}'] = len(metadata)
+        metadata = metadata[metadata[self.num_voxels_column] <= self.max_active_voxels]
+        stats[f'Active voxels <= {self.max_active_voxels}'] = len(metadata)
+        if self.max_num_faces is not None:
+            metadata = metadata[metadata['num_faces'] <= self.max_num_faces]
+            stats[f'Faces <= {self.max_num_faces}'] = len(metadata)
+        return metadata, stats
+
+    def read_shape_voxel(self, root, instance):
+        coords, _ = o_voxel.io.read_vxz(
+            os.path.join(root[self.voxel_root_key], f'{instance}.vxz'),
+            num_threads=self.num_read_threads,
+        )
+        feats = torch.ones((coords.shape[0], 1), dtype=torch.float32)
+        x = sp.SparseTensor(
+            feats,
+            torch.cat([torch.zeros_like(coords[:, 0:1]), coords], dim=-1),
+        )
+        return {'x': x}
+
+    def get_instance(self, root, instance):
+        return self.read_shape_voxel(root, instance)
+
+    @staticmethod
+    def collate_fn(batch, split_size=None):
+        if split_size is None:
+            group_idx = [list(range(len(batch)))]
+        else:
+            group_idx = load_balanced_group_indices([b['x'].feats.shape[0] for b in batch], split_size)
+        packs = []
+        for group in group_idx:
+            sub_batch = [batch[i] for i in group]
+            pack = {}
+
+            keys = [k for k in sub_batch[0].keys()]
+            for k in keys:
+                if isinstance(sub_batch[0][k], torch.Tensor):
+                    pack[k] = torch.stack([b[k] for b in sub_batch])
+                elif isinstance(sub_batch[0][k], sp.SparseTensor):
+                    pack[k] = sp.sparse_cat([b[k] for b in sub_batch], dim=0)
+                elif isinstance(sub_batch[0][k], list):
+                    pack[k] = sum([b[k] for b in sub_batch], [])
+                else:
+                    pack[k] = [b[k] for b in sub_batch]
+
+            packs.append(pack)
+
+        if split_size is None:
+            return packs[0]
+        return packs
+
+
 class DenseGaussianPatchDataset(StandardDatasetBase):
     """
     Dense 6-channel Gaussian-distance patch dataset.
@@ -117,6 +223,8 @@ class DenseGaussianPatchDataset(StandardDatasetBase):
         cond_as_token: bool = False,
         zero_cond: bool = False,
         return_origin: bool = False,
+        metadata_filter_csv: str = None,
+        metadata_filter_column: str = None,
     ):
         if patch_size > resolution:
             raise ValueError(f"patch_size ({patch_size}) must be <= resolution ({resolution})")
@@ -139,6 +247,9 @@ class DenseGaussianPatchDataset(StandardDatasetBase):
         self.cond_as_token = cond_as_token
         self.zero_cond = zero_cond
         self.return_origin = return_origin
+        self.metadata_filter_csv = metadata_filter_csv
+        self.metadata_filter_column = metadata_filter_column
+        self._metadata_filter_sha256 = None
         self.value_range = (-1, 1)
         self.channels = {
             'base_color': 3,
@@ -172,8 +283,35 @@ class DenseGaussianPatchDataset(StandardDatasetBase):
             f'  - Cond as token: {self.cond_as_token}',
             f'  - Zero cond: {self.zero_cond}',
             f'  - Return origin: {self.return_origin}',
+            f'  - Metadata filter CSV: {self.metadata_filter_csv}',
+            f'  - Metadata filter column: {self.metadata_filter_column}',
         ]
         return '\n'.join(lines)
+
+    def _load_gaussian_metadata_filter(self):
+        if self.metadata_filter_csv is None:
+            return None
+        if self._metadata_filter_sha256 is not None:
+            return self._metadata_filter_sha256
+
+        def truthy(value):
+            return str(value).strip().lower() in {'1', 'true', 't', 'yes', 'y'}
+
+        allowed = set()
+        with open(self.metadata_filter_csv, newline='') as f:
+            reader = csv.DictReader(f)
+            if 'sha256' not in reader.fieldnames:
+                raise ValueError(f"Metadata filter CSV must contain sha256 column: {self.metadata_filter_csv}")
+            if self.metadata_filter_column is not None and self.metadata_filter_column not in reader.fieldnames:
+                raise ValueError(
+                    f"Metadata filter CSV is missing requested column "
+                    f"{self.metadata_filter_column}: {self.metadata_filter_csv}"
+                )
+            for row in reader:
+                if self.metadata_filter_column is None or truthy(row[self.metadata_filter_column]):
+                    allowed.add(str(row['sha256']))
+        self._metadata_filter_sha256 = allowed
+        return allowed
 
     def filter_metadata(self, metadata):
         stats = {}
@@ -185,6 +323,10 @@ class DenseGaussianPatchDataset(StandardDatasetBase):
         if self.max_num_faces is not None:
             metadata = metadata[metadata['num_faces'] <= self.max_num_faces]
             stats[f'Faces <= {self.max_num_faces}'] = len(metadata)
+        allowed_sha256 = self._load_gaussian_metadata_filter()
+        if allowed_sha256 is not None:
+            metadata = metadata[metadata.index.astype(str).isin(allowed_sha256)]
+            stats[f'Metadata filter {self.metadata_filter_column or "sha256"}'] = len(metadata)
         return metadata, stats
 
     def _sample_patch_origin(self, coords: torch.Tensor) -> torch.Tensor:

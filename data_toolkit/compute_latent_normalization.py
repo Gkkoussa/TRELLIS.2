@@ -40,6 +40,21 @@ def truthy_series(series):
     return series.fillna(False).map(lambda value: str(value).strip().lower() in true_values)
 
 
+def load_metadata_filter(metadata_filter_csv: str) -> set[str]:
+    allowed = None
+    for path in [p.strip() for p in metadata_filter_csv.split(",") if p.strip()]:
+        filter_metadata = pd.read_csv(path)
+        if "sha256" not in filter_metadata.columns:
+            raise ValueError(f"{path} must contain a sha256 column.")
+        if "local_density_filter_keep" in filter_metadata.columns:
+            filter_metadata = filter_metadata[truthy_series(filter_metadata["local_density_filter_keep"])]
+        elif "has_local_dense_region" in filter_metadata.columns:
+            filter_metadata = filter_metadata[~truthy_series(filter_metadata["has_local_dense_region"])]
+        current = set(filter_metadata["sha256"].astype(str).values)
+        allowed = current if allowed is None else allowed & current
+    return allowed or set()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compute per-channel mean/std for latent features using token-weighted statistics."
@@ -73,6 +88,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not require the latent encoded flag to be true.",
     )
+    parser.add_argument(
+        "--metadata-filter-csv",
+        default=None,
+        help=(
+            "Optional CSV of allowed sha256 values. Multiple CSVs can be comma-separated "
+            "and are applied as an intersection. local_density_filter_keep/has_local_dense_region "
+            "columns are honored when present."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -102,6 +126,11 @@ def main() -> None:
     metadata["sha256"] = metadata["sha256"].astype(str)
     if not args.allow_unencoded:
         metadata = metadata[truthy_series(metadata[flag_col])].copy()
+    if args.metadata_filter_csv is not None and args.metadata_filter_csv.strip() != "":
+        allowed = load_metadata_filter(args.metadata_filter_csv)
+        before = len(metadata)
+        metadata = metadata[metadata["sha256"].isin(allowed)].copy()
+        print(f"Metadata filter kept {len(metadata)} / {before} rows")
     metadata = metadata.drop_duplicates("sha256", keep="first")
     if args.max_files is not None:
         metadata = metadata.head(args.max_files)

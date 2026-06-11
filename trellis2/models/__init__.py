@@ -13,6 +13,7 @@ __attributes = {
     # SC-VAEs
     'SparseUnetVaeEncoder': 'sc_vaes.sparse_unet_vae',
     'SparseUnetVaeDecoder': 'sc_vaes.sparse_unet_vae',
+    'SparseUNetDiTFlowModel': 'sc_vaes.sparse_unet_dit_flow',
     'FlexiDualGridVaeEncoder': 'sc_vaes.fdg_vae',
     'FlexiDualGridVaeDecoder': 'sc_vaes.fdg_vae'
 }
@@ -75,4 +76,5 @@ if __name__ == '__main__':
     from .structured_latent_flow import SLatFlowModel, ElasticSLatFlowModel
         
     from .sc_vaes.sparse_unet_vae import SparseUnetVaeEncoder, SparseUnetVaeDecoder
+    from .sc_vaes.sparse_unet_dit_flow import SparseUNetDiTFlowModel
     from .sc_vaes.fdg_vae import FlexiDualGridVaeEncoder, FlexiDualGridVaeDecoder

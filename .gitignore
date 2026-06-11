@@ -222,3 +222,15 @@ outputs/
 *.out
 
 Michelangelo/
+
+post_decode_patch_*/
+
+objxl_canonical_cross_duplicate_meshes/
+objxl_chamfer_point_cache/
+sparse_patch_vis_32/
+*.obj
+dense_patch_vis/
+dense_patch_vis_rendered/
+errors.txt
+meshes_V1138_F2248/
+missing_gdist64.txt

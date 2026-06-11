@@ -3,7 +3,7 @@
         "denoiser": {
             "name": "ElasticSLatFlowModel",
             "args": {
-                "resolution": 32,
+                "resolution": 16,
                 "in_channels": 6,
                 "out_channels": 6,
                 "model_channels": 1536,
@@ -23,9 +23,9 @@
         "name": "SparseGaussianPatchDataset",
         "args": {
             "resolution": 256,
-            "patch_size": 32,
+            "patch_size": 16,
             "min_aesthetic_score": 4.5,
-            "max_active_voxels": 32768,
+            "max_active_voxels": 4096,
             "min_patch_active_voxels": 1,
             "max_resample_attempts": 16,
             "max_num_faces": null,
@@ -49,7 +49,6 @@
             "max_steps": 1000000,
             "batch_size_per_gpu": 8,
             "batch_split": 2,
-            "num_workers": 2,
             "optimizer": {
                 "name": "AdamW",
                 "args": {
@@ -86,8 +85,6 @@
                 "args": {}
             },
             "sigma_min": 1e-5,
-            "noise_scale": 2.0,
-            "skip_startup_snapshot": true,
             "snapshot_batch_size": 1
         }
     }
