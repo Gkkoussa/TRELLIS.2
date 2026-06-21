@@ -10,6 +10,7 @@ from .components import StandardDatasetBase
 from ..modules.sparse import SparseTensor, sparse_cat
 from ..renderers import VoxelRenderer
 from ..representations import Voxel
+from ..utils.render_utils import snapshot_orbit_cameras
 from ..utils.data_utils import load_balanced_group_indices
 
 
@@ -129,25 +130,7 @@ class GaussianDistanceSLatVisMixin:
         renderer.rendering_options.resolution = render_resolution
         renderer.rendering_options.ssaa = 4
 
-        # Build camera
-        yaws = [0, np.pi / 2, np.pi, 3 * np.pi / 2]
-        yaws_offset = np.random.uniform(-np.pi / 4, np.pi / 4)
-        yaws = [y + yaws_offset for y in yaws]
-        pitch = [np.random.uniform(-np.pi / 4, np.pi / 4) for _ in range(4)]
-
-        exts = []
-        ints = []
-        for yaw, pitch_i in zip(yaws, pitch):
-            orig = torch.tensor([
-                np.sin(yaw) * np.cos(pitch_i),
-                np.cos(yaw) * np.cos(pitch_i),
-                np.sin(pitch_i),
-            ]).float().cuda() * 2
-            fov = torch.deg2rad(torch.tensor(30)).cuda()
-            extrinsics = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().cuda(), torch.tensor([0, 0, 1]).float().cuda())
-            intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
-            exts.append(extrinsics)
-            ints.append(intrinsics)
+        exts, ints = snapshot_orbit_cameras()
 
         images = {k: [] for k in self.layout}
 

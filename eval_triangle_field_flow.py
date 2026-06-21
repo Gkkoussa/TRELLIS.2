@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--max_batches", type=int, default=None, help="Optional cap on validation batches.")
     parser.add_argument("--num_samples", type=int, default=16, help="Number of visualization samples.")
     parser.add_argument("--snapshot_batch_size", type=int, default=4, help="Batch size used by trainer.snapshot().")
+    parser.add_argument("--dataset_resolution", type=int, default=None, help="Override dataset/decode resolution.")
     parser.add_argument("--render_resolution", type=int, default=None, help="Override flow snapshot render resolution.")
     parser.add_argument("--sampling_steps", type=int, default=12, help="Number of Euler sampling steps.")
     parser.add_argument("--guidance_strength", type=float, default=1.0, help="Classifier-free guidance strength.")
@@ -179,6 +180,8 @@ def main():
     cfg = json.load(open(config_path, "r"))
     dataset_args = json.loads(json.dumps(cfg["dataset"]["args"]))
     trainer_args = json.loads(json.dumps(cfg["trainer"]["args"]))
+    if args.dataset_resolution is not None:
+        dataset_args["resolution"] = args.dataset_resolution
     if args.render_resolution is not None:
         dataset_args["snapshot_render_resolution"] = args.render_resolution
 

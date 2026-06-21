@@ -39,6 +39,13 @@ def yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs):
     return extrinsics, intrinsics
 
 
+def snapshot_orbit_cameras(nviews=4, yaw_offset=-16 / 180 * np.pi, pitch=20 / 180 * np.pi, r=2, fov=30):
+    yaw = np.linspace(0, 2 * np.pi, nviews, endpoint=False)
+    yaw = [y + yaw_offset for y in yaw]
+    pitch = [pitch for _ in range(nviews)]
+    return yaw_pitch_r_fov_to_extrinsics_intrinsics(yaw, pitch, r, fov)
+
+
 def get_renderer(sample, **kwargs):
     if isinstance(sample, (MeshWithPbrMaterial, MeshWithVoxel)):
         renderer = PbrMeshRenderer()
@@ -98,11 +105,7 @@ def render_multiview(sample, resolution=512, nviews=30):
 
 
 def render_snapshot(samples, resolution=512, bg_color=(0, 0, 0), offset=(-16 / 180 * np.pi, 20 / 180 * np.pi), r=10, fov=8, nviews=4, **kwargs):
-    yaw = np.linspace(0, 2 * np.pi, nviews, endpoint=False)
-    yaw_offset = offset[0]
-    yaw = [y + yaw_offset for y in yaw]
-    pitch = [offset[1] for _ in range(nviews)]
-    extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaw, pitch, r, fov)
+    extrinsics, intrinsics = snapshot_orbit_cameras(nviews=nviews, yaw_offset=offset[0], pitch=offset[1], r=r, fov=fov)
     return render_frames(samples, extrinsics, intrinsics, {'resolution': resolution, 'bg_color': bg_color}, **kwargs)
 
 

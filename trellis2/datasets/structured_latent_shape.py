@@ -7,7 +7,7 @@ from .. import models
 from .components import ImageConditionedMixin
 from ..modules.sparse import SparseTensor
 from .structured_latent import SLatVisMixin, SLat
-from ..utils.render_utils import get_renderer, yaw_pitch_r_fov_to_extrinsics_intrinsics
+from ..utils.render_utils import get_renderer, snapshot_orbit_cameras
 
 
 class SLatShapeVisMixin(SLatVisMixin):
@@ -29,12 +29,7 @@ class SLatShapeVisMixin(SLatVisMixin):
         x_0 = x_0 if isinstance(x_0, SparseTensor) else x_0['x_0']
         reps = self.decode_latent(x_0.cuda())
         
-        # build camera
-        yaw = [0, np.pi/2, np.pi, 3*np.pi/2]
-        yaw_offset = -16 / 180 * np.pi
-        yaw = [y + yaw_offset for y in yaw]
-        pitch = [20 / 180 * np.pi for _ in range(4)]
-        exts, ints = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaw, pitch, 2, 30)
+        exts, ints = snapshot_orbit_cameras()
         
         # render
         renderer = get_renderer(reps[0])

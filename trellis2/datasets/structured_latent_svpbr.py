@@ -11,7 +11,7 @@ from ..modules.sparse import SparseTensor, sparse_cat
 from ..representations import MeshWithVoxel
 from ..renderers import PbrMeshRenderer, EnvMap
 from ..utils.data_utils import load_balanced_group_indices
-from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
+from ..utils.render_utils import snapshot_orbit_cameras
 
 
 class SLatPbrVisMixin:
@@ -96,12 +96,7 @@ class SLatPbrVisMixin:
         z = sample['x_0'].cuda()
         reps = self.decode_latent(z, shape_z)
         
-        # build camera
-        yaw = [0, np.pi/2, np.pi, 3*np.pi/2]
-        yaw_offset = -16 / 180 * np.pi
-        yaw = [y + yaw_offset for y in yaw]
-        pitch = [20 / 180 * np.pi for _ in range(4)]
-        exts, ints = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaw, pitch, 2, 30)
+        exts, ints = snapshot_orbit_cameras()
         
         # render
         renderer = PbrMeshRenderer()

@@ -5,7 +5,7 @@
             "args": {
                 "in_channels": 20,
                 "model_channels": [64, 128, 256, 512, 1024],
-                "latent_channels": 32,
+                "latent_channels": 64,
                 "num_blocks": [0, 4, 8, 16, 4],
                 "block_type": [
                     "SparseConvNeXtBlock3d",
@@ -21,21 +21,11 @@
                     "SparseResBlockS2C3d"
                 ],
                 "block_args": [
-                    {
-                        "use_checkpoint": true
-                    },
-                    {
-                        "use_checkpoint": true
-                    },
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": false
-                    }
+                    {"use_checkpoint": true},
+                    {"use_checkpoint": true},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false}
                 ],
                 "use_fp16": true
             }
@@ -45,7 +35,7 @@
             "args": {
                 "out_channels": 2,
                 "model_channels": [1024, 512, 256, 128, 64],
-                "latent_channels": 32,
+                "latent_channels": 64,
                 "num_blocks": [4, 16, 8, 4, 0],
                 "block_type": [
                     "SparseConvNeXtBlock3d",
@@ -61,24 +51,14 @@
                     "SparseResBlockC2S3d"
                 ],
                 "block_args": [
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": true
-                    },
-                    {
-                        "use_checkpoint": true
-                    }
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": true},
+                    {"use_checkpoint": true}
                 ],
                 "use_fp16": true,
-                "pred_subdiv": false
+                "pred_subdiv": true
             }
         }
     },
@@ -106,7 +86,7 @@
             "optimizer": {
                 "name": "AdamW",
                 "args": {
-                    "lr": 1e-4,
+                    "lr": 0.0001,
                     "weight_decay": 0.0
                 }
             },
@@ -116,9 +96,7 @@
                     "warmup_steps": 1000
                 }
             },
-            "ema_rate": [
-                0.9999
-            ],
+            "ema_rate": [0.9999],
             "fp16_mode": "inflat_all",
             "fp16_scale_growth": 0.001,
             "grad_clip": {
@@ -131,7 +109,8 @@
             "i_log": 500,
             "i_sample": 10000,
             "i_save": 10000,
-            "lambda_kl": 1e-4,
+            "lambda_kl": 0.0001,
+            "lambda_subdiv": 0.1,
             "loss_type": "l1",
             "lambda_render": 0.0,
             "debug_nans": false,

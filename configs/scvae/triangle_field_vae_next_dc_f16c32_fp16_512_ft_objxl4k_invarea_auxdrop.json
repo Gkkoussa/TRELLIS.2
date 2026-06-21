@@ -21,21 +21,11 @@
                     "SparseResBlockS2C3d"
                 ],
                 "block_args": [
-                    {
-                        "use_checkpoint": true
-                    },
-                    {
-                        "use_checkpoint": true
-                    },
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": false
-                    }
+                    {"use_checkpoint": true},
+                    {"use_checkpoint": true},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false}
                 ],
                 "use_fp16": true
             }
@@ -61,21 +51,11 @@
                     "SparseResBlockC2S3d"
                 ],
                 "block_args": [
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": false
-                    },
-                    {
-                        "use_checkpoint": true
-                    },
-                    {
-                        "use_checkpoint": true
-                    }
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": true},
+                    {"use_checkpoint": true}
                 ],
                 "use_fp16": true,
                 "pred_subdiv": false
@@ -85,7 +65,7 @@
     "dataset": {
         "name": "SparseVoxelTriangleFieldDataset",
         "args": {
-            "resolution": 256,
+            "resolution": 512,
             "min_aesthetic_score": 4.5,
             "max_active_voxels": 1000000,
             "max_num_faces": null,
@@ -100,13 +80,13 @@
         "name": "TriangleFieldVaeTrainer",
         "args": {
             "max_steps": 1000000,
-            "batch_size_per_gpu": 8,
+            "batch_size_per_gpu": 2,
             "batch_split": 1,
             "num_workers": 2,
             "optimizer": {
                 "name": "AdamW",
                 "args": {
-                    "lr": 1e-4,
+                    "lr": 0.0001,
                     "weight_decay": 0.0
                 }
             },
@@ -116,9 +96,7 @@
                     "warmup_steps": 1000
                 }
             },
-            "ema_rate": [
-                0.9999
-            ],
+            "ema_rate": [0.9999],
             "fp16_mode": "inflat_all",
             "fp16_scale_growth": 0.001,
             "grad_clip": {
@@ -131,12 +109,18 @@
             "i_log": 500,
             "i_sample": 10000,
             "i_save": 10000,
-            "lambda_kl": 1e-4,
+            "lambda_kl": 0.0001,
             "loss_type": "l1",
+            "voxel_loss_weight": {
+                "type": "inverse_triangle_area",
+                "eps": 1e-8,
+                "normalize": "mean",
+                "clamp_max": 100.0
+            },
             "lambda_render": 0.0,
             "debug_nans": false,
             "aux_feature_dropout": {
-                "enabled": false,
+                "enabled": true,
                 "full_prob": 0.5,
                 "drop_all_prob": 0.25,
                 "drop_group_prob": 0.25,
@@ -150,6 +134,10 @@
                     "face_normal",
                     "offset_to_projection"
                 ]
+            },
+            "finetune_ckpt": {
+                "encoder": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/outputs/triangle_field_vae_512_ft256_invarea_20260618_233615/ckpts/encoder_step0170000.pt",
+                "decoder": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/outputs/triangle_field_vae_512_ft256_invarea_20260618_233615/ckpts/decoder_step0170000.pt"
             }
         }
     }

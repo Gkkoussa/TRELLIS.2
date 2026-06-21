@@ -2,10 +2,10 @@
 #SBATCH --job-name=trellis-trifield-vae
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH --time=36:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --partition=gpu-rtx6000
@@ -36,7 +36,7 @@ python /home/koussa/scratch/TRELLIS.2/train.py \
   --data_dir "$DATA_DIR" \
   --num_nodes 1 \
   --node_rank 0 \
-  --num_gpus 8 \
+  --num_gpus 4 \
   --master_addr "$MASTER_ADDR" \
   --master_port "$MASTER_PORT" \
   --auto_retry 3

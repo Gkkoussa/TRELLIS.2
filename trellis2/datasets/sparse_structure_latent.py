@@ -7,7 +7,7 @@ from ..representations import Voxel
 from ..renderers import VoxelRenderer
 from .components import StandardDatasetBase, ImageConditionedMixin
 from .. import models
-from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
+from ..utils.render_utils import snapshot_orbit_cameras
 
 
 class SparseStructureLatentVisMixin:
@@ -62,12 +62,7 @@ class SparseStructureLatentVisMixin:
         renderer.rendering_options.resolution = 512
         renderer.rendering_options.ssaa = 4
         
-        # build camera
-        yaw = [0, np.pi/2, np.pi, 3*np.pi/2]
-        yaw_offset = -16 / 180 * np.pi
-        yaw = [y + yaw_offset for y in yaw]
-        pitch = [20 / 180 * np.pi for _ in range(4)]
-        exts, ints = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaw, pitch, 2, 30)
+        exts, ints = snapshot_orbit_cameras()
 
         images = []
         

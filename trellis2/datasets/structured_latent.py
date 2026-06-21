@@ -7,7 +7,7 @@ import utils3d.torch
 from .components import StandardDatasetBase, ImageConditionedMixin
 from ..modules.sparse.basic import SparseTensor
 from .. import models
-from ..utils.render_utils import get_renderer
+from ..utils.render_utils import get_renderer, snapshot_orbit_cameras
 from ..utils.data_utils import load_balanced_group_indices
 
 
@@ -59,25 +59,7 @@ class SLatVisMixin:
         x_0 = x_0 if isinstance(x_0, SparseTensor) else x_0['x_0']
         reps = self.decode_latent(x_0.cuda())
         
-        # Build camera
-        yaws = [0, np.pi / 2, np.pi, 3 * np.pi / 2]
-        yaws_offset = np.random.uniform(-np.pi / 4, np.pi / 4)
-        yaws = [y + yaws_offset for y in yaws]
-        pitch = [np.random.uniform(-np.pi / 4, np.pi / 4) for _ in range(4)]
-
-        exts = []
-        ints = []
-        for yaw, pitch in zip(yaws, pitch):
-            orig = torch.tensor([
-                np.sin(yaw) * np.cos(pitch),
-                np.cos(yaw) * np.cos(pitch),
-                np.sin(pitch),
-            ]).float().cuda() * 2
-            fov = torch.deg2rad(torch.tensor(40)).cuda()
-            extrinsics = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().cuda(), torch.tensor([0, 0, 1]).float().cuda())
-            intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
-            exts.append(extrinsics)
-            ints.append(intrinsics)
+        exts, ints = snapshot_orbit_cameras(fov=40)
 
         renderer = get_renderer(reps[0])
         images = []
