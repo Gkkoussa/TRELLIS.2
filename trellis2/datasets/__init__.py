@@ -5,6 +5,7 @@ __attributes = {
     'SparseVoxelPbrDataset':'sparse_voxel_pbr',
     'SparseVoxelOccupancyDataset': 'sparse_voxel_occupancy',
     'SparseVoxelTriangleFieldDataset': 'sparse_voxel_triangle_field',
+    'TriangleFieldSuperResolutionDataset': 'triangle_field_super_resolution',
     
     'SparseStructureLatent': 'sparse_structure_latent',
     'TextConditionedSparseStructureLatent': 'sparse_structure_latent',
@@ -18,6 +19,7 @@ __attributes = {
     'ImageConditionedSLatPbr': 'structured_latent_svpbr',
     'MichelangeloConditionedGaussianDistanceSLat': 'structured_latent_gaussian_distance',
     'MichelangeloShapeConditionedGaussianDistanceSLat': 'structured_latent_gaussian_distance',
+    'MichelangeloConditionedTriangleFieldSLat': 'structured_latent_triangle_field',
     'MichelangeloShapeConditionedTriangleFieldSLat': 'structured_latent_triangle_field',
 }
 
@@ -45,11 +47,12 @@ if __name__ == '__main__':
     from .sparse_voxel_pbr import SparseVoxelPbrDataset
     from .sparse_voxel_occupancy import SparseVoxelOccupancyDataset
     from .sparse_voxel_triangle_field import SparseVoxelTriangleFieldDataset
+    from .triangle_field_super_resolution import TriangleFieldSuperResolutionDataset
     
     from .sparse_structure_latent import SparseStructureLatent, ImageConditionedSparseStructureLatent
     from .structured_latent import SLat, ImageConditionedSLat
     from .structured_latent_shape import SLatShape, ImageConditionedSLatShape
     from .structured_latent_svpbr import SLatPbr, ImageConditionedSLatPbr
     from .structured_latent_gaussian_distance import MichelangeloConditionedGaussianDistanceSLat, MichelangeloShapeConditionedGaussianDistanceSLat
-    from .structured_latent_triangle_field import MichelangeloShapeConditionedTriangleFieldSLat
+    from .structured_latent_triangle_field import MichelangeloConditionedTriangleFieldSLat, MichelangeloShapeConditionedTriangleFieldSLat
     

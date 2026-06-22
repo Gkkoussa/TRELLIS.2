@@ -8,6 +8,22 @@ from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
 
 
+def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+    """
+    Create sinusoidal timestep embeddings.
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -torch.log(torch.tensor(float(max_period), device=t.device)) *
+        torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+    )
+    args = t.float()[:, None] * freqs[None]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+    return emb
+
+
 class SparseResBlock3d(nn.Module):
     def __init__(
         self,
@@ -389,6 +405,92 @@ class SparseUnetVaeEncoder(nn.Module):
             z = mean
         z = h.replace(z)
             
+        if return_raw:
+            return z, mean, logvar
+        else:
+            return z
+
+
+class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
+    """
+    Sparse VAE encoder with zero-initialized timestep FiLM after each encoder block.
+
+    The posterior interface is intentionally kept identical to SparseUnetVaeEncoder:
+    to_latent outputs mean/logvar, and callers can choose mean-only or posterior
+    sampling through sample_posterior.
+    """
+    def __init__(
+        self,
+        *args,
+        time_embed_dim: int = 256,
+        time_embed_max_period: int = 10000,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.time_embed_dim = time_embed_dim
+        self.time_embed_max_period = time_embed_max_period
+
+        self.time_embed = nn.Sequential(
+            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+        self.film_layers = nn.ModuleList([])
+        for i, res in enumerate(self.blocks):
+            film_res = nn.ModuleList([])
+            for j, _ in enumerate(res):
+                out_channels = self.model_channels[i]
+                if i < len(self.blocks) - 1 and j == len(res) - 1:
+                    out_channels = self.model_channels[i + 1]
+                film = nn.Linear(time_embed_dim, 2 * out_channels)
+                nn.init.constant_(film.weight, 0)
+                nn.init.constant_(film.bias, 0)
+                film_res.append(film)
+            self.film_layers.append(film_res)
+
+    def convert_to_fp16(self) -> None:
+        """
+        Convert the sparse torso to float16 while leaving time MLPs in fp32.
+        """
+        self.blocks.apply(convert_module_to_f16)
+
+    def _apply_film(self, h: sp.SparseTensor, emb: torch.Tensor, i: int, j: int) -> sp.SparseTensor:
+        scale_shift = self.film_layers[i][j](emb).to(dtype=h.feats.dtype)
+        scale, shift = scale_shift.chunk(2, dim=-1)
+        batch_idx = h.coords[:, 0].long()
+        feats = h.feats * (1.0 + scale[batch_idx]) + shift[batch_idx]
+        return h.replace(feats)
+
+    def forward(
+        self,
+        x: sp.SparseTensor,
+        t: torch.Tensor,
+        sample_posterior: bool = False,
+        return_raw: bool = False,
+    ):
+        if t.ndim != 1:
+            t = t.reshape(-1)
+        emb = timestep_embedding(t, self.time_embed_dim, self.time_embed_max_period)
+        emb = self.time_embed(emb)
+
+        h = self.input_layer(x)
+        h = h.type(self.dtype)
+        for i, res in enumerate(self.blocks):
+            for j, block in enumerate(res):
+                h = block(h)
+                h = self._apply_film(h, emb, i, j)
+        h = h.type(x.dtype)
+        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+        h = self.to_latent(h)
+
+        mean, logvar = h.feats.chunk(2, dim=-1)
+        if sample_posterior:
+            std = torch.exp(0.5 * logvar)
+            z = mean + std * torch.randn_like(std)
+        else:
+            z = mean
+        z = h.replace(z)
+
         if return_raw:
             return z, mean, logvar
         else:

@@ -76,6 +76,8 @@ class SparseVoxelTriangleFieldVisMixin:
             x = sample
         elif 'target' in sample:
             x = sample['target']
+        elif 'x_0' in sample:
+            x = sample['x_0']
         else:
             x = sample['x']
 
