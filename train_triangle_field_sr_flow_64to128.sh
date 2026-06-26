@@ -24,6 +24,8 @@ export RUN_NAME="${RUN_NAME:-triangle_field_sr_flow_64to128_film_${SLURM_JOB_ID}
 export FLOW_CONFIG="${FLOW_CONFIG:-/home/koussa/scratch/TRELLIS.2/configs/gen/triangle_field_sr_flow_64to128_film_f16c32_fp16_objxl4k.json}"
 export LOW_TRIANGLE_FIELD_VOXEL_DIR="${LOW_TRIANGLE_FIELD_VOXEL_DIR:-$ROOT/triangle_field_voxels_64}"
 export HIGH_TRIANGLE_FIELD_VOXEL_DIR="${HIGH_TRIANGLE_FIELD_VOXEL_DIR:-$ROOT/triangle_field_voxels_128}"
+export SPLIT="${SPLIT:-train}"
+export INSTANCES_PATH="${INSTANCES_PATH:-$ROOT/splits/$SPLIT/instances.txt}"
 
 mkdir -p "$ROOT/outputs/$RUN_NAME"
 
@@ -39,12 +41,20 @@ for d in "$LOW_TRIANGLE_FIELD_VOXEL_DIR" "$HIGH_TRIANGLE_FIELD_VOXEL_DIR"; do
     exit 1
   fi
 done
+if [ ! -f "$INSTANCES_PATH" ]; then
+  echo "Missing split instances: $INSTANCES_PATH" >&2
+  exit 1
+fi
+
+export FILTERED_FLOW_CONFIG="$ROOT/outputs/$RUN_NAME/config.${SPLIT}.json"
+python -c "import json, os; src=os.environ['FLOW_CONFIG']; dst=os.environ['FILTERED_FLOW_CONFIG']; instances=os.environ['INSTANCES_PATH']; cfg=json.load(open(src)); cfg['dataset']['args']['instances_path']=instances; json.dump(cfg, open(dst, 'w'), indent=4)"
 
 DATA_DIR="{\"objxl4k_filtered\":{\"low_triangle_field_voxel\":\"$LOW_TRIANGLE_FIELD_VOXEL_DIR\",\"high_triangle_field_voxel\":\"$HIGH_TRIANGLE_FIELD_VOXEL_DIR\"}}"
 
 python /home/koussa/scratch/TRELLIS.2/train.py \
-  --config "$FLOW_CONFIG" \
+  --config "$FILTERED_FLOW_CONFIG" \
   --output_dir "$ROOT/outputs/$RUN_NAME" \
+  --ckpt none \
   --data_dir "$DATA_DIR" \
   --num_nodes 1 \
   --node_rank 0 \
