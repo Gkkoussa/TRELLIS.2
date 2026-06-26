@@ -67,7 +67,7 @@ def trim_decoder_spatial_cache(spatial_cache):
     return trimmed
 
 
-def require_triangle_field_dataset_args(cfg, resolution):
+def require_triangle_field_dataset_args(cfg, resolution, allow_resolution_mismatch=False):
     if 'dataset' not in cfg:
         raise ValueError('VAE config is missing dataset settings.')
     if cfg.dataset.name != 'SparseVoxelTriangleFieldDataset':
@@ -88,9 +88,15 @@ def require_triangle_field_dataset_args(cfg, resolution):
     missing = [key for key in required if key not in dataset_args]
     if missing:
         raise ValueError(f'VAE config triangle-field dataset args are missing: {missing}')
-    if int(dataset_args.resolution) != int(resolution):
+    if int(dataset_args.resolution) != int(resolution) and not allow_resolution_mismatch:
         raise ValueError(
             f'--resolution {resolution} does not match VAE config dataset resolution {dataset_args.resolution}'
+        )
+    if int(dataset_args.resolution) != int(resolution) and allow_resolution_mismatch:
+        print(
+            f'[Warning] --resolution {resolution} does not match VAE config dataset resolution '
+            f'{dataset_args.resolution}; continuing because --allow_resolution_mismatch was set.',
+            flush=True,
         )
     if dataset_args.distance_transform not in ('none', 'minus_one_one'):
         raise ValueError(
@@ -168,6 +174,8 @@ if __name__ == '__main__':
                         help='Seconds to wait for a loaded item before printing loader status')
     parser.add_argument('--benchmark', action='store_true',
                         help='Print per-object read/encode/save-submit timings')
+    parser.add_argument('--allow_resolution_mismatch', action='store_true',
+                        help='Allow encoding voxel fields at a resolution different from the VAE training config.')
     opt = parser.parse_args()
     opt = edict(vars(opt))
     opt.triangle_field_voxel_root = opt.triangle_field_voxel_root or opt.root
@@ -182,7 +190,11 @@ if __name__ == '__main__':
 
     latent_name = f'{opt.enc_model.split("/")[-1]}_{opt.ckpt}_{opt.resolution}'
     cfg = edict(json.load(open(os.path.join(opt.model_root, opt.enc_model, 'config.json'), 'r')))
-    dataset_args = require_triangle_field_dataset_args(cfg, opt.resolution)
+    dataset_args = require_triangle_field_dataset_args(
+        cfg,
+        opt.resolution,
+        allow_resolution_mismatch=opt.allow_resolution_mismatch,
+    )
     encoder = getattr(models, cfg.models.encoder.name)(**cfg.models.encoder.args).cuda()
     ckpt_path = os.path.join(opt.model_root, opt.enc_model, 'ckpts', f'encoder_{opt.ckpt}.pt')
     encoder.load_state_dict(torch.load(ckpt_path), strict=False)

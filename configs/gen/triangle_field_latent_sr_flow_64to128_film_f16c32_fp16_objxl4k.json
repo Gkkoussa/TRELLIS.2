@@ -33,7 +33,7 @@
         }
     },
     "dataset": {
-        "name": "TriangleFieldSuperResolutionDataset",
+        "name": "TriangleFieldLatentSuperResolutionDataset",
         "args": {
             "low_resolution": 64,
             "high_resolution": 128,
@@ -42,20 +42,18 @@
             "max_num_faces": null,
             "low_voxel_root_key": "low_triangle_field_voxel",
             "high_voxel_root_key": "high_triangle_field_voxel",
+            "latent_root_key": "triangle_field_latent",
             "voxelized_flag_column": "triangle_field_voxelized",
             "num_voxels_column": "num_triangle_field_voxels",
+            "latent_encoded_flag_column": "triangle_field_latent_encoded",
+            "latent_tokens_column": "triangle_field_latent_tokens",
+            "max_latent_tokens": 32768,
             "distance_transform": "minus_one_one",
-            "return_area_offsets": true,
-            "conditioning_augmentation": {
-                "type": "sparse_blur_noise",
-                "blur_sigma": 1.0,
-                "noise_level": 0.25,
-                "apply_prob": 1.0
-            }
+            "return_area_offsets": false
         }
     },
     "trainer": {
-        "name": "TriangleFieldSuperResolutionFlowTrainer",
+        "name": "TriangleFieldLatentSuperResolutionFlowTrainer",
         "args": {
             "decoder_model": {
                 "name": "SparseUnetVaeDecoder",
@@ -88,7 +86,7 @@
                     "pred_subdiv": false
                 }
             },
-            "decoder_ckpt": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/outputs/triangle_field_vae_512_invarea_auxdrop_52039231/ckpts/decoder_step0170000.pt",
+            "decoder_ckpt": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/outputs/triangle_field_vae_512_invarea_auxdrop_52039231/ckpts/decoder_step0180000.pt",
             "max_steps": 1000000,
             "batch_size_per_gpu": 16,
             "batch_split": 1,
@@ -128,17 +126,20 @@
             },
             "sigma_min": 1e-5,
             "cond_drop_prob": 0.1,
-            "loss_type": "l1",
-            "voxel_loss_weight": {
-                "type": "inverse_triangle_area",
-                "eps": 1e-8,
-                "normalize": "mean",
-                "clamp_max": 100.0
+            "conditioning_augmentation": {
+                "type": "sparse_blur_noise",
+                "blur_sigma": 1.0,
+                "noise_level": 0.25,
+                "apply_prob": 1.0
             },
+            "loss_type": "l1",
+            "latent_loss_parameterization": "velocity",
+            "latent_loss_t_min": 0.05,
+            "batched_cache_decode": true,
             "sample_posterior": false,
             "snapshot_t": 0.5,
             "finetune_ckpt": {
-                "encoder": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/outputs/triangle_field_vae_512_invarea_auxdrop_52039231/ckpts/encoder_step0170000.pt"
+                "encoder": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/outputs/triangle_field_vae_512_invarea_auxdrop_52039231/ckpts/encoder_step0180000.pt"
             }
         }
     }

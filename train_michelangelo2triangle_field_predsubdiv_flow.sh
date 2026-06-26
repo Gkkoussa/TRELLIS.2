@@ -2,10 +2,10 @@
 #SBATCH --job-name=trellis-trifield-flow-predsub
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=128G
-#SBATCH --time=1-00:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --partition=gpu-rtx6000
@@ -24,7 +24,7 @@ export TRIANGLE_FIELD_LATENT_NAME="${TRIANGLE_FIELD_LATENT_NAME:-triangle_field_
 export MICHELANGELO_NAME="${MICHELANGELO_NAME:-shapevae256_pretrained}"
 export FLOW_CONFIG="${FLOW_CONFIG:-/home/koussa/scratch/TRELLIS.2/configs/gen/slat_flow_michelangelo2triangle_field_predsubdiv_c64_dit_small_256_bf16_objxl4k.json}"
 export RUN_NAME="${RUN_NAME:-michelangelo2triangle_field_predsubdiv_c64_flow_small_${SLURM_JOB_ID}}"
-export NUM_GPUS="${NUM_GPUS:-8}"
+export NUM_GPUS="${NUM_GPUS:-1}"
 
 mkdir -p "$ROOT/outputs/$RUN_NAME"
 
