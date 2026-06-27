@@ -28,6 +28,37 @@ def clear_cuda_error():
     torch.cuda.empty_cache()
 
 
+def truthy(value):
+    return str(value).strip().lower() in {'1', 'true', 't', 'yes', 'y'}
+
+
+def load_one_metadata_filter(metadata_filter_csv):
+    if not os.path.exists(metadata_filter_csv):
+        raise FileNotFoundError(f'Metadata filter CSV not found: {metadata_filter_csv}')
+    filter_metadata = pd.read_csv(metadata_filter_csv)
+    if 'sha256' not in filter_metadata.columns:
+        raise ValueError(f'{metadata_filter_csv} must contain a sha256 column.')
+    if 'local_density_filter_keep' in filter_metadata.columns:
+        filter_metadata = filter_metadata[
+            filter_metadata['local_density_filter_keep'].map(truthy)
+        ]
+    elif 'has_local_dense_region' in filter_metadata.columns:
+        filter_metadata = filter_metadata[
+            ~filter_metadata['has_local_dense_region'].map(truthy)
+        ]
+    return set(filter_metadata['sha256'].astype(str).values)
+
+
+def load_metadata_filter(metadata_filter_csv):
+    paths = [path.strip() for path in metadata_filter_csv.split(',') if path.strip()]
+    if len(paths) == 0:
+        return set()
+    allowed = load_one_metadata_filter(paths[0])
+    for path in paths[1:]:
+        allowed = allowed & load_one_metadata_filter(path)
+    return allowed
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, required=True,
@@ -48,6 +79,8 @@ if __name__ == '__main__':
                         help='Checkpoint to load, e.g. step0090000')
     parser.add_argument('--instances', type=str, default=None,
                         help='Optional instances file or comma-separated sha256 list')
+    parser.add_argument('--metadata_filter_csv', type=str, default=None,
+                        help='Optional comma-separated metadata CSV filters. Filters are intersected.')
     parser.add_argument('--loader_workers', type=int, default=4,
                         help='Number of background voxel readers')
     parser.add_argument('--read_threads', type=int, default=1,
@@ -84,6 +117,14 @@ if __name__ == '__main__':
     if os.path.exists(latent_metadata_path):
         metadata = metadata.combine_first(pd.read_csv(latent_metadata_path).set_index('sha256'))
     metadata = metadata.reset_index()
+    if opt.metadata_filter_csv is not None and opt.metadata_filter_csv.strip() != '':
+        total_before_filter = len(metadata)
+        allowed = load_metadata_filter(opt.metadata_filter_csv)
+        metadata = metadata[metadata['sha256'].astype(str).isin(allowed)]
+        print(
+            f'Applied metadata filter: {total_before_filter} -> {len(metadata)} objects '
+            f'using {opt.metadata_filter_csv}'
+        )
 
     if opt.instances is None:
         if opt.filter_low_aesthetic_score is not None:

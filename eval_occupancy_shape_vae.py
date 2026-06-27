@@ -32,6 +32,12 @@ def parse_args():
         default=None,
         help="Optional JSON data_dir override. If omitted, --root and the config dataset args are used.",
     )
+    parser.add_argument(
+        "--metadata_filter_csv",
+        type=str,
+        default=None,
+        help="Optional metadata CSV filter. Multiple CSVs can be comma-separated and are applied by the dataset loader.",
+    )
     parser.add_argument("--root", type=str, default=None, help="Processed dataset root used when --data_dir is omitted.")
     parser.add_argument("--split", type=str, default="test", help="Split name under <root>/splits/.")
     parser.add_argument("--batch_size", type=int, default=None, help="Override evaluation batch size.")
@@ -59,16 +65,20 @@ def find_ckpt_step(run_dir: Path, ckpt: str) -> int:
     return int(ckpt)
 
 
-def build_data_dir(root: Path, split: str, dataset_args: dict) -> dict:
+def build_data_dir(root: Path, split: str, dataset_args: dict, metadata_filter_csv: str | None = None) -> dict:
     voxel_root_key = dataset_args["voxel_root_key"]
     voxel_dirname = dataset_args["voxel_dirname"]
     resolution = dataset_args["resolution"]
     split_root = root / "splits" / split
-    voxel_root = split_root / f"{voxel_dirname}_{resolution}"
+    voxel_root = root / f"{voxel_dirname}_{resolution}"
+    filters = [str(split_root / "metadata.csv")]
+    if metadata_filter_csv is not None and str(metadata_filter_csv).strip() != "":
+        filters.append(str(Path(metadata_filter_csv).resolve()))
     return {
         split: {
             "base": str(split_root),
             voxel_root_key: str(voxel_root),
+            "_metadata_filter_csv": ",".join(filters),
         }
     }
 
@@ -145,7 +155,7 @@ def main():
     else:
         if args.root is None:
             raise ValueError("Either --data_dir or --root must be provided.")
-        data_dir = build_data_dir(Path(args.root).resolve(), args.split, dataset_args)
+        data_dir = build_data_dir(Path(args.root).resolve(), args.split, dataset_args, args.metadata_filter_csv)
 
     dataset = getattr(datasets, cfg["dataset"]["name"])(json.dumps(data_dir), **dataset_args)
 
@@ -240,6 +250,7 @@ def main():
         "dataset_size": len(dataset),
         "max_batches": args.max_batches,
         "posterior_mode": "mean" if args.deterministic_posterior else "sampled",
+        "metadata_filter_csv": str(Path(args.metadata_filter_csv).resolve()) if args.metadata_filter_csv else None,
         "mean_iou": totals["iou_sum"] / n,
         "mean_recall": totals["recall_sum"] / n,
         "mean_precision": totals["precision_sum"] / n,
