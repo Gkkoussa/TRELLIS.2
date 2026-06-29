@@ -13,6 +13,7 @@ from tqdm import tqdm
 from trellis2 import datasets, models
 from trellis2.modules import sparse as sp
 from trellis2.utils.data_utils import recursive_to_device
+from eval_metadata_filters import add_eval_metadata_filter_args, attach_eval_metadata_filter
 
 
 def parse_args():
@@ -28,8 +29,10 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=12)
     parser.add_argument("--t_start", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--low_resolution", type=int, default=64)
     parser.add_argument("--high_resolution", type=int, default=128)
+    add_eval_metadata_filter_args(parser)
     return parser.parse_args()
 
 
@@ -47,7 +50,7 @@ def load_config(run_dir: Path) -> dict:
         return json.load(f)
 
 
-def build_dataset(cfg: dict, root: Path, low_resolution: int, high_resolution: int):
+def build_dataset(cfg: dict, root: Path, split: str, low_resolution: int, high_resolution: int, args=None):
     dataset_args = copy.deepcopy(cfg["dataset"]["args"])
     dataset_args["low_resolution"] = low_resolution
     dataset_args["high_resolution"] = high_resolution
@@ -60,6 +63,7 @@ def build_dataset(cfg: dict, root: Path, low_resolution: int, high_resolution: i
             "high_triangle_field_voxel": str(root / f"triangle_field_voxels_{high_resolution}"),
         }
     }
+    data_dir = attach_eval_metadata_filter(data_dir, root, split, args)
     return getattr(datasets, cfg["dataset"]["name"])(json.dumps(data_dir), **dataset_args)
 
 
@@ -133,7 +137,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = load_config(run_dir)
-    dataset = build_dataset(cfg, root, args.low_resolution, args.high_resolution)
+    dataset = build_dataset(cfg, root, args.split, args.low_resolution, args.high_resolution, args=args)
     encoder, decoder, sigma_min = load_model(cfg, run_dir, args.ckpt, device)
     loader = DataLoader(
         dataset,

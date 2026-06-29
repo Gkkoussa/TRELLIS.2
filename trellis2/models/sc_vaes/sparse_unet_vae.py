@@ -424,11 +424,19 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         *args,
         time_embed_dim: int = 256,
         time_embed_max_period: int = 10000,
+        latent_cond_channels: int = 0,
+        latent_cond_mode: Optional[Literal['bottleneck']] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.time_embed_dim = time_embed_dim
         self.time_embed_max_period = time_embed_max_period
+        self.latent_cond_channels = int(latent_cond_channels)
+        self.latent_cond_mode = latent_cond_mode
+        if self.latent_cond_mode not in (None, 'bottleneck'):
+            raise ValueError(f"latent_cond_mode must be None or 'bottleneck', got {self.latent_cond_mode}")
+        if self.latent_cond_mode is not None and self.latent_cond_channels <= 0:
+            raise ValueError(f'latent_cond_channels must be positive when latent_cond_mode is set, got {latent_cond_channels}')
 
         self.time_embed = nn.Sequential(
             nn.Linear(time_embed_dim, time_embed_dim),
@@ -447,6 +455,17 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
                 nn.init.constant_(film.bias, 0)
                 film_res.append(film)
             self.film_layers.append(film_res)
+        if self.latent_cond_mode == 'bottleneck':
+            self.latent_bottleneck_proj = sp.SparseLinear(
+                self.model_channels[-1] + self.latent_cond_channels,
+                self.model_channels[-1],
+            )
+            nn.init.constant_(self.latent_bottleneck_proj.weight, 0)
+            nn.init.constant_(self.latent_bottleneck_proj.bias, 0)
+            with torch.no_grad():
+                self.latent_bottleneck_proj.weight[:, :self.model_channels[-1]].copy_(
+                    torch.eye(self.model_channels[-1])
+                )
 
     def convert_to_fp16(self) -> None:
         """
@@ -461,12 +480,20 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         feats = h.feats * (1.0 + scale[batch_idx]) + shift[batch_idx]
         return h.replace(feats)
 
+    @staticmethod
+    def _check_matching_coords(a: sp.SparseTensor, b: sp.SparseTensor, name_a: str, name_b: str) -> None:
+        if not torch.equal(a.coords, b.coords):
+            raise ValueError(
+                f'{name_a} and {name_b} coords must match, got {a.coords.shape} vs {b.coords.shape}'
+            )
+
     def forward(
         self,
         x: sp.SparseTensor,
         t: torch.Tensor,
         sample_posterior: bool = False,
         return_raw: bool = False,
+        latent_cond: Optional[sp.SparseTensor] = None,
     ):
         if t.ndim != 1:
             t = t.reshape(-1)
@@ -476,6 +503,15 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         h = self.input_layer(x)
         h = h.type(self.dtype)
         for i, res in enumerate(self.blocks):
+            if self.latent_cond_mode == 'bottleneck' and i == len(self.blocks) - 1:
+                if latent_cond is None:
+                    raise ValueError('latent_cond must be provided when latent_cond_mode="bottleneck"')
+                self._check_matching_coords(h, latent_cond, 'bottleneck h', 'latent_cond')
+                h = h.type(x.dtype)
+                cond_feats = latent_cond.feats.to(device=h.feats.device, dtype=h.feats.dtype)
+                h = h.replace(torch.cat([h.feats, cond_feats], dim=-1))
+                h = self.latent_bottleneck_proj(h)
+                h = h.type(self.dtype)
             for j, block in enumerate(res):
                 h = block(h)
                 h = self._apply_film(h, emb, i, j)

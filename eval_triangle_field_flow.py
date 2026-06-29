@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from trellis2 import models, datasets, trainers
 from trellis2.utils.data_utils import recursive_to_device
+from eval_metadata_filters import add_eval_metadata_filter_args, attach_eval_metadata_filter
 
 
 def parse_args():
@@ -24,6 +25,7 @@ def parse_args():
     parser.add_argument("--data_dir", type=str, default=None, help="Optional JSON data_dir override.")
     parser.add_argument("--root", type=str, default=None, help="Processed dataset root used when --data_dir is omitted.")
     parser.add_argument("--split", type=str, default="test", help="Split name under <root>/splits/.")
+    parser.add_argument("--instances", type=str, default=None, help="Optional ordered instance list to evaluate/visualize.")
     parser.add_argument(
         "--triangle_field_latent_name",
         type=str,
@@ -53,7 +55,32 @@ def parse_args():
     parser.add_argument("--guidance_strength", type=float, default=1.0, help="Classifier-free guidance strength.")
     parser.add_argument("--ema_rate", type=str, default=None, help="Optional EMA rate to evaluate, e.g. 0.9999.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    add_eval_metadata_filter_args(parser)
     return parser.parse_args()
+
+
+def restrict_dataset_to_instances(dataset, instances_path: str, limit: int | None = None) -> list[str]:
+    with open(instances_path, "r") as f:
+        ordered = [line.strip() for line in f if line.strip()]
+    if limit is not None:
+        ordered = ordered[:limit]
+    keep = set(ordered)
+    by_sha = {str(sha256): (root, sha256) for root, sha256 in dataset.instances}
+    missing = [sha256 for sha256 in ordered if sha256 not in by_sha]
+    if missing:
+        raise ValueError(f"{len(missing)} requested instances are missing from dataset; first missing: {missing[0]}")
+    dataset.instances = [by_sha[sha256] for sha256 in ordered]
+    if len(dataset.metadata) > 0:
+        dataset.metadata = dataset.metadata[dataset.metadata.index.astype(str).isin(keep)]
+    if hasattr(dataset, "loads"):
+        dataset.loads = [
+            dataset.metadata.loc[sha256, dataset.num_voxels_column]
+            if getattr(dataset, "num_voxels_column", None) in dataset.metadata.columns else 1
+            for _, sha256 in dataset.instances
+        ]
+    for stats in getattr(dataset, "_stats", {}).values():
+        stats["Restricted to explicit instances"] = len(dataset.instances)
+    return ordered
 
 
 def find_ckpt_step(run_dir: Path, ckpt: str) -> int:
@@ -76,16 +103,27 @@ def build_data_dir(
     triangle_field_latent_name: str,
     michelangelo_latent_name: str,
     shape_latent_name: str,
+    args=None,
 ) -> dict:
     split_root = root / "splits" / split
-    return {
+    triangle_field_latent = split_root / "triangle_field_latents" / triangle_field_latent_name
+    michelangelo_latent = split_root / "michelangelo_latents" / michelangelo_latent_name
+    shape_latent = split_root / "shape_latents" / shape_latent_name
+    if not triangle_field_latent.exists():
+        triangle_field_latent = root / "triangle_field_latents" / triangle_field_latent_name
+    if not michelangelo_latent.exists():
+        michelangelo_latent = root / "michelangelo_latents" / michelangelo_latent_name
+    if not shape_latent.exists():
+        shape_latent = root / "shape_latents" / shape_latent_name
+    data_dir = {
         split: {
             "metadata": str(split_root),
-            "triangle_field_latent": str(split_root / "triangle_field_latents" / triangle_field_latent_name),
-            "michelangelo_latent": str(split_root / "michelangelo_latents" / michelangelo_latent_name),
-            "shape_latent": str(split_root / "shape_latents" / shape_latent_name),
+            "triangle_field_latent": str(triangle_field_latent),
+            "michelangelo_latent": str(michelangelo_latent),
+            "shape_latent": str(shape_latent),
         }
     }
+    return attach_eval_metadata_filter(data_dir, root, split, args)
 
 
 def load_denoiser_checkpoint(model, run_dir: Path, step: int, ema_rate: str | None, device: torch.device) -> str:
@@ -205,6 +243,7 @@ def main():
             args.triangle_field_latent_name,
             args.michelangelo_latent_name,
             args.shape_latent_name,
+            args=args,
         )
         train_norm_path = (
             root
@@ -228,6 +267,9 @@ def main():
             dataset_args["shape_slat_normalization_path"] = str(shape_train_norm_path)
 
     dataset = getattr(datasets, cfg["dataset"]["name"])(json.dumps(data_dir), **dataset_args)
+    selected_instances = None
+    if args.instances is not None:
+        selected_instances = restrict_dataset_to_instances(dataset, args.instances, args.num_samples if args.num_samples > 0 else None)
 
     model_dict = {
         name: getattr(models, model_cfg["name"])(**model_cfg["args"]).cuda()
@@ -272,6 +314,7 @@ def main():
         "split": args.split,
         "dataset_size": len(dataset),
         "max_batches": args.max_batches,
+        "instances": selected_instances,
     })
 
     metrics_path = output_dir / "metrics.json"
@@ -289,6 +332,7 @@ def main():
             batch_size=args.snapshot_batch_size,
             steps=args.sampling_steps,
             guidance_strength=args.guidance_strength,
+            shuffle=False,
         )
         print(f"Saved visualization samples to {output_dir / 'samples' / suffix}")
 

@@ -5,6 +5,7 @@ __attributes = {
     'SparseVoxelPbrDataset':'sparse_voxel_pbr',
     'SparseVoxelOccupancyDataset': 'sparse_voxel_occupancy',
     'SparseVoxelTriangleFieldDataset': 'sparse_voxel_triangle_field',
+    'MultiResolutionSparseVoxelTriangleFieldDataset': 'sparse_voxel_triangle_field',
     'TriangleFieldSuperResolutionDataset': 'triangle_field_super_resolution',
     'TriangleFieldLatentSuperResolutionDataset': 'triangle_field_super_resolution',
     
@@ -47,7 +48,7 @@ if __name__ == '__main__':
     from .flexi_dual_grid import FlexiDualGridDataset
     from .sparse_voxel_pbr import SparseVoxelPbrDataset
     from .sparse_voxel_occupancy import SparseVoxelOccupancyDataset
-    from .sparse_voxel_triangle_field import SparseVoxelTriangleFieldDataset
+    from .sparse_voxel_triangle_field import SparseVoxelTriangleFieldDataset, MultiResolutionSparseVoxelTriangleFieldDataset
     from .triangle_field_super_resolution import TriangleFieldSuperResolutionDataset, TriangleFieldLatentSuperResolutionDataset
     
     from .sparse_structure_latent import SparseStructureLatent, ImageConditionedSparseStructureLatent

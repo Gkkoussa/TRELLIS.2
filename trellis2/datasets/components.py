@@ -36,9 +36,16 @@ class StandardDatasetBase(Dataset):
             for key, root in self.roots.items():
                 self._stats[key] = {}
                 metadata = pd.DataFrame(columns=['sha256']).set_index('sha256')
-                for _, r in root.items():
+                for root_key, r in root.items():
+                    if root_key.startswith('_'):
+                        continue
                     metadata = metadata.combine_first(pd.read_csv(os.path.join(r, 'metadata.csv')).set_index('sha256'))
                 self._stats[key]['Total'] = len(metadata)
+                metadata = self._apply_metadata_filter_csv(
+                    metadata,
+                    root.get('_metadata_filter_csv', None),
+                    self._stats[key],
+                )
                 metadata, stats = self.filter_metadata(metadata)
                 self._stats[key].update(stats)
                 self.instances.extend([(root, sha256) for sha256 in metadata.index.values])
@@ -54,6 +61,37 @@ class StandardDatasetBase(Dataset):
                 self.instances.extend([(root, sha256) for sha256 in metadata['sha256'].values])
                 metadata.set_index('sha256', inplace=True)
                 self.metadata = pd.concat([self.metadata, metadata])
+
+    @staticmethod
+    def _read_filter_sha256s(path: str) -> Set[str]:
+        if os.path.isdir(path):
+            path = os.path.join(path, 'metadata.csv')
+        if not os.path.exists(path):
+            raise FileNotFoundError(f'Metadata filter CSV not found: {path}')
+        metadata = pd.read_csv(path, usecols=['sha256'])
+        return set(metadata['sha256'].astype(str).values)
+
+    def _apply_metadata_filter_csv(
+        self,
+        metadata: pd.DataFrame,
+        filter_csv: Optional[str],
+        stats: Dict[str, int],
+    ) -> pd.DataFrame:
+        if filter_csv is None or str(filter_csv).strip() == '':
+            return metadata
+        keep = None
+        paths = [p.strip() for p in str(filter_csv).split(',') if p.strip()]
+        for path in paths:
+            path_keep = self._read_filter_sha256s(path)
+            keep = path_keep if keep is None else keep.intersection(path_keep)
+            stats[f'Metadata filter {os.path.basename(path)}'] = len(path_keep)
+        keep = keep or set()
+        before = len(metadata)
+        filtered = metadata[metadata.index.astype(str).isin(keep)]
+        stats['Metadata filters applied'] = len(paths)
+        stats['Metadata filter kept'] = len(filtered)
+        stats['Metadata filter removed'] = before - len(filtered)
+        return filtered
             
     @abstractmethod
     def filter_metadata(self, metadata: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:

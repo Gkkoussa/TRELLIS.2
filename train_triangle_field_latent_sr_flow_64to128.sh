@@ -2,7 +2,7 @@
 #SBATCH --job-name=trellis-trifield-latent-sr64to128
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:6
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
@@ -20,13 +20,16 @@ eval "$(conda shell.bash hook)"
 conda activate trellis2
 
 export ROOT="${ROOT:-/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k}"
-export RUN_NAME="${RUN_NAME:-triangle_field_latent_sr_flow_64to128_film_${SLURM_JOB_ID}}"
+export RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-triangle_field_latent_sr_flow_64to128_film}"
+export RUN_NAME="${RUN_NAME:-${RUN_NAME_PREFIX}_${SLURM_JOB_ID}}"
 export FLOW_CONFIG="${FLOW_CONFIG:-/home/koussa/scratch/TRELLIS.2/configs/gen/triangle_field_latent_sr_flow_64to128_film_f16c32_fp16_objxl4k.json}"
+export NUM_GPUS="${NUM_GPUS:-2}"
+export CKPT="${CKPT:-none}"
 export LOW_TRIANGLE_FIELD_VOXEL_DIR="${LOW_TRIANGLE_FIELD_VOXEL_DIR:-$ROOT/triangle_field_voxels_64}"
 export HIGH_TRIANGLE_FIELD_VOXEL_DIR="${HIGH_TRIANGLE_FIELD_VOXEL_DIR:-$ROOT/triangle_field_voxels_128}"
 export TRIANGLE_FIELD_LATENT_DIR="${TRIANGLE_FIELD_LATENT_DIR:-$ROOT/triangle_field_latents/triangle_field_vae_512_invarea_auxdrop_52039231_step0180000_128}"
 export SPLIT="${SPLIT:-train}"
-export INSTANCES_PATH="${INSTANCES_PATH:-$ROOT/splits/$SPLIT/instances.txt}"
+export INSTANCES_PATH="${INSTANCES_PATH:-$ROOT/splits/train_triangle_field_512/instances.txt}"
 
 mkdir -p "$ROOT/outputs/$RUN_NAME"
 
@@ -55,11 +58,11 @@ DATA_DIR="{\"objxl4k_filtered\":{\"low_triangle_field_voxel\":\"$LOW_TRIANGLE_FI
 python /home/koussa/scratch/TRELLIS.2/train.py \
   --config "$FILTERED_FLOW_CONFIG" \
   --output_dir "$ROOT/outputs/$RUN_NAME" \
-  --ckpt none \
+  --ckpt "$CKPT" \
   --data_dir "$DATA_DIR" \
   --num_nodes 1 \
   --node_rank 0 \
-  --num_gpus 6 \
+  --num_gpus "$NUM_GPUS" \
   --master_addr "$MASTER_ADDR" \
   --master_port "$MASTER_PORT" \
   --auto_retry 3

@@ -13,6 +13,7 @@ from tqdm import tqdm
 from trellis2 import datasets, models
 from trellis2.modules import sparse as sp
 from trellis2.utils.data_utils import recursive_to_device
+from eval_metadata_filters import add_eval_metadata_filter_args, attach_eval_metadata_filter
 
 
 def parse_args():
@@ -36,6 +37,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--zero_from_channel", type=int, default=2)
     parser.add_argument("--dataset_resolution", type=int, default=None)
+    add_eval_metadata_filter_args(parser)
     return parser.parse_args()
 
 
@@ -51,7 +53,7 @@ def find_ckpt_step(run_dir: Path, ckpt: str) -> str:
     )
 
 
-def build_data_dir(root: Path, split: str, dataset_args: dict) -> dict:
+def build_data_dir(root: Path, split: str, dataset_args: dict, args=None) -> dict:
     voxel_root_key = dataset_args["voxel_root_key"]
     voxel_dirname = dataset_args["voxel_dirname"]
     resolution = dataset_args["resolution"]
@@ -61,12 +63,13 @@ def build_data_dir(root: Path, split: str, dataset_args: dict) -> dict:
     base_root = filtered_base if (filtered_base / "metadata.csv").exists() else split_root
     voxel_root = split_root / f"{voxel_dirname}_{resolution}"
 
-    return {
+    data_dir = {
         split: {
             "base": str(base_root),
             voxel_root_key: str(voxel_root),
         }
     }
+    return attach_eval_metadata_filter(data_dir, root, split, args)
 
 
 def load_vae(run_dir: Path, ckpt: str):
@@ -189,7 +192,7 @@ def main():
     dataset_args = copy.deepcopy(before_cfg["dataset"]["args"])
     if args.dataset_resolution is not None:
         dataset_args["resolution"] = args.dataset_resolution
-    data_dir = json.loads(args.data_dir) if args.data_dir is not None else build_data_dir(Path(args.root), args.split, dataset_args)
+    data_dir = json.loads(args.data_dir) if args.data_dir is not None else build_data_dir(Path(args.root), args.split, dataset_args, args=args)
     dataset = getattr(datasets, before_cfg["dataset"]["name"])(json.dumps(data_dir), **dataset_args)
     distance_transform = dataset_args.get("distance_transform", "none")
 

@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from trellis2 import datasets, models, trainers
 from trellis2.utils.data_utils import recursive_to_device
+from eval_metadata_filters import add_eval_metadata_filter_args, attach_eval_metadata_filter
 
 
 def parse_args():
@@ -24,8 +25,10 @@ def parse_args():
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--root", type=str, default=None)
     parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--instances", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--max_eval_samples", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=16)
     parser.add_argument("--snapshot_batch_size", type=int, default=1)
     parser.add_argument("--render_resolution", type=int, default=None)
@@ -37,6 +40,7 @@ def parse_args():
     parser.add_argument("--log_area_max", type=float, default=0.0)
     parser.add_argument("--num_area_bins", type=int, default=12)
     parser.add_argument("--seed", type=int, default=0)
+    add_eval_metadata_filter_args(parser)
     return parser.parse_args()
 
 
@@ -55,7 +59,7 @@ def find_ckpt_step(run_dir: Path, ckpt: str) -> int:
     return int(ckpt)
 
 
-def build_data_dir(root: Path, split: str, dataset_args: dict) -> dict:
+def build_data_dir(root: Path, split: str, dataset_args: dict, args=None) -> dict:
     voxel_root_key = dataset_args["voxel_root_key"]
     voxel_dirname = dataset_args["voxel_dirname"]
     resolution = dataset_args["resolution"]
@@ -63,14 +67,57 @@ def build_data_dir(root: Path, split: str, dataset_args: dict) -> dict:
     split_root = root / "splits" / split
     filtered_base = root / "splits" / f"{split}_triangle_field_{resolution}"
     base_root = filtered_base if (filtered_base / "metadata.csv").exists() else split_root
-    voxel_root = split_root / f"{voxel_dirname}_{resolution}"
+    split_voxel_root = split_root / f"{voxel_dirname}_{resolution}"
+    canonical_voxel_root = root / f"{voxel_dirname}_{resolution}"
+    voxel_root = split_voxel_root if (split_voxel_root / "metadata.csv").exists() else canonical_voxel_root
 
-    return {
+    data_dir = {
         split: {
             "base": str(base_root),
             voxel_root_key: str(voxel_root),
         }
     }
+    return attach_eval_metadata_filter(data_dir, root, split, args)
+
+
+def restrict_dataset_instances(dataset, instances_path: str) -> None:
+    with open(instances_path, "r") as f:
+        keep = {line.strip() for line in f if line.strip()}
+    before = len(dataset.instances)
+    dataset.instances = [
+        (root, sha256)
+        for root, sha256 in dataset.instances
+        if str(sha256) in keep
+    ]
+    if len(dataset.metadata) > 0:
+        dataset.metadata = dataset.metadata[dataset.metadata.index.astype(str).isin(keep)]
+    if hasattr(dataset, "loads"):
+        dataset.loads = [
+            dataset.metadata.loc[sha256, dataset.num_voxels_column]
+            if getattr(dataset, "num_voxels_column", None) in dataset.metadata.columns else 1
+            for _, sha256 in dataset.instances
+        ]
+    for stats in getattr(dataset, "_stats", {}).values():
+        stats["Restricted to instances"] = len(dataset.instances)
+        stats["Instances removed"] = before - len(dataset.instances)
+
+
+def limit_dataset_instances(dataset, max_eval_samples: int) -> None:
+    if max_eval_samples is None:
+        return
+    if max_eval_samples <= 0:
+        raise ValueError("--max_eval_samples must be positive when provided.")
+    before = len(dataset.instances)
+    dataset.instances = dataset.instances[:max_eval_samples]
+    keep = {str(sha256) for _, sha256 in dataset.instances}
+    if len(dataset.metadata) > 0:
+        dataset.metadata = dataset.metadata[dataset.metadata.index.astype(str).isin(keep)]
+    if hasattr(dataset, "loads"):
+        dataset.loads = dataset.loads[:len(dataset.instances)]
+    for stats in getattr(dataset, "_stats", {}).values():
+        stats["Max eval samples"] = max_eval_samples
+        stats["Eval samples used"] = len(dataset.instances)
+        stats["Eval samples skipped"] = max(0, before - len(dataset.instances))
 
 
 def save_image_grid(images: torch.Tensor, path: Path) -> None:
@@ -123,6 +170,15 @@ def main():
     dataset_args = copy.deepcopy(cfg["dataset"]["args"])
     if args.dataset_resolution is not None:
         dataset_args["resolution"] = args.dataset_resolution
+        if cfg["dataset"]["name"] == "MultiResolutionSparseVoxelTriangleFieldDataset":
+            resolutions = [int(r) for r in dataset_args.get("resolutions", [])]
+            if int(args.dataset_resolution) not in resolutions:
+                raise ValueError(
+                    f"--dataset_resolution {args.dataset_resolution} is not in config resolutions {resolutions}"
+                )
+            dataset_args.pop("resolutions", None)
+            dataset_args.pop("instances_path", None)
+            cfg["dataset"]["name"] = "SparseVoxelTriangleFieldDataset"
     trainer_args = copy.deepcopy(cfg["trainer"]["args"])
     if args.render_resolution is not None:
         trainer_args["render_resolution"] = args.render_resolution
@@ -140,9 +196,12 @@ def main():
     else:
         if args.root is None:
             raise ValueError("Either --data_dir or --root must be provided.")
-        data_dir = build_data_dir(Path(args.root).resolve(), args.split, dataset_args)
+        data_dir = build_data_dir(Path(args.root).resolve(), args.split, dataset_args, args=args)
 
     dataset = getattr(datasets, cfg["dataset"]["name"])(json.dumps(data_dir), **dataset_args)
+    if args.instances is not None:
+        restrict_dataset_instances(dataset, args.instances)
+    limit_dataset_instances(dataset, args.max_eval_samples)
     model_dict = {
         name: getattr(models, model_cfg["name"])(**model_cfg["args"]).cuda()
         for name, model_cfg in cfg["models"].items()

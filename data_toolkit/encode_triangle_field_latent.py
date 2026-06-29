@@ -70,24 +70,36 @@ def trim_decoder_spatial_cache(spatial_cache):
 def require_triangle_field_dataset_args(cfg, resolution, allow_resolution_mismatch=False):
     if 'dataset' not in cfg:
         raise ValueError('VAE config is missing dataset settings.')
-    if cfg.dataset.name != 'SparseVoxelTriangleFieldDataset':
+    valid_dataset_names = {
+        'SparseVoxelTriangleFieldDataset',
+        'MultiResolutionSparseVoxelTriangleFieldDataset',
+    }
+    if cfg.dataset.name not in valid_dataset_names:
         raise ValueError(
-            f"Expected VAE dataset SparseVoxelTriangleFieldDataset, got {cfg.dataset.name}"
+            f"Expected VAE dataset one of {sorted(valid_dataset_names)}, got {cfg.dataset.name}"
         )
     if 'args' not in cfg.dataset:
         raise ValueError('VAE config dataset is missing args.')
 
     dataset_args = cfg.dataset.args
-    required = [
-        'resolution',
-        'voxel_dirname',
-        'voxelized_flag_column',
-        'num_voxels_column',
-        'distance_transform',
-    ]
+    required = ['voxel_dirname', 'voxelized_flag_column', 'num_voxels_column', 'distance_transform']
+    if cfg.dataset.name == 'SparseVoxelTriangleFieldDataset':
+        required.append('resolution')
+    else:
+        required.append('resolutions')
     missing = [key for key in required if key not in dataset_args]
     if missing:
         raise ValueError(f'VAE config triangle-field dataset args are missing: {missing}')
+
+    if cfg.dataset.name == 'MultiResolutionSparseVoxelTriangleFieldDataset':
+        resolutions = [int(r) for r in dataset_args.resolutions]
+        if int(resolution) not in resolutions:
+            raise ValueError(
+                f'--resolution {resolution} is not in VAE config dataset resolutions {resolutions}'
+            )
+        dataset_args = edict(dict(dataset_args))
+        dataset_args.resolution = int(resolution)
+
     if int(dataset_args.resolution) != int(resolution) and not allow_resolution_mismatch:
         raise ValueError(
             f'--resolution {resolution} does not match VAE config dataset resolution {dataset_args.resolution}'

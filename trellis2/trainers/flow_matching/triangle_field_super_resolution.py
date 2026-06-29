@@ -462,11 +462,15 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         latent_loss_parameterization: str = 'velocity',
         latent_loss_t_min: float = 0.05,
         batched_cache_decode: bool = False,
+        latent_self_conditioning: dict = None,
         **kwargs,
     ):
         self.latent_loss_parameterization = latent_loss_parameterization
         self.latent_loss_t_min = float(latent_loss_t_min)
         self.batched_cache_decode = bool(batched_cache_decode)
+        self.latent_self_conditioning = latent_self_conditioning or {'mode': 'none'}
+        self.latent_self_conditioning_mode = self.latent_self_conditioning.get('mode', 'none')
+        self.latent_self_conditioning_upsample_factor = self.latent_self_conditioning.get('upsample_factor', None)
         if self.latent_loss_parameterization not in ('z0', 'velocity'):
             raise ValueError(
                 "latent_loss_parameterization must be 'z0' or 'velocity', "
@@ -474,6 +478,11 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             )
         if self.latent_loss_t_min <= 0:
             raise ValueError(f'latent_loss_t_min must be positive, got {self.latent_loss_t_min}')
+        if self.latent_self_conditioning_mode not in ('none', 'input', 'bottleneck'):
+            raise ValueError(
+                "latent_self_conditioning.mode must be 'none', 'input', or 'bottleneck', "
+                f"got {self.latent_self_conditioning_mode}"
+            )
         super().__init__(*args, **kwargs)
 
     def _build_frozen_decoder(self):
@@ -491,6 +500,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             f'  - Latent loss parameterization: {self.latent_loss_parameterization}',
             f'  - Latent loss t min: {self.latent_loss_t_min}',
             f'  - Batched cache decode: {self.batched_cache_decode}',
+            f'  - Latent self-conditioning: {self.latent_self_conditioning}',
         ]
         return '\n'.join(lines)
 
@@ -636,6 +646,52 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             return err.pow(2).mean()
         raise ValueError(f'Invalid loss type {self.loss_type}')
 
+    @staticmethod
+    def _coords_to_keys(coords: torch.Tensor, spatial_size: torch.Tensor) -> torch.Tensor:
+        coords = coords.long()
+        sx, sy, sz = spatial_size.long()
+        return (((coords[:, 0] * sx + coords[:, 1]) * sy + coords[:, 2]) * sz + coords[:, 3])
+
+    def _infer_latent_to_field_factor(self, z_t: sp.SparseTensor, x_t: sp.SparseTensor) -> int:
+        if self.latent_self_conditioning_upsample_factor is not None:
+            return int(self.latent_self_conditioning_upsample_factor)
+        up_block_type = self.decoder_model_config.get('args', {}).get('up_block_type', [])
+        if len(up_block_type) == 0:
+            raise ValueError(
+                'latent_self_conditioning.upsample_factor must be set when decoder_model.args.up_block_type is unavailable.'
+            )
+        return 2 ** len(up_block_type)
+
+    def _latent_to_field_support(self, z_t: sp.SparseTensor, x_t: sp.SparseTensor) -> Tuple[sp.SparseTensor, torch.Tensor]:
+        factor = self._infer_latent_to_field_factor(z_t, x_t)
+        field_parent = torch.div(x_t.coords[:, 1:], factor, rounding_mode='floor')
+        query_coords = torch.cat([x_t.coords[:, 0:1], field_parent], dim=1)
+        source_coords = z_t.coords
+
+        max_spatial = torch.maximum(
+            query_coords[:, 1:].amax(dim=0),
+            source_coords[:, 1:].amax(dim=0),
+        ) + 1
+        query_keys = self._coords_to_keys(query_coords, max_spatial)
+        source_keys = self._coords_to_keys(source_coords, max_spatial)
+        order = torch.argsort(source_keys)
+        sorted_keys = source_keys[order]
+        sorted_feats = z_t.feats[order]
+        idx = torch.searchsorted(sorted_keys, query_keys)
+        valid = (
+            (idx < sorted_keys.numel()) &
+            (sorted_keys[idx.clamp_max(sorted_keys.numel() - 1)] == query_keys)
+        )
+        feats = torch.zeros(
+            (x_t.feats.shape[0], z_t.feats.shape[1]),
+            dtype=z_t.feats.dtype,
+            device=z_t.feats.device,
+        )
+        if valid.any():
+            feats[valid] = sorted_feats[idx[valid]]
+        missing = 1.0 - torch.segment_reduce(valid.float(), reduce='mean', lengths=x_t.seqlen)
+        return x_t.replace(feats), missing
+
     def training_losses(
         self,
         z_0: sp.SparseTensor,
@@ -660,11 +716,23 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
 
         cond = self._augment_conditioning(cond)
         cond, cond_drop = self._drop_cond(cond)
-        enc_in = self._make_encoder_input(x_t, cond)
+        latent_cond_missing = None
+        if self.latent_self_conditioning_mode == 'input':
+            latent_cond_input, latent_cond_missing = self._latent_to_field_support(z_t, x_t)
+            enc_in = self._make_encoder_input(x_t, cond)
+            enc_in = enc_in.replace(torch.cat([enc_in.feats, latent_cond_input.feats], dim=-1))
+            encoder_kwargs = {}
+        elif self.latent_self_conditioning_mode == 'bottleneck':
+            enc_in = self._make_encoder_input(x_t, cond)
+            encoder_kwargs = {'latent_cond': z_t}
+        else:
+            enc_in = self._make_encoder_input(x_t, cond)
+            encoder_kwargs = {}
         pred_z0 = self.training_models['encoder'](
             enc_in,
             t * 1000.0,
             sample_posterior=self.sample_posterior,
+            **encoder_kwargs,
         )
         if not torch.equal(pred_z0.coords, z_0.coords):
             raise ValueError(
@@ -683,6 +751,9 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             missing_low_parent_frac = missing_low_parent_frac.float()
             status['cond/missing_low_parent_frac'] = missing_low_parent_frac.mean()
             status['cond/missing_low_parent_frac_max'] = missing_low_parent_frac.max()
+        if latent_cond_missing is not None:
+            status['latent_cond/missing_parent_frac'] = latent_cond_missing.mean()
+            status['latent_cond/missing_parent_frac_max'] = latent_cond_missing.max()
 
         with torch.no_grad():
             raw_l1 = (pred_z0.feats - z_0.feats).abs()
@@ -741,8 +812,23 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 caches=args.get('triangle_field_slat_cache', None),
                 cache_paths=args.get('triangle_field_slat_cache_path', None),
             )
-            enc_in = self._make_encoder_input(x_t, args['cond'])
-            pred_z0 = self.models['encoder'](enc_in, t * 1000.0, sample_posterior=False)
+            if self.latent_self_conditioning_mode == 'input':
+                latent_cond_input, _ = self._latent_to_field_support(z_t, x_t)
+                enc_in = self._make_encoder_input(x_t, args['cond'])
+                enc_in = enc_in.replace(torch.cat([enc_in.feats, latent_cond_input.feats], dim=-1))
+                encoder_kwargs = {}
+            elif self.latent_self_conditioning_mode == 'bottleneck':
+                enc_in = self._make_encoder_input(x_t, args['cond'])
+                encoder_kwargs = {'latent_cond': z_t}
+            else:
+                enc_in = self._make_encoder_input(x_t, args['cond'])
+                encoder_kwargs = {}
+            pred_z0 = self.models['encoder'](
+                enc_in,
+                t * 1000.0,
+                sample_posterior=False,
+                **encoder_kwargs,
+            )
             y = self._decode_latents_with_cache(
                 pred_z0,
                 caches=args.get('triangle_field_slat_cache', None),

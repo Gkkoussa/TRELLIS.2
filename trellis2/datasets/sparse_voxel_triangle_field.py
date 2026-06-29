@@ -1,4 +1,6 @@
+import bisect
 import io
+import json
 import os
 from typing import Union
 
@@ -289,3 +291,117 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
         if split_size is None:
             return packs[0]
         return packs
+
+
+class MultiResolutionSparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin):
+    """
+    Flatten several SparseVoxelTriangleFieldDataset instances into one dataset.
+
+    Each item is still loaded through the normal single-resolution dataset path,
+    so feature transforms, filtering, and sparse collation stay shared.
+    """
+
+    def __init__(
+        self,
+        roots,
+        resolutions=(32, 64, 128, 256, 512),
+        instances_path: str = None,
+        **kwargs,
+    ):
+        self.resolutions = [int(r) for r in resolutions]
+        if len(self.resolutions) == 0:
+            raise ValueError('resolutions must be non-empty.')
+        self.resolution = max(self.resolutions)
+        self.datasets = []
+        self._cumulative_sizes = []
+        self._stats = {}
+
+        parsed_roots = json.loads(roots)
+        keep = None
+        if instances_path is not None:
+            with open(instances_path, 'r') as f:
+                keep = {line.strip() for line in f if line.strip()}
+
+        total = 0
+        for resolution in self.resolutions:
+            per_resolution_roots = {}
+            resolution_key = f'triangle_field_voxel_{resolution}'
+            for source_name, source_roots in parsed_roots.items():
+                if resolution_key in source_roots:
+                    voxel_root = source_roots[resolution_key]
+                elif 'triangle_field_voxel' in source_roots:
+                    voxel_root = str(source_roots['triangle_field_voxel']).format(resolution=resolution)
+                else:
+                    raise KeyError(
+                        f"Source {source_name} must define '{resolution_key}' or 'triangle_field_voxel'."
+                    )
+                per_resolution_roots[f'{source_name}_r{resolution}'] = {
+                    'triangle_field_voxel': voxel_root,
+                }
+
+            dataset = SparseVoxelTriangleFieldDataset(
+                json.dumps(per_resolution_roots),
+                resolution=resolution,
+                **kwargs,
+            )
+            if keep is not None:
+                before = len(dataset.instances)
+                dataset.instances = [
+                    (root, sha256)
+                    for root, sha256 in dataset.instances
+                    if sha256 in keep
+                ]
+                if len(dataset.metadata) > 0:
+                    dataset.metadata = dataset.metadata[dataset.metadata.index.astype(str).isin(keep)]
+                dataset.loads = [
+                    dataset.metadata.loc[sha256, dataset.num_voxels_column]
+                    if dataset.num_voxels_column in dataset.metadata.columns else 1
+                    for _, sha256 in dataset.instances
+                ]
+                for stats in dataset._stats.values():
+                    stats['Restricted to instances'] = len(dataset.instances)
+                    stats['Instances removed'] = before - len(dataset.instances)
+
+            self.datasets.append(dataset)
+            total += len(dataset)
+            self._cumulative_sizes.append(total)
+            self._stats[f'resolution_{resolution}'] = {
+                'Total instances': len(dataset),
+            }
+
+        self.loads = []
+        for dataset in self.datasets:
+            self.loads.extend(dataset.loads)
+        self.input_layout = self.datasets[0].input_layout
+        self.target_layout = self.datasets[0].target_layout
+        self.value_range = self.datasets[0].value_range
+        self.distance_transform = self.datasets[0].distance_transform
+
+    def __len__(self):
+        return self._cumulative_sizes[-1]
+
+    def __getitem__(self, index):
+        dataset_idx = bisect.bisect_right(self._cumulative_sizes, index)
+        prev_size = 0 if dataset_idx == 0 else self._cumulative_sizes[dataset_idx - 1]
+        pack = self.datasets[dataset_idx][index - prev_size]
+        pack['resolution'] = torch.tensor(self.datasets[dataset_idx].resolution, dtype=torch.int32)
+        return pack
+
+    def __str__(self):
+        lines = [
+            self.__class__.__name__,
+            f'  - Total instances: {len(self)}',
+            f'  - Resolutions: {self.resolutions}',
+            f'  - Snapshot/render resolution: {self.resolution}',
+            f'  - Input channels: {self.datasets[0].num_input_channels}',
+            f'  - Target channels: {self.datasets[0].num_target_channels}',
+            f'  - Distance transform: {self.distance_transform}',
+            '  - Per-resolution datasets:',
+        ]
+        for resolution, dataset in zip(self.resolutions, self.datasets):
+            lines.append(f'    - {resolution}: {len(dataset)}')
+        return '\n'.join(lines)
+
+    @staticmethod
+    def collate_fn(batch, split_size=None):
+        return SparseVoxelTriangleFieldDataset.collate_fn(batch, split_size=split_size)
