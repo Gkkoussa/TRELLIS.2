@@ -25,8 +25,8 @@ mkdir -p "$ROOT/outputs/$RUN_NAME"
 MASTER_ADDR=$(hostname -I | awk '{print $1}')
 MASTER_PORT=$((20000 + SLURM_JOB_ID % 40000))
 export TRELLIS_DIST_TIMEOUT_MINUTES=${TRELLIS_DIST_TIMEOUT_MINUTES:-60}
-export FLEX_GEMM_USE_AUTOTUNE_CACHE=0
-export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE=0
+export FLEX_GEMM_USE_AUTOTUNE_CACHE="${FLEX_GEMM_USE_AUTOTUNE_CACHE:-1}"
+export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE="${FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-1}"
 
 DATA_DIR="{\"neuframe_train\":{\"base\":\"$ROOT/splits/train\",\"triangle_field_voxel\":\"$ROOT/splits/train/triangle_field_voxels_256\"}}"
 

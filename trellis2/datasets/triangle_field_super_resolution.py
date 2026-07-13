@@ -7,6 +7,7 @@ import pandas as pd
 
 from .components import StandardDatasetBase
 from .sparse_voxel_triangle_field import (
+    EXTENDED_INPUT_LAYOUT,
     SparseVoxelTriangleFieldVisMixin,
     find_triangle_field_path,
     load_triangle_field_npz,
@@ -39,6 +40,9 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         distance_transform: str = 'minus_one_one',
         return_area_offsets: bool = False,
         conditioning_augmentation: dict = None,
+        density_conditioning: bool = False,
+        density_voxel_root_key: str = 'density_triangle_field_voxel',
+        density_channel: str = 'density_field',
         instances_path: str = None,
     ):
         if high_resolution % low_resolution != 0:
@@ -57,7 +61,15 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         self.distance_transform = distance_transform
         self.return_area_offsets = return_area_offsets
         self.conditioning_augmentation = conditioning_augmentation
+        self.density_conditioning = bool(density_conditioning)
+        self.density_voxel_root_key = density_voxel_root_key
+        self.density_channel = density_channel
         self.instances_path = instances_path
+        if self.density_channel not in EXTENDED_INPUT_LAYOUT:
+            raise ValueError(
+                f'density_channel must be one of {sorted(EXTENDED_INPUT_LAYOUT.keys())}, '
+                f'got {self.density_channel}'
+            )
         if self.distance_transform not in ('none', 'minus_one_one'):
             raise ValueError(f"distance_transform must be 'none' or 'minus_one_one', got {self.distance_transform}")
         if self.conditioning_augmentation is not None:
@@ -81,6 +93,9 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
             f'  - Distance transform: {self.distance_transform}',
             f'  - Return area offsets: {self.return_area_offsets}',
             f'  - Conditioning augmentation: {self.conditioning_augmentation}',
+            f'  - Density conditioning: {self.density_conditioning}',
+            f'  - Density voxel root key: {self.density_voxel_root_key}',
+            f'  - Density channel: {self.density_channel}',
         ]
         return '\n'.join(lines)
 
@@ -127,9 +142,18 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
             low_metadata = pd.read_csv(os.path.join(root[self.low_voxel_root_key], 'metadata.csv'))
             high_metadata = pd.read_csv(os.path.join(root[self.high_voxel_root_key], 'metadata.csv'))
             valid = set(low_metadata['sha256'].values).intersection(set(high_metadata['sha256'].values))
+            if self.density_conditioning:
+                if self.density_voxel_root_key not in root:
+                    raise KeyError(
+                        f'Density conditioning requires root key {self.density_voxel_root_key}. '
+                        f'Available keys: {sorted(root.keys())}'
+                    )
+                density_metadata = pd.read_csv(os.path.join(root[self.density_voxel_root_key], 'metadata.csv'))
+                valid = valid.intersection(set(density_metadata['sha256'].values))
             valid_by_source[key] = valid
             if key in self._stats:
-                self._stats[key]['Paired low/high metadata'] = len(valid)
+                stat_name = 'Paired low/high/density metadata' if self.density_conditioning else 'Paired low/high metadata'
+                self._stats[key][stat_name] = len(valid)
 
         filtered = []
         for root, sha256 in self.instances:
@@ -209,6 +233,71 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         if coords.ndim != 2 or coords.shape[1] != 3:
             raise ValueError(f'{path} has invalid coords shape {tuple(coords.shape)}')
         return coords
+
+    def _features_to_support(
+        self,
+        source_coords: torch.Tensor,
+        source_feats: torch.Tensor,
+        target_coords: torch.Tensor,
+        resolution: int,
+    ) -> Tuple[torch.Tensor, float]:
+        if source_coords.numel() == 0:
+            feats = torch.zeros(
+                (target_coords.shape[0], source_feats.shape[1]),
+                dtype=source_feats.dtype,
+            )
+            return feats, 1.0
+        if source_coords.shape == target_coords.shape and torch.equal(source_coords, target_coords):
+            return source_feats, 0.0
+
+        source_keys = self._coord_keys(source_coords, resolution)
+        target_keys = self._coord_keys(target_coords, resolution)
+        order = torch.argsort(source_keys)
+        sorted_keys = source_keys[order]
+        sorted_feats = source_feats[order]
+        idx = torch.searchsorted(sorted_keys, target_keys)
+        valid = (
+            (idx < sorted_keys.numel()) &
+            (sorted_keys[idx.clamp_max(sorted_keys.numel() - 1)] == target_keys)
+        )
+        feats = torch.zeros(
+            (target_coords.shape[0], source_feats.shape[1]),
+            dtype=source_feats.dtype,
+        )
+        if valid.any():
+            feats[valid] = sorted_feats[idx[valid]]
+        missing_frac = 1.0 - valid.float().mean().item()
+        return feats, missing_frac
+
+    def _read_density_conditioning(
+        self,
+        root: str,
+        instance: str,
+        high_coords: torch.Tensor,
+    ) -> Tuple[torch.Tensor, float]:
+        path = find_triangle_field_path(root, instance)
+        with load_triangle_field_npz(path) as data:
+            coords = torch.from_numpy(data['coords'].astype(np.int32, copy=False))
+            features = torch.from_numpy(data['features'].astype(np.float32, copy=False))
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            raise ValueError(f'{path} has invalid coords shape {tuple(coords.shape)}')
+        if features.ndim != 2:
+            raise ValueError(f'{path} has invalid feature shape {tuple(features.shape)}')
+        if coords.shape[0] != features.shape[0]:
+            raise ValueError(f'{path} coords/features length mismatch: {coords.shape[0]} vs {features.shape[0]}')
+
+        slc = EXTENDED_INPUT_LAYOUT[self.density_channel]
+        if features.shape[1] < slc.stop:
+            raise ValueError(
+                f'{path} has {features.shape[1]} feature channels, but density channel '
+                f'{self.density_channel} requires at least {slc.stop}'
+            )
+        return self._features_to_support(
+            coords,
+            features[:, slc].float(),
+            high_coords,
+            self.high_resolution,
+        )
 
     def _low_to_high_support(
         self,
@@ -305,6 +394,14 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         )
         cond, missing_frac = self._low_to_high_support(low_coords, low_target, high_coords)
         cond = self._augment_conditioning(high_coords, cond)
+        density_cond = None
+        density_missing_frac = None
+        if self.density_conditioning:
+            density_cond, density_missing_frac = self._read_density_conditioning(
+                root[self.density_voxel_root_key],
+                instance,
+                high_coords,
+            )
 
         sparse_coords = torch.cat([torch.zeros_like(high_coords[:, 0:1]), high_coords], dim=-1).int()
         x_0 = sp.SparseTensor(high_target.float(), sparse_coords)
@@ -316,6 +413,9 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         }
         if self.return_area_offsets:
             pack['area_offsets'] = sp.SparseTensor(area_offsets.float(), sparse_coords)
+        if self.density_conditioning:
+            pack['density_cond'] = sp.SparseTensor(density_cond.float(), sparse_coords)
+            pack['density_missing_parent_frac'] = torch.tensor(density_missing_frac, dtype=torch.float32)
         return pack
 
     @staticmethod
@@ -388,9 +488,22 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
                 .intersection(set(high_metadata['sha256'].values))
                 .intersection(set(latent_metadata['sha256'].values))
             )
+            if self.density_conditioning:
+                if self.density_voxel_root_key not in root:
+                    raise KeyError(
+                        f'Density conditioning requires root key {self.density_voxel_root_key}. '
+                        f'Available keys: {sorted(root.keys())}'
+                    )
+                density_metadata = pd.read_csv(os.path.join(root[self.density_voxel_root_key], 'metadata.csv'))
+                valid = valid.intersection(set(density_metadata['sha256'].values))
             valid_by_source[key] = valid
             if key in self._stats:
-                self._stats[key]['Paired low/high/latent metadata'] = len(valid)
+                stat_name = (
+                    'Paired low/high/latent/density metadata'
+                    if self.density_conditioning else
+                    'Paired low/high/latent metadata'
+                )
+                self._stats[key][stat_name] = len(valid)
 
         filtered = []
         for root, sha256 in self.instances:
@@ -455,11 +568,22 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
         cond = self._augment_conditioning(high_coords, cond)
         sparse_coords = torch.cat([torch.zeros_like(high_coords[:, 0:1]), high_coords], dim=-1).int()
         z_0, cache_path = self._read_latent(root[self.latent_root_key], instance)
+        density_cond = None
+        density_missing_frac = None
+        if self.density_conditioning:
+            density_cond, density_missing_frac = self._read_density_conditioning(
+                root[self.density_voxel_root_key],
+                instance,
+                high_coords,
+            )
         pack = {
             'cond': sp.SparseTensor(cond.float(), sparse_coords),
             'missing_low_parent_frac': torch.tensor(missing_frac, dtype=torch.float32),
             'z_0': z_0,
         }
+        if self.density_conditioning:
+            pack['density_cond'] = sp.SparseTensor(density_cond.float(), sparse_coords)
+            pack['density_missing_parent_frac'] = torch.tensor(density_missing_frac, dtype=torch.float32)
         pack['triangle_field_slat_cache_path'] = cache_path
         pack['triangle_field_slat_cache'] = self._read_latent_cache(cache_path)
         return pack

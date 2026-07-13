@@ -38,6 +38,23 @@ def parse_args():
         action="store_true",
         help="Apply the trainer's configured conditioning augmentation to the positive conditioning path.",
     )
+    parser.add_argument(
+        "--conditioning_augmentation_noise_level",
+        type=float,
+        default=None,
+        help="Eval-only override for conditioning_augmentation.noise_level.",
+    )
+    parser.add_argument(
+        "--conditioning_augmentation_blur_sigma",
+        type=float,
+        default=None,
+        help="Eval-only override/default for conditioning_augmentation.blur_sigma.",
+    )
+    parser.add_argument(
+        "--conditioning_augmentation_disable_blur",
+        action="store_true",
+        help="Eval-only override that applies conditioning noise without sparse blur.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--instances", type=str, default=None)
@@ -140,10 +157,16 @@ def build_data_dir(
     elif require_latents:
         latent_root = root / "triangle_field_latents" / latent_name
 
+    def triangle_field_voxel_root(resolution: int) -> Path:
+        override = os.environ.get(f"TRIANGLE_FIELD_VOXEL_{resolution}_DIR")
+        if override:
+            return Path(override)
+        return root / f"triangle_field_voxels_{resolution}"
+
     data_dir = {
         "objxl4k_filtered": {
-            "low_triangle_field_voxel": str(root / f"triangle_field_voxels_{low_resolution}"),
-            "high_triangle_field_voxel": str(root / f"triangle_field_voxels_{high_resolution}"),
+            "low_triangle_field_voxel": str(triangle_field_voxel_root(low_resolution)),
+            "high_triangle_field_voxel": str(triangle_field_voxel_root(high_resolution)),
         }
     }
     if require_latents:
@@ -158,6 +181,8 @@ def build_dataset(cfg: dict, root: Path, args):
     dataset_args["return_area_offsets"] = False
     dataset_args.pop("conditioning_augmentation", None)
     dataset_args.pop("instances_path", None)
+    if getattr(args, "disable_dataset_density_conditioning", False):
+        dataset_args["density_conditioning"] = False
     if args.render_resolution is not None:
         dataset_args["snapshot_render_resolution"] = args.render_resolution
     dataset_name = cfg["dataset"]["name"]
@@ -201,6 +226,29 @@ def build_dataset(cfg: dict, root: Path, args):
     if getattr(args, "instances", None) is not None:
         restrict_dataset_to_instances(dataset, args.instances, None)
     return dataset, data_dir
+
+
+def apply_conditioning_augmentation_overrides(trainer, args) -> None:
+    noise_level = getattr(args, "conditioning_augmentation_noise_level", None)
+    blur_sigma = getattr(args, "conditioning_augmentation_blur_sigma", None)
+    disable_blur = bool(getattr(args, "conditioning_augmentation_disable_blur", False))
+    if noise_level is None and blur_sigma is None and not disable_blur:
+        return
+    cfg = (
+        copy.deepcopy(trainer.conditioning_augmentation)
+        if trainer.conditioning_augmentation is not None
+        else {"type": "sparse_blur_noise", "blur_sigma": 1.0, "noise_level": 0.0, "apply_prob": 1.0}
+    )
+    if noise_level is not None:
+        cfg["noise_level"] = float(noise_level)
+    if blur_sigma is not None:
+        cfg["blur_sigma"] = float(blur_sigma)
+    if disable_blur:
+        cfg["disable_blur"] = True
+    trainer._validate_conditioning_augmentation(cfg)
+    trainer.conditioning_augmentation = cfg
+    if hasattr(trainer, "_cond_blur_cache"):
+        trainer._cond_blur_cache.clear()
 
 
 def spatial_cache_scale_key(scale: int) -> str:
@@ -328,6 +376,7 @@ def predict_z0(
     caches,
     cache_paths,
     t: float,
+    density_cond: sp.SparseTensor | None = None,
 ) -> sp.SparseTensor:
     x_t = trainer._decode_latents_with_cache(z_t, caches=caches, cache_paths=cache_paths)
     if not torch.equal(x_t.coords, cond.coords):
@@ -337,12 +386,19 @@ def predict_z0(
         latent_cond_input, _ = trainer._latent_to_field_support(z_t, x_t)
         enc_in = trainer._make_encoder_input(x_t, cond)
         enc_in = enc_in.replace(torch.cat([enc_in.feats, latent_cond_input.feats], dim=-1))
+        if density_cond is not None:
+            if not torch.equal(enc_in.coords, density_cond.coords):
+                raise ValueError(
+                    f"density_cond coords must match encoder input coords: "
+                    f"{density_cond.coords.shape} vs {enc_in.coords.shape}"
+                )
+            enc_in = enc_in.replace(torch.cat([enc_in.feats, density_cond.feats], dim=-1))
         encoder_kwargs = {}
     elif mode == "bottleneck":
-        enc_in = trainer._make_encoder_input(x_t, cond)
+        enc_in = trainer._make_encoder_input(x_t, cond, density_cond)
         encoder_kwargs = {"latent_cond": z_t}
     else:
-        enc_in = trainer._make_encoder_input(x_t, cond)
+        enc_in = trainer._make_encoder_input(x_t, cond, density_cond)
         encoder_kwargs = {}
     batch_t = torch.full((z_t.shape[0],), t * 1000.0, device=z_t.feats.device, dtype=torch.float32)
     pred_z0 = trainer.models["encoder"](enc_in, batch_t, sample_posterior=False, **encoder_kwargs)
@@ -361,6 +417,7 @@ def sample_latent_sr(
     steps: int,
     guidance_strength: float,
     apply_conditioning_augmentation: bool = False,
+    density_cond: sp.SparseTensor | None = None,
 ):
     z_t = z_0.replace(torch.randn_like(z_0.feats))
     cond_pos = trainer._augment_conditioning(cond) if apply_conditioning_augmentation else cond
@@ -369,13 +426,13 @@ def sample_latent_sr(
     pred_z0_last = None
     for t, t_prev in tqdm(list(zip(t_seq[:-1], t_seq[1:])), desc="Sampling latent SR"):
         if guidance_strength == 0.0:
-            pred_z0 = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t))
+            pred_z0 = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t), density_cond)
         else:
-            pred_pos = predict_z0(trainer, z_t, cond_pos, caches, cache_paths, float(t))
+            pred_pos = predict_z0(trainer, z_t, cond_pos, caches, cache_paths, float(t), density_cond)
         if guidance_strength == 1.0:
             pred_z0 = pred_pos
         elif guidance_strength != 0.0:
-            pred_neg = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t))
+            pred_neg = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t), density_cond)
             pred_z0 = pred_pos.replace(
                 guidance_strength * pred_pos.feats + (1.0 - guidance_strength) * pred_neg.feats
             )
@@ -448,6 +505,7 @@ def main():
             args.steps,
             args.guidance_strength,
             args.apply_conditioning_augmentation,
+            data.get("density_cond", None),
         )
         gt = data["x_0"] if args.no_latents else trainer._decode_latents_with_cache(data["z_0"], caches=caches, cache_paths=cache_paths)
         sample = trainer._decode_latents_with_cache(sample_z, caches=caches, cache_paths=cache_paths)

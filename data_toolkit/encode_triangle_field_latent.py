@@ -15,6 +15,7 @@ from queue import Empty, Queue
 import trellis2.models as models
 import trellis2.modules.sparse as sp
 from trellis2.datasets.sparse_voxel_triangle_field import (
+    EXTENDED_INPUT_LAYOUT,
     INPUT_LAYOUT,
     TARGET_LAYOUT,
     find_triangle_field_path,
@@ -119,7 +120,8 @@ def require_triangle_field_dataset_args(cfg, resolution, allow_resolution_mismat
 
 
 def build_triangle_field_sparse_tensor(path, dataset_args):
-    num_input_channels = max(slc.stop for slc in INPUT_LAYOUT.values())
+    input_layout = EXTENDED_INPUT_LAYOUT if dataset_args.get('include_density_field', False) else INPUT_LAYOUT
+    num_input_channels = max(slc.stop for slc in input_layout.values())
     num_target_channels = max(slc.stop for slc in TARGET_LAYOUT.values())
 
     with load_triangle_field_npz(path) as data:

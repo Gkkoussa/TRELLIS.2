@@ -23,6 +23,9 @@ cd /home/koussa/scratch/TRELLIS.2
 eval "$(conda shell.bash hook)"
 conda activate trellis2
 
+export FLEX_GEMM_USE_AUTOTUNE_CACHE="${FLEX_GEMM_USE_AUTOTUNE_CACHE:-1}"
+export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE="${FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-1}"
+
 export ROOT=/nfs/turbo/coe-jjparkcv-medium/koussa/neuframe
 export RUN_DIR="$1"
 export EVAL_SPLIT="${EVAL_SPLIT:-test}"

@@ -27,6 +27,11 @@ INPUT_LAYOUT = {
     'offset_to_projection': slice(17, 20),
 }
 
+EXTENDED_INPUT_LAYOUT = {
+    **INPUT_LAYOUT,
+    'density_field': slice(20, 21),
+}
+
 TARGET_LAYOUT = {
     'd_tri': slice(0, 1),
     'd_vert': slice(1, 2),
@@ -154,6 +159,7 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
         num_voxels_column: str = 'num_triangle_field_voxels',
         input_feature_scale: Union[float, list[float], None] = None,
         distance_transform: str = 'none',
+        include_density_field: bool = False,
     ):
         self.resolution = resolution
         self.max_active_voxels = max_active_voxels
@@ -163,7 +169,8 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
         self.voxel_dirname = voxel_dirname
         self.voxelized_flag_column = voxelized_flag_column
         self.num_voxels_column = num_voxels_column
-        self.input_layout = INPUT_LAYOUT
+        self.include_density_field = include_density_field
+        self.input_layout = EXTENDED_INPUT_LAYOUT if include_density_field else INPUT_LAYOUT
         self.target_layout = TARGET_LAYOUT
         self.value_range = (0, 1)
         self.distance_transform = distance_transform
@@ -189,6 +196,7 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
             f'  - Target channels: {self.num_target_channels}',
             f'  - Input feature scale: {None if self.input_feature_scale is None else "explicit"}',
             f'  - Distance transform: {self.distance_transform}',
+            f'  - Include density field: {self.include_density_field}',
         ]
         return '\n'.join(lines)
 
@@ -247,9 +255,14 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
             raise ValueError(f'{path} has invalid coords shape {tuple(coords.shape)}')
         if coords.shape[0] != features.shape[0]:
             raise ValueError(f'{path} coords/features length mismatch: {coords.shape[0]} vs {features.shape[0]}')
+        if features.shape[1] < self.num_input_channels:
+            raise ValueError(
+                f'{path} has {features.shape[1]} feature channels, but dataset requires '
+                f'{self.num_input_channels}. include_density_field={self.include_density_field}'
+            )
 
         sparse_coords = torch.cat([torch.zeros_like(coords[:, 0:1]), coords], dim=-1)
-        input_features = self._transform_distance_channels(features)
+        input_features = self._transform_distance_channels(features[:, :self.num_input_channels])
         target_features = input_features[:, :self.num_target_channels]
         x = sp.SparseTensor(
             self._scale_input_features(input_features).float(),

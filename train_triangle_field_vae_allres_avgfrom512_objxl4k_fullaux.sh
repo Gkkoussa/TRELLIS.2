@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=trellis-trifield-vae-allres-fullaux
+#SBATCH --job-name=trellis-trifield-vae-allres-avg512
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:2
@@ -20,9 +20,9 @@ eval "$(conda shell.bash hook)"
 conda activate trellis2
 
 export ROOT="${ROOT:-/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k}"
-export RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-triangle_field_vae_allres_invarea_fullaux}"
+export RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-triangle_field_vae_allres_avgfrom512_invarea_fullaux}"
 export RUN_NAME="${RUN_NAME:-${RUN_NAME_PREFIX}_${SLURM_JOB_ID}}"
-export FLOW_CONFIG="${FLOW_CONFIG:-/home/koussa/scratch/TRELLIS.2/configs/scvae/triangle_field_vae_next_dc_f16c32_fp16_allres_objxl4k_invarea_fullaux.json}"
+export FLOW_CONFIG="${FLOW_CONFIG:-/home/koussa/scratch/TRELLIS.2/configs/scvae/triangle_field_vae_next_dc_f16c32_fp16_allres_avgfrom512_objxl4k_invarea_fullaux.json}"
 export TRAIN_INSTANCES="${TRAIN_INSTANCES:-$ROOT/splits/train_triangle_field_512/instances.txt}"
 export NUM_GPUS="${NUM_GPUS:-2}"
 
@@ -40,15 +40,20 @@ if [ ! -f "$TRAIN_INSTANCES" ]; then
   exit 1
 fi
 
-for RESOLUTION in 32 64 128 256 512; do
-  VOXEL_DIR="$ROOT/triangle_field_voxels_${RESOLUTION}"
+for RESOLUTION in 32 64 128 256; do
+  VOXEL_DIR="$ROOT/triangle_field_voxels_${RESOLUTION}_avg_from_512"
   if [ ! -f "$VOXEL_DIR/metadata.csv" ]; then
-    echo "Missing triangle-field voxel metadata: $VOXEL_DIR/metadata.csv" >&2
+    echo "Missing averaged triangle-field voxel metadata: $VOXEL_DIR/metadata.csv" >&2
     exit 1
   fi
 done
 
-DATA_DIR="{\"objxl4k_filtered_train\":{\"triangle_field_voxel_32\":\"$ROOT/triangle_field_voxels_32\",\"triangle_field_voxel_64\":\"$ROOT/triangle_field_voxels_64\",\"triangle_field_voxel_128\":\"$ROOT/triangle_field_voxels_128\",\"triangle_field_voxel_256\":\"$ROOT/triangle_field_voxels_256\",\"triangle_field_voxel_512\":\"$ROOT/triangle_field_voxels_512\"}}"
+if [ ! -f "$ROOT/triangle_field_voxels_512/metadata.csv" ]; then
+  echo "Missing native 512 triangle-field voxel metadata: $ROOT/triangle_field_voxels_512/metadata.csv" >&2
+  exit 1
+fi
+
+DATA_DIR="{\"objxl4k_filtered_train_avgfrom512\":{\"triangle_field_voxel_32\":\"$ROOT/triangle_field_voxels_32_avg_from_512\",\"triangle_field_voxel_64\":\"$ROOT/triangle_field_voxels_64_avg_from_512\",\"triangle_field_voxel_128\":\"$ROOT/triangle_field_voxels_128_avg_from_512\",\"triangle_field_voxel_256\":\"$ROOT/triangle_field_voxels_256_avg_from_512\",\"triangle_field_voxel_512\":\"$ROOT/triangle_field_voxels_512\"}}"
 
 python - "$FLOW_CONFIG" "$JOB_CONFIG" "$TRAIN_INSTANCES" <<'PY'
 import json

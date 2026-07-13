@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--ema_rate", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--instances", type=str, default=None)
     parser.add_argument("--low_resolution", type=int, default=256)
     parser.add_argument("--high_resolution", type=int, default=512)
     parser.add_argument("--steps", type=int, default=50)
@@ -79,6 +80,29 @@ def tensor_l1_delta(current: torch.Tensor | None, previous: torch.Tensor | None)
     if current is None or previous is None:
         return None
     return float((current.float() - previous.float()).abs().mean().item())
+
+
+def restrict_dataset_to_instances(dataset, instances_path: str):
+    with open(instances_path, "r") as f:
+        selected = [line.strip() for line in f if line.strip()]
+    selected_set = set(selected)
+    selected_index = {sha256: idx for idx, sha256 in enumerate(selected)}
+    filtered = [(root, sha256) for root, sha256 in dataset.instances if sha256 in selected_set]
+    filtered.sort(key=lambda item: selected_index[item[1]])
+    if len(filtered) != len(selected):
+        found = {sha256 for _, sha256 in filtered}
+        missing = [sha256 for sha256 in selected if sha256 not in found]
+        raise ValueError(f"Only found {len(filtered)}/{len(selected)} requested instances; first missing: {missing[:5]}")
+    dataset.instances = filtered
+    if len(dataset.metadata) > 0:
+        dataset.metadata = dataset.metadata[dataset.metadata.index.astype(str).isin(selected_set)]
+    if hasattr(dataset, "loads"):
+        dataset.loads = [
+            dataset.metadata.loc[sha256, dataset.num_voxels_column]
+            if dataset.num_voxels_column in dataset.metadata.columns else 1
+            for _, sha256 in dataset.instances
+        ]
+    return selected
 
 
 @torch.no_grad()
@@ -198,6 +222,7 @@ def main():
         no_latents=True,
         latent_name=None,
         split=args.split,
+        instances=args.instances,
         render_resolution=args.render_resolution,
         metadata_filter_csv=args.metadata_filter_csv,
         no_train_duplicate_csv=args.no_train_duplicate_csv,
@@ -205,6 +230,9 @@ def main():
         disable_default_eval_filters=args.disable_default_eval_filters,
     )
     dataset, data_dir = build_dataset(cfg, root, flow_args)
+    selected_instances = None
+    if args.instances is not None:
+        selected_instances = restrict_dataset_to_instances(dataset, args.instances)
     trainer = build_trainer(cfg, dataset, output_dir)
     ckpt_path = load_encoder_checkpoint(trainer, run_dir, ckpt_step, args.ema_rate)
 
@@ -213,7 +241,7 @@ def main():
     loader = DataLoader(
         dataset,
         batch_size=1,
-        shuffle=True,
+        shuffle=args.instances is None,
         generator=generator,
         drop_last=False,
         num_workers=0,
@@ -239,7 +267,7 @@ def main():
         panel_width=args.panel_width,
     )
 
-    gif_path = output_dir / "unconditional_512_d_tri_trajectory.gif"
+    gif_path = output_dir / f"unconditional_{args.high_resolution}_d_tri_trajectory.gif"
     frames[0].save(
         gif_path,
         save_all=True,
@@ -270,6 +298,8 @@ def main():
         "output_dir": str(output_dir),
         "gif_path": str(gif_path),
         "stats_path": str(stats_path),
+        "instances": args.instances,
+        "selected_instance": selected_instances[args.sample_index] if selected_instances is not None else None,
     }
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)

@@ -12,6 +12,7 @@ from trellis2.modules import sparse as sp
 from trellis2.utils.data_utils import recursive_to_device
 
 from eval_triangle_field_latent_sr_flow import (
+    apply_conditioning_augmentation_overrides,
     build_dataset,
     build_support_latents,
     build_trainer,
@@ -43,6 +44,23 @@ def parse_args():
         "--apply_conditioning_augmentation",
         action="store_true",
         help="Apply the trainer's configured conditioning augmentation to the positive conditioning path.",
+    )
+    parser.add_argument(
+        "--conditioning_augmentation_noise_level",
+        type=float,
+        default=None,
+        help="Eval-only override for conditioning_augmentation.noise_level.",
+    )
+    parser.add_argument(
+        "--conditioning_augmentation_blur_sigma",
+        type=float,
+        default=None,
+        help="Eval-only override/default for conditioning_augmentation.blur_sigma.",
+    )
+    parser.add_argument(
+        "--conditioning_augmentation_disable_blur",
+        action="store_true",
+        help="Eval-only override that applies conditioning noise without sparse blur.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--render_resolution", type=int, default=None)
@@ -198,6 +216,7 @@ def main():
                 raise ValueError("Explicit instance ordering differs across cascade stage datasets.")
 
     trainer = build_trainer(cfg, datasets[0], output_dir)
+    apply_conditioning_augmentation_overrides(trainer, args)
     ckpt_path = load_encoder_checkpoint(trainer, run_dir, ckpt_step, args.ema_rate)
     latent_channels = int(cfg["models"]["encoder"]["args"]["latent_channels"])
 

@@ -102,10 +102,11 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
                 f"Unsupported conditioning_augmentation type {cfg.get('type')}. "
                 "Expected 'sparse_blur_noise'."
             )
+        disable_blur = bool(cfg.get('disable_blur', False))
         blur_sigma = float(cfg.get('blur_sigma', 1.0))
         noise_level = float(cfg.get('noise_level', 0.0))
         apply_prob = float(cfg.get('apply_prob', 1.0))
-        if blur_sigma <= 0:
+        if not disable_blur and blur_sigma <= 0:
             raise ValueError(f'conditioning_augmentation.blur_sigma must be positive, got {blur_sigma}')
         if not (0.0 <= noise_level <= 1.0):
             raise ValueError(f'conditioning_augmentation.noise_level must be in [0, 1], got {noise_level}')
@@ -163,19 +164,23 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         else:
             apply = torch.ones(cond.shape[0], device=cond.feats.device, dtype=torch.bool)
 
+        disable_blur = bool(cfg.get('disable_blur', False))
         blur_sigma = float(cfg.get('blur_sigma', 1.0))
         noise_level = float(cfg.get('noise_level', 0.0))
-        value_conv, norm_conv = self._get_cond_blur_convs(
-            cond.feats.shape[1],
-            blur_sigma,
-            cond.feats.dtype,
-            cond.feats.device,
-        )
+        if disable_blur:
+            aug_feats = cond.feats
+        else:
+            value_conv, norm_conv = self._get_cond_blur_convs(
+                cond.feats.shape[1],
+                blur_sigma,
+                cond.feats.dtype,
+                cond.feats.device,
+            )
 
-        blurred = value_conv(cond)
-        ones = cond.replace(torch.ones((cond.feats.shape[0], 1), device=cond.feats.device, dtype=cond.feats.dtype))
-        denom = norm_conv(ones).feats.clamp_min(1e-6)
-        aug_feats = (blurred.feats / denom).clamp(-1.0, 1.0)
+            blurred = value_conv(cond)
+            ones = cond.replace(torch.ones((cond.feats.shape[0], 1), device=cond.feats.device, dtype=cond.feats.dtype))
+            denom = norm_conv(ones).feats.clamp_min(1e-6)
+            aug_feats = (blurred.feats / denom).clamp(-1.0, 1.0)
         if noise_level > 0:
             aug_feats = ((1.0 - noise_level) * aug_feats + noise_level * torch.randn_like(aug_feats)).clamp(-1.0, 1.0)
 
@@ -222,15 +227,29 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             raw = torch.load(finetune_ckpt[name], map_location=self.device, weights_only=True)
             loadable = {}
             skipped = []
+            partially_loaded = []
             for k, v in raw.items():
                 if k not in model_state:
                     skipped.append((k, 'missing_in_model'))
+                elif (
+                    k.endswith('input_layer.weight') and
+                    v.ndim == 2 and
+                    model_state[k].ndim == 2 and
+                    v.shape[0] == model_state[k].shape[0] and
+                    v.shape[1] < model_state[k].shape[1]
+                ):
+                    merged = model_state[k].clone()
+                    merged[:, :v.shape[1]] = v
+                    loadable[k] = merged
+                    partially_loaded.append((k, f'copied prefix columns {v.shape[1]}/{model_state[k].shape[1]}'))
                 elif v.shape != model_state[k].shape:
                     skipped.append((k, f'shape {tuple(v.shape)} != {tuple(model_state[k].shape)}'))
                 else:
                     loadable[k] = v
             missing, unexpected = model.load_state_dict(loadable, strict=False)
             if self.is_master:
+                for k, reason in partially_loaded:
+                    print(f'Info: partially loaded {name}.{k}: {reason}')
                 for k, reason in skipped:
                     print(f'Warning: skipped {name}.{k}: {reason}')
                 for k in missing:
@@ -273,13 +292,36 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         return cond, drop
 
     @staticmethod
-    def _make_encoder_input(x_t: sp.SparseTensor, cond: sp.SparseTensor) -> sp.SparseTensor:
+    def _make_encoder_input(
+        x_t: sp.SparseTensor,
+        cond: sp.SparseTensor,
+        extra_cond: Optional[Union[sp.SparseTensor, List[sp.SparseTensor]]] = None,
+    ) -> sp.SparseTensor:
         if not torch.equal(x_t.coords, cond.coords):
             raise ValueError(f'x_t and cond coords must match, got {x_t.coords.shape} vs {cond.coords.shape}')
-        return x_t.replace(torch.cat([x_t.feats, cond.feats], dim=-1))
+        feats = [x_t.feats, cond.feats]
+        if extra_cond is not None:
+            if isinstance(extra_cond, sp.SparseTensor):
+                extra_cond = [extra_cond]
+            for i, tensor in enumerate(extra_cond):
+                if tensor is None:
+                    continue
+                if not torch.equal(x_t.coords, tensor.coords):
+                    raise ValueError(
+                        f'extra_cond[{i}] coords must match x_t coords, '
+                        f'got {tensor.coords.shape} vs {x_t.coords.shape}'
+                    )
+                feats.append(tensor.feats)
+        return x_t.replace(torch.cat(feats, dim=-1))
 
-    def _predict_x0(self, x_t: sp.SparseTensor, cond: sp.SparseTensor, t: torch.Tensor) -> sp.SparseTensor:
-        enc_in = self._make_encoder_input(x_t, cond)
+    def _predict_x0(
+        self,
+        x_t: sp.SparseTensor,
+        cond: sp.SparseTensor,
+        t: torch.Tensor,
+        extra_cond: Optional[Union[sp.SparseTensor, List[sp.SparseTensor]]] = None,
+    ) -> sp.SparseTensor:
+        enc_in = self._make_encoder_input(x_t, cond, extra_cond)
         z = self.training_models['encoder'](
             enc_in,
             t * 1000.0,
@@ -334,6 +376,8 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         x_0: sp.SparseTensor,
         cond: sp.SparseTensor,
         missing_low_parent_frac: torch.Tensor = None,
+        density_cond: sp.SparseTensor = None,
+        density_missing_parent_frac: torch.Tensor = None,
         area_offsets: sp.SparseTensor = None,
         **kwargs,
     ) -> Tuple[Dict, Dict]:
@@ -342,7 +386,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         x_t, _ = self._diffuse_sparse(x_0, t)
         cond = self._augment_conditioning(cond)
         cond, cond_drop = self._drop_cond(cond)
-        pred_x0 = self._predict_x0(x_t, cond, t)
+        pred_x0 = self._predict_x0(x_t, cond, t, extra_cond=density_cond)
         if pred_x0.feats.shape != x_0.feats.shape:
             raise ValueError(f'Prediction shape must match x_0, got {pred_x0.feats.shape} vs {x_0.feats.shape}')
 
@@ -369,6 +413,10 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             missing_low_parent_frac = missing_low_parent_frac.float()
             status['cond/missing_low_parent_frac'] = missing_low_parent_frac.mean()
             status['cond/missing_low_parent_frac_max'] = missing_low_parent_frac.max()
+        if density_missing_parent_frac is not None:
+            density_missing_parent_frac = density_missing_parent_frac.float()
+            status['density_cond/missing_parent_frac'] = density_missing_parent_frac.mean()
+            status['density_cond/missing_parent_frac_max'] = density_missing_parent_frac.max()
 
         with torch.no_grad():
             l1_per_channel = (pred_x0.feats - x_0.feats).abs().mean(dim=0)
@@ -418,7 +466,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             args = recursive_to_device(args, self.device)
             t = torch.full((args['x_0'].shape[0],), self.snapshot_t, device=self.device)
             x_t, _ = self._diffuse_sparse(args['x_0'], t)
-            enc_in = self._make_encoder_input(x_t, args['cond'])
+            enc_in = self._make_encoder_input(x_t, args['cond'], args.get('density_cond', None))
             z = self.models['encoder'](enc_in, t * 1000.0, sample_posterior=False)
             y = self.decoder(z)
 
@@ -700,6 +748,8 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         triangle_field_slat_cache_path: List[str] = None,
         x_0: sp.SparseTensor = None,
         missing_low_parent_frac: torch.Tensor = None,
+        density_cond: sp.SparseTensor = None,
+        density_missing_parent_frac: torch.Tensor = None,
         **kwargs,
     ) -> Tuple[Dict, Dict]:
         t = self.sample_t(z_0.shape[0]).to(z_0.feats.device).float()
@@ -721,12 +771,16 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             latent_cond_input, latent_cond_missing = self._latent_to_field_support(z_t, x_t)
             enc_in = self._make_encoder_input(x_t, cond)
             enc_in = enc_in.replace(torch.cat([enc_in.feats, latent_cond_input.feats], dim=-1))
+            if density_cond is not None:
+                if not torch.equal(enc_in.coords, density_cond.coords):
+                    raise ValueError('density_cond coords must match encoder input coords')
+                enc_in = enc_in.replace(torch.cat([enc_in.feats, density_cond.feats], dim=-1))
             encoder_kwargs = {}
         elif self.latent_self_conditioning_mode == 'bottleneck':
-            enc_in = self._make_encoder_input(x_t, cond)
+            enc_in = self._make_encoder_input(x_t, cond, density_cond)
             encoder_kwargs = {'latent_cond': z_t}
         else:
-            enc_in = self._make_encoder_input(x_t, cond)
+            enc_in = self._make_encoder_input(x_t, cond, density_cond)
             encoder_kwargs = {}
         pred_z0 = self.training_models['encoder'](
             enc_in,
@@ -754,6 +808,10 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         if latent_cond_missing is not None:
             status['latent_cond/missing_parent_frac'] = latent_cond_missing.mean()
             status['latent_cond/missing_parent_frac_max'] = latent_cond_missing.max()
+        if density_missing_parent_frac is not None:
+            density_missing_parent_frac = density_missing_parent_frac.float()
+            status['density_cond/missing_parent_frac'] = density_missing_parent_frac.mean()
+            status['density_cond/missing_parent_frac_max'] = density_missing_parent_frac.max()
 
         with torch.no_grad():
             raw_l1 = (pred_z0.feats - z_0.feats).abs()
@@ -816,12 +874,17 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 latent_cond_input, _ = self._latent_to_field_support(z_t, x_t)
                 enc_in = self._make_encoder_input(x_t, args['cond'])
                 enc_in = enc_in.replace(torch.cat([enc_in.feats, latent_cond_input.feats], dim=-1))
+                density_cond = args.get('density_cond', None)
+                if density_cond is not None:
+                    if not torch.equal(enc_in.coords, density_cond.coords):
+                        raise ValueError('density_cond coords must match encoder input coords')
+                    enc_in = enc_in.replace(torch.cat([enc_in.feats, density_cond.feats], dim=-1))
                 encoder_kwargs = {}
             elif self.latent_self_conditioning_mode == 'bottleneck':
-                enc_in = self._make_encoder_input(x_t, args['cond'])
+                enc_in = self._make_encoder_input(x_t, args['cond'], args.get('density_cond', None))
                 encoder_kwargs = {'latent_cond': z_t}
             else:
-                enc_in = self._make_encoder_input(x_t, args['cond'])
+                enc_in = self._make_encoder_input(x_t, args['cond'], args.get('density_cond', None))
                 encoder_kwargs = {}
             pred_z0 = self.models['encoder'](
                 enc_in,
