@@ -195,6 +195,87 @@ $ROOT/outputs/triangle_field_vae_512_invarea_auxdrop_52039231/ckpts/decoder_step
 The latent SR model is initialized from the VAE encoder checkpoint above, not
 from previous latent-SR checkpoints unless intentionally resuming a clean run.
 
+## Current Best Setup
+
+As of the latest comparisons, the best SR setup is the **non-high-KL all-res
+VAE latent space** with the **input-style self-conditioning latent SR model**.
+
+Best all-res VAE run:
+
+```bash
+$ROOT/outputs/triangle_field_vae_allres_invarea_fullaux_52454251
+```
+
+Useful all-res VAE checkpoint:
+
+```bash
+$ROOT/outputs/triangle_field_vae_allres_invarea_fullaux_52454251/ckpts/encoder_step0320000.pt
+$ROOT/outputs/triangle_field_vae_allres_invarea_fullaux_52454251/ckpts/decoder_step0320000.pt
+```
+
+Best latent SR flow run so far:
+
+```bash
+$ROOT/outputs/triangle_field_latent_sr_flow_64to128_selfcond_input_allres_fullaux_52494005
+```
+
+Useful latent SR checkpoint:
+
+```bash
+$ROOT/outputs/triangle_field_latent_sr_flow_64to128_selfcond_input_allres_fullaux_52494005/ckpts/encoder_ema0.9999_step0080000.pt
+```
+
+Best observed cascade inference setting:
+
+```text
+stage repeats: 3
+steps per repeat: 11
+CFG / guidance_strength: 1.0
+base_guidance_strength: 0.0
+conditioning augmentation: enabled
+```
+
+Existing encoded latents from this VAE:
+
+```bash
+$ROOT/triangle_field_latents/triangle_field_vae_allres_invarea_fullaux_52454251_step0320000_128
+```
+
+These are the current best 128-resolution triangle-field latents for 64->128
+latent SR training/eval. Do not re-encode them unless the VAE checkpoint,
+resolution, or filtered instance set intentionally changes.
+
+Related existing latent payloads:
+
+```bash
+# High-KL all-res VAE latents.
+$ROOT/triangle_field_latents/triangle_field_vae_allres_invarea_fullaux_highkl_52457336_step0320000_128
+
+# Earlier inverse-area aux-drop VAE latents.
+$ROOT/triangle_field_latents/triangle_field_vae_512_invarea_auxdrop_52039231_step0180000_128
+$ROOT/triangle_field_latents/triangle_field_vae_512_invarea_auxdrop_52039231_step0180000_512
+
+# DiT comparison / older VAE latent set.
+$ROOT/triangle_field_latents/triangle_field_vae_51685536_step0100000_256
+
+# Pred-subdiv c64 latent set.
+$ROOT/triangle_field_latents/triangle_field_vae_256_predsubdiv_c64_52039264_step0150000_256
+```
+
+This model differs from the older latent SR flow by concatenating the current
+latent/self-conditioning signal at the encoder input. The VAE latents are still
+decoded through the frozen all-res VAE decoder; the extra input conditioning is
+for the SR encoder, not a replacement for the decoder.
+
+The training recipe for this setup is:
+
+1. Train/fine-tune the all-res VAE on filtered train only.
+2. Encode 128-resolution triangle-field latents with that all-res VAE.
+3. Train the input-style latent SR model on filtered train only using those
+   all-res VAE latents.
+4. Evaluate on filtered test only, plus the no-train-duplicate filter when
+   making comparison figures.
+
 ## Encode Triangle-Field Latents
 
 Latent SR needs offline high-resolution latents from the selected VAE encoder.
@@ -432,6 +513,109 @@ Restricted to split/test: 4494
 
 Use `cfg=3.0` as the default guidance strength unless explicitly testing a
 different value.
+
+For clean comparison figures, evaluation should also apply the test duplicate
+removal filter:
+
+```bash
+$ROOT/metadata_test_no_train_duplicates/metadata_test_no_train_duplicates.csv
+```
+
+The eval helpers now apply the filtered-test, no-train-duplicate, and triangle
+filter intersection by default for `--split test`. The currently used fixed
+16-example duplicate-filtered list is:
+
+```bash
+$ROOT/eval_instances_duplicate_filtered_test_n16.txt
+```
+
+### Cascaded Eval Without Repeat
+
+This runs the normal cascade, where each stage is sampled once:
+
+```bash
+cd /home/koussa/scratch/TRELLIS.2
+export ROOT=/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k
+export RUN=$ROOT/outputs/triangle_field_latent_sr_flow_64to128_selfcond_input_allres_fullaux_52494005
+export INST=$ROOT/eval_instances_duplicate_filtered_test_n16.txt
+
+/home/koussa/scratch/envs/trellis2/bin/python eval_triangle_field_latent_sr_cascade.py \
+  --run_dir "$RUN" \
+  --root "$ROOT" \
+  --ckpt 80000 \
+  --ema_rate 0.9999 \
+  --split test \
+  --instances "$INST" \
+  --num_samples 16 \
+  --batch_size 1 \
+  --steps 50 \
+  --base_guidance_strength 0.0 \
+  --guidance_strength 1.0 \
+  --apply_conditioning_augmentation \
+  --output_dir "$RUN/eval_cascade_step0080000_cfg1_aug_n16_dupfilter"
+```
+
+### Cascaded Eval With Repeat
+
+This is the repeat-cascade strategy. It starts with unconditional 128, averages
+that down to 64, then repeats each SR stage by feeding the generated high-res
+field back through average downsampling:
+
+```text
+uncond 128 -> avg down to 64
+64 -> 128 repeated xN
+128 -> 256 repeated xN
+256 -> 512 repeated xN
+```
+
+Run repeat-3:
+
+```bash
+cd /home/koussa/scratch/TRELLIS.2
+export ROOT=/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k
+export RUN=$ROOT/outputs/triangle_field_latent_sr_flow_64to128_selfcond_input_allres_fullaux_52494005
+export INST=$ROOT/eval_instances_duplicate_filtered_test_n16.txt
+
+/home/koussa/scratch/envs/trellis2/bin/python eval_triangle_field_latent_sr_stage_repeat_cascade.py \
+  --run_dir "$RUN" \
+  --root "$ROOT" \
+  --ckpt 80000 \
+  --ema_rate 0.9999 \
+  --split test \
+  --instances "$INST" \
+  --num_samples 16 \
+  --batch_size 1 \
+  --steps 11 \
+  --base_guidance_strength 0.0 \
+  --guidance_strength 1.0 \
+  --apply_conditioning_augmentation \
+  --stage_repeats 3 \
+  --output_dir "$RUN/eval_repeat3_step0080000_cfg1_aug_n16_dupfilter"
+```
+
+This repeat-3 command is the current best observed inference recipe: it uses
+conditioning augmentation, `11` steps per repeat, CFG `1.0`, and base CFG `0.0`.
+
+For repeat-6, only change:
+
+```bash
+--stage_repeats 6
+```
+
+and use a separate output directory, for example:
+
+```bash
+--output_dir "$RUN/eval_repeat6_step0080000_cfg1_aug_n16_dupfilter"
+```
+
+Important eval details:
+
+- Keep `--apply_conditioning_augmentation` on for SR cascade evals if the model
+  was trained with conditioning augmentation.
+- Use `--guidance_strength 1.0` for current comparison runs unless explicitly
+  sweeping CFG.
+- Use `--base_guidance_strength 0.0` for the initial unconditional/base path.
+- Use the same `--instances` file when comparing methods side by side.
 
 ## Quick Sanity Checks
 

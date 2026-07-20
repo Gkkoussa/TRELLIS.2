@@ -20,7 +20,7 @@ import o_voxel
 
 FORMAT_NAME = 'triangle_field_voxel_npz'
 FORMAT_VERSION = 2
-INPUT_LAYOUT = [
+BASE_INPUT_LAYOUT = [
     ['d_tri', 1],
     ['d_vert', 1],
     ['offset_to_v0', 3],
@@ -30,8 +30,21 @@ INPUT_LAYOUT = [
     ['face_normal', 3],
     ['offset_to_projection', 3],
 ]
+DENSITY_FIELD_LAYOUT = [['density_field', 1]]
+INPUT_LAYOUT = BASE_INPUT_LAYOUT
 DEBUG_VERBOSE = False
 BENCHMARK_ENABLED = False
+
+
+def get_input_layout(include_density_field: bool = False):
+    layout = list(BASE_INPUT_LAYOUT)
+    if include_density_field:
+        layout += DENSITY_FIELD_LAYOUT
+    return layout
+
+
+def feature_channel_count(include_density_field: bool = False) -> int:
+    return sum(width for _, width in get_input_layout(include_density_field))
 
 
 def debug_log(message: str):
@@ -484,6 +497,8 @@ def assemble_triangle_features(
     normal: torch.Tensor,
     closest: torch.Tensor,
     bary: torch.Tensor,
+    face_vertex_area: torch.Tensor = None,
+    resolution: int = None,
 ) -> torch.Tensor:
     bary_clamped = bary.clamp(0.0, 1.0)
     d_tri = (3.0 * bary_clamped.min(dim=1).values).clamp(0.0, 1.0)
@@ -504,7 +519,29 @@ def assemble_triangle_features(
         normal,
         offset_to_projection,
     ], dim=1)
+    if face_vertex_area is not None:
+        if resolution is None:
+            raise ValueError('resolution is required when adding density_field')
+        bary_area = bary_clamped / bary_clamped.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        area_value = (bary_area * face_vertex_area).sum(dim=1, keepdim=True).clamp_min(1e-12)
+        voxel_size = 1.0 / float(resolution)
+        density_field = -torch.log(area_value / (voxel_size * voxel_size) + 1e-8)
+        features = torch.cat([features, density_field], dim=1)
     return features
+
+
+def compute_vertex_mean_incident_area(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    tri_areas: torch.Tensor,
+) -> torch.Tensor:
+    vertex_area_sum = torch.zeros(vertices.shape[0], dtype=tri_areas.dtype, device=vertices.device)
+    vertex_area_count = torch.zeros(vertices.shape[0], dtype=tri_areas.dtype, device=vertices.device)
+    ones = torch.ones_like(tri_areas)
+    for corner in range(3):
+        vertex_area_sum.scatter_add_(0, faces[:, corner], tri_areas)
+        vertex_area_count.scatter_add_(0, faces[:, corner], ones)
+    return vertex_area_sum / vertex_area_count.clamp_min(1.0)
 
 
 def nearest_triangle_features(
@@ -514,9 +551,11 @@ def nearest_triangle_features(
     device: torch.device,
     point_batch: int,
     triangle_batch: int,
+    resolution: int,
+    include_density_field: bool = False,
 ) -> np.ndarray:
     if points.numel() == 0:
-        return np.zeros((0, 20), dtype=np.float32)
+        return np.zeros((0, feature_channel_count(include_density_field)), dtype=np.float32)
     if vertices.numel() == 0 or faces.numel() == 0:
         raise ValueError('mesh has no valid triangles')
 
@@ -526,9 +565,13 @@ def nearest_triangle_features(
     tri_a_all = tri[:, 0]
     tri_b_all = tri[:, 1]
     tri_c_all = tri[:, 2]
-    normals_all = torch.cross(tri_b_all - tri_a_all, tri_c_all - tri_a_all, dim=1)
-    normals_all = normals_all / torch.linalg.norm(normals_all, dim=1, keepdim=True).clamp_min(1e-12)
+    raw_normals_all = torch.cross(tri_b_all - tri_a_all, tri_c_all - tri_a_all, dim=1)
+    tri_areas_all = (torch.linalg.norm(raw_normals_all, dim=1) * 0.5).clamp_min(1e-12)
+    normals_all = raw_normals_all / torch.linalg.norm(raw_normals_all, dim=1, keepdim=True).clamp_min(1e-12)
     centroids_all = (tri_a_all + tri_b_all + tri_c_all) / 3.0
+    vertex_area_all = None
+    if include_density_field:
+        vertex_area_all = compute_vertex_mean_incident_area(vertices, faces, tri_areas_all)
 
     features = []
     for p0 in range(0, points.shape[0], point_batch):
@@ -565,7 +608,19 @@ def nearest_triangle_features(
         centroid = centroids_all[best_tri]
         normal = normals_all[best_tri]
 
-        feats = assemble_triangle_features(p, tri_a, tri_b, tri_c, centroid, normal, best_closest, best_bary)
+        face_vertex_area = vertex_area_all[faces[best_tri]] if include_density_field else None
+        feats = assemble_triangle_features(
+            p,
+            tri_a,
+            tri_b,
+            tri_c,
+            centroid,
+            normal,
+            best_closest,
+            best_bary,
+            face_vertex_area=face_vertex_area,
+            resolution=resolution if include_density_field else None,
+        )
         features.append(feats.cpu().numpy().astype(np.float32))
 
     return np.concatenate(features, axis=0)
@@ -582,9 +637,11 @@ def triangle_features_from_native_candidates(
     device: torch.device,
     point_batch: int,
     projection_mode: str,
+    resolution: int,
+    include_density_field: bool = False,
 ) -> Tuple[np.ndarray, dict]:
     if points.numel() == 0:
-        return np.zeros((0, 20), dtype=np.float32), {
+        return np.zeros((0, feature_channel_count(include_density_field)), dtype=np.float32), {
             'native_empty_candidates': 0,
             'native_mean_candidates': 0.0,
             'native_max_candidates': 0,
@@ -621,11 +678,15 @@ def triangle_features_from_native_candidates(
     tri_a_all = tri[:, 0]
     tri_b_all = tri[:, 1]
     tri_c_all = tri[:, 2]
-    normals_all = torch.cross(tri_b_all - tri_a_all, tri_c_all - tri_a_all, dim=1)
-    normals_all = normals_all / torch.linalg.norm(normals_all, dim=1, keepdim=True).clamp_min(1e-12)
+    raw_normals_all = torch.cross(tri_b_all - tri_a_all, tri_c_all - tri_a_all, dim=1)
+    tri_areas_all = (torch.linalg.norm(raw_normals_all, dim=1) * 0.5).clamp_min(1e-12)
+    normals_all = raw_normals_all / torch.linalg.norm(raw_normals_all, dim=1, keepdim=True).clamp_min(1e-12)
     centroids_all = (tri_a_all + tri_b_all + tri_c_all) / 3.0
+    vertex_area_all = None
+    if include_density_field:
+        vertex_area_all = compute_vertex_mean_incident_area(vertices, faces, tri_areas_all)
 
-    features = np.zeros((points.shape[0], 20), dtype=np.float32)
+    features = np.zeros((points.shape[0], feature_channel_count(include_density_field)), dtype=np.float32)
     subtimings = {
         'native_setup_s': 0.0,
         'native_projection_s': 0.0,
@@ -725,7 +786,19 @@ def triangle_features_from_native_candidates(
         centroid = centroids_all[best_tri]
         normal = normals_all[best_tri]
 
-        feats = assemble_triangle_features(p, tri_a, tri_b, tri_c, centroid, normal, best_closest, best_bary)
+        face_vertex_area = vertex_area_all[faces[best_tri]] if include_density_field else None
+        feats = assemble_triangle_features(
+            p,
+            tri_a,
+            tri_b,
+            tri_c,
+            centroid,
+            normal,
+            best_closest,
+            best_bary,
+            face_vertex_area=face_vertex_area,
+            resolution=resolution if include_density_field else None,
+        )
         features[p0:p1] = feats.cpu().numpy().astype(np.float32)
         subtimings['native_assemble_copy_s'] += time.perf_counter() - stage_t
 
@@ -790,9 +863,11 @@ def triangle_features_from_candidate_lists(
     device: torch.device,
     point_batch: int,
     fallback: str,
+    resolution: int,
+    include_density_field: bool = False,
 ) -> Tuple[np.ndarray, dict]:
     if points.numel() == 0:
-        return np.zeros((0, 20), dtype=np.float32), {
+        return np.zeros((0, feature_channel_count(include_density_field)), dtype=np.float32), {
             'aabb_fallback_points': 0,
         }
     if vertices.numel() == 0 or faces.numel() == 0:
@@ -808,11 +883,15 @@ def triangle_features_from_candidate_lists(
     tri_a_all = tri[:, 0]
     tri_b_all = tri[:, 1]
     tri_c_all = tri[:, 2]
-    normals_all = torch.cross(tri_b_all - tri_a_all, tri_c_all - tri_a_all, dim=1)
-    normals_all = normals_all / torch.linalg.norm(normals_all, dim=1, keepdim=True).clamp_min(1e-12)
+    raw_normals_all = torch.cross(tri_b_all - tri_a_all, tri_c_all - tri_a_all, dim=1)
+    tri_areas_all = (torch.linalg.norm(raw_normals_all, dim=1) * 0.5).clamp_min(1e-12)
+    normals_all = raw_normals_all / torch.linalg.norm(raw_normals_all, dim=1, keepdim=True).clamp_min(1e-12)
     centroids_all = (tri_a_all + tri_b_all + tri_c_all) / 3.0
+    vertex_area_all = None
+    if include_density_field:
+        vertex_area_all = compute_vertex_mean_incident_area(vertices, faces, tri_areas_all)
 
-    features = np.zeros((points.shape[0], 20), dtype=np.float32)
+    features = np.zeros((points.shape[0], feature_channel_count(include_density_field)), dtype=np.float32)
 
     for p0 in range(0, points.shape[0], point_batch):
         p1 = min(p0 + point_batch, points.shape[0])
@@ -855,7 +934,19 @@ def triangle_features_from_candidate_lists(
         centroid = centroids_all[best_tri]
         normal = normals_all[best_tri]
 
-        feats = assemble_triangle_features(p, tri_a, tri_b, tri_c, centroid, normal, best_closest, best_bary)
+        face_vertex_area = vertex_area_all[faces[best_tri]] if include_density_field else None
+        feats = assemble_triangle_features(
+            p,
+            tri_a,
+            tri_b,
+            tri_c,
+            centroid,
+            normal,
+            best_closest,
+            best_bary,
+            face_vertex_area=face_vertex_area,
+            resolution=resolution if include_density_field else None,
+        )
         global_rows = p0 + batch_rows
         features[global_rows] = feats.cpu().numpy().astype(np.float32)
 
@@ -868,6 +959,8 @@ def triangle_features_from_candidate_lists(
             device=device,
             point_batch=point_batch,
             triangle_batch=opt.triangle_batch,
+            resolution=resolution,
+            include_density_field=include_density_field,
         )
         features[np.array(empty_indices, dtype=np.int64)] = fallback_features
 
@@ -884,7 +977,24 @@ def feature_dtype_to_numpy(feature_dtype: str):
     raise ValueError(f'Unsupported feature dtype: {feature_dtype}')
 
 
-def build_metadata_json(resolution: int, feature_dtype: str, npz_compression: str) -> str:
+def build_metadata_json(
+    resolution: int,
+    feature_dtype: str,
+    npz_compression: str,
+    include_density_field: bool = False,
+) -> str:
+    definitions = {
+        'voxel_center': '(coords + 0.5) / resolution - 0.5',
+        'projected_point': 'closest point on nearest triangle',
+        'd_tri': '3 * min(barycentric(projected_point))',
+        'd_vert': '(max(barycentric(projected_point)) - 1/3) / (2/3)',
+    }
+    if include_density_field:
+        definitions['density_field'] = (
+            'For each vertex, compute the mean area of incident triangles. For each voxel center, '
+            'project to the nearest triangle and barycentrically interpolate those vertex areas into '
+            'area_value. density_field = -log(area_value / voxel_size^2 + 1e-8).'
+        )
     return json.dumps({
         'format': FORMAT_NAME,
         'version': FORMAT_VERSION,
@@ -893,13 +1003,8 @@ def build_metadata_json(resolution: int, feature_dtype: str, npz_compression: st
         'npz_compression': npz_compression,
         'coordinate_frame': 'normalized_object_space',
         'normalization': 'same_as_voxelize_gaussian_distance.normalize_dump',
-        'feature_layout': INPUT_LAYOUT,
-        'definitions': {
-            'voxel_center': '(coords + 0.5) / resolution - 0.5',
-            'projected_point': 'closest point on nearest triangle',
-            'd_tri': '3 * min(barycentric(projected_point))',
-            'd_vert': '(max(barycentric(projected_point)) - 1/3) / (2/3)',
-        },
+        'feature_layout': get_input_layout(include_density_field),
+        'definitions': definitions,
     })
 
 
@@ -936,14 +1041,21 @@ def triangle_field_output_path(root: str, sha256: str, resolution: int, npz_comp
     return os.path.join(root, f'triangle_field_voxels_{resolution}', f'{sha256}{suffix}')
 
 
-def matching_or_requested_output_path(root: str, sha256: str, resolution: int, feature_dtype: str, npz_compression: str) -> Tuple[str, bool]:
+def matching_or_requested_output_path(
+    root: str,
+    sha256: str,
+    resolution: int,
+    feature_dtype: str,
+    npz_compression: str,
+    include_density_field: bool = False,
+) -> Tuple[str, bool]:
     requested = triangle_field_output_path(root, sha256, resolution, npz_compression)
     legacy = triangle_field_output_path(root, sha256, resolution, 'none')
     candidates = [requested]
     if legacy != requested:
         candidates.append(legacy)
     for path in candidates:
-        if output_matches_expected_layout(path, resolution, feature_dtype):
+        if output_matches_expected_layout(path, resolution, feature_dtype, include_density_field):
             return path, False
     return requested, True
 
@@ -952,7 +1064,12 @@ def save_triangle_field_npz(out_path: str, coords: torch.Tensor, features: np.nd
     np_dtype = feature_dtype_to_numpy(opt.feature_dtype)
     coords_np = coords.cpu().numpy().astype(np.int32, copy=False)
     features_np = features.astype(np_dtype, copy=False)
-    metadata_json = np.array(build_metadata_json(resolution, opt.feature_dtype, opt.npz_compression))
+    metadata_json = np.array(build_metadata_json(
+        resolution,
+        opt.feature_dtype,
+        opt.npz_compression,
+        include_density_field=opt.include_density_field,
+    ))
 
     if opt.npz_compression == 'compressed':
         tmp_path = out_path + '.tmp.npz'
@@ -986,7 +1103,12 @@ def save_triangle_field_npz(out_path: str, coords: torch.Tensor, features: np.nd
     os.replace(tmp_path, out_path)
 
 
-def output_matches_expected_layout(out_path: str, resolution: int, feature_dtype: str) -> bool:
+def output_matches_expected_layout(
+    out_path: str,
+    resolution: int,
+    feature_dtype: str,
+    include_density_field: bool = False,
+) -> bool:
     if not os.path.exists(out_path):
         return False
     try:
@@ -1001,13 +1123,14 @@ def output_matches_expected_layout(out_path: str, resolution: int, feature_dtype
                 coords.ndim == 2
                 and coords.shape[1] == 3
                 and features.ndim == 2
-                and features.shape[1] == 20
+                and features.shape[1] == feature_channel_count(include_density_field)
                 and features.shape[0] == coords.shape[0]
                 and features.dtype == expected_dtype
                 and metadata.get('format') == FORMAT_NAME
                 and metadata.get('version') == FORMAT_VERSION
                 and metadata.get('resolution') == resolution
                 and metadata.get('feature_dtype') == feature_dtype
+                and metadata.get('feature_layout') == get_input_layout(include_density_field)
             )
     except Exception:
         return False
@@ -1044,6 +1167,7 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
                 res,
                 opt.feature_dtype,
                 opt.npz_compression,
+                include_density_field=opt.include_density_field,
             )
 
             if not need_process:
@@ -1107,7 +1231,7 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
             debug_log(f'{sha256}: resolution={res} voxelized active coords count={len(coords)}')
 
             if len(coords) == 0:
-                empty_features = np.zeros((0, 20), dtype=np.float32)
+                empty_features = np.zeros((0, feature_channel_count(opt.include_density_field)), dtype=np.float32)
                 stage_start_t = time.perf_counter()
                 save_triangle_field_npz(out_path, coords, empty_features, res)
                 stage_timings['write_s'] += time.perf_counter() - stage_start_t
@@ -1135,6 +1259,8 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
                     device=device,
                     point_batch=opt.point_batch,
                     projection_mode=opt.projection_mode,
+                    resolution=res,
+                    include_density_field=opt.include_density_field,
                 )
                 stage_timings['nearest_triangle_s'] += time.perf_counter() - stage_start_t
                 pack[f'native_empty_candidates_{res}'] = native_stats['native_empty_candidates']
@@ -1158,6 +1284,8 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
                     device=device,
                     point_batch=opt.point_batch,
                     triangle_batch=opt.triangle_batch,
+                    resolution=res,
+                    include_density_field=opt.include_density_field,
                 )
                 stage_timings['nearest_triangle_s'] += time.perf_counter() - stage_start_t
             else:
@@ -1194,6 +1322,8 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
                     device=device,
                     point_batch=opt.point_batch,
                     fallback=opt.aabb_fallback,
+                    resolution=res,
+                    include_density_field=opt.include_density_field,
                 )
                 stage_timings['nearest_triangle_s'] += time.perf_counter() - stage_start_t
                 pack[f'aabb_empty_candidates_{res}'] = candidate_stats['aabb_empty_candidates']
@@ -1270,6 +1400,9 @@ if __name__ == '__main__':
                         help='Conservative voxel padding around each triangle AABB when building candidates')
     parser.add_argument('--aabb_fallback', type=str, default='global', choices=['global', 'error'],
                         help='Behavior when an active sparse voxel receives no AABB triangle candidates')
+    parser.add_argument('--include_density_field', action='store_true',
+                        help='Append density_field as an extra input channel: '
+                             '-log(vertex-area-interpolated area / voxel_size^2 + 1e-8)')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable detailed per-object debug logging')
     parser.add_argument('--benchmark', action='store_true',
@@ -1337,6 +1470,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     print(f'Feature dtype: {opt.feature_dtype}')
+    print(f'Include density field: {opt.include_density_field}')
     print(f'NPZ compression: {opt.npz_compression}')
     print(f'Projection mode: {opt.projection_mode}')
     if opt.npz_compression == 'zstd':

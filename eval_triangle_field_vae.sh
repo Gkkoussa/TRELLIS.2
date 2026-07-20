@@ -24,6 +24,9 @@ mkdir -p logs
 eval "$(conda shell.bash hook)"
 conda activate trellis2
 
+export FLEX_GEMM_USE_AUTOTUNE_CACHE="${FLEX_GEMM_USE_AUTOTUNE_CACHE:-1}"
+export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE="${FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-1}"
+
 export ROOT="${ROOT:-/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k}"
 export RUN_DIR="$1"
 export EVAL_SPLIT="${EVAL_SPLIT:-test}"

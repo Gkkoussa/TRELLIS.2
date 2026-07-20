@@ -107,6 +107,287 @@ The pretrained model **TRELLIS.2-4B** is available on Hugging Face. Please refer
 | :--- | :--- | :--- | :--- |
 | **TRELLIS.2-4B** | 4 Billion | 512³ - 1536³ | [Hugging Face](https://huggingface.co/microsoft/TRELLIS.2-4B) |
 
+## 🧪 Triangle-Field SR Project State
+
+This fork also contains the current ObjXL4K triangle-field super-resolution
+experiments. The detailed end-to-end training notes live in
+[docs/triangle_field_super_resolution_workflow.md](docs/triangle_field_super_resolution_workflow.md).
+This section is the short “what should I use right now?” snapshot.
+
+Unless stated otherwise:
+
+* Training uses the filtered train split only.
+* Evaluation uses the filtered test split, plus the no-train-duplicate filter for comparison figures.
+* `$ROOT` means `/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k`.
+
+### Best VAE: allres inv-area full-aux
+
+The best triangle-field VAE latent space is the all-resolution inverse-area
+full-aux VAE:
+
+```bash
+$ROOT/outputs/triangle_field_vae_allres_invarea_fullaux_52454251
+```
+
+Useful checkpoint pair:
+
+```bash
+$ROOT/outputs/triangle_field_vae_allres_invarea_fullaux_52454251/ckpts/encoder_step0320000.pt
+$ROOT/outputs/triangle_field_vae_allres_invarea_fullaux_52454251/ckpts/decoder_step0320000.pt
+```
+
+Local config:
+
+```bash
+configs/scvae/triangle_field_vae_next_dc_f16c32_fp16_allres_objxl4k_invarea_fullaux.json
+```
+
+Important training options:
+
+* Trained as a multi-resolution VAE over `32, 64, 128, 256, 512`.
+* Fine-tuned from the 512 inverse-area aux-drop VAE:
+  `$ROOT/outputs/triangle_field_vae_512_invarea_auxdrop_52039231/ckpts/{encoder,decoder}_step0180000.pt`.
+* Uses the full 20-channel triangle-field input; aux dropout is disabled.
+* Uses L1 reconstruction loss with inverse-triangle-area voxel weighting:
+  `type=inverse_triangle_area`, `normalize=mean`, `clamp_max=100`.
+* Uses 32 latent channels and `pred_subdiv=false`, so the decoder expects the saved sparse support/cache from the encoding path.
+* Uses `lambda_kl=1e-4`, fp16 mixed precision, and EMA `0.9999`.
+
+Existing 128-resolution latents from this VAE:
+
+```bash
+$ROOT/triangle_field_latents/triangle_field_vae_allres_invarea_fullaux_52454251_step0320000_128
+```
+
+### Best unconditional/remeshing SR: allres noise-only
+
+The best non-density latent SR model is:
+
+```bash
+$ROOT/outputs/triangle_field_latent_sr_flow_64to128_selfcond_input_allres_fullaux_noiseonly_continue_52960154
+```
+
+Useful checkpoint:
+
+```bash
+$ROOT/outputs/triangle_field_latent_sr_flow_64to128_selfcond_input_allres_fullaux_noiseonly_continue_52960154/ckpts/encoder_ema0.9999_step0200000.pt
+```
+
+Local config:
+
+```bash
+configs/gen/triangle_field_latent_sr_flow_64to128_film_selfcond_input_allres_fullaux_noiseonly_continue_f16c32_fp16_objxl4k.json
+```
+
+Important training options:
+
+* Uses the allres inv-area full-aux VAE decoder at step `0320000`.
+* Uses latent SR flow from `64 -> 128`; higher resolutions are reached by cascaded eval.
+* Uses input-style latent self-conditioning:
+  `latent_self_conditioning.mode=input`, `upsample_factor=16`.
+* Encoder input has 36 channels: decoded/noisy current latent features, low-res conditioning features, and self-conditioning latent features.
+* Uses noise-only conditioning augmentation:
+  `conditioning_augmentation.type=sparse_blur_noise`,
+  `noise_level=0.25`, `disable_blur=true`, `apply_prob=1.0`.
+* Uses `cond_drop_prob=0.1`, L1 loss, velocity-parameterized latent loss,
+  `latent_loss_t_min=0.05`, and batched VAE cache decode.
+* Continued from the earlier allres input SR run:
+  `$ROOT/outputs/triangle_field_latent_sr_flow_64to128_selfcond_input_allres_fullaux_52494005/ckpts/encoder_step0130000.pt`.
+
+For remeshing-style evaluation from mesh support only, this is the main
+unconditional baseline because it does not require a density field.
+
+### Best conditional SR: allres density
+
+The best density-conditioned latent SR model is:
+
+```bash
+$ROOT/outputs/triangle_field_latent_sr_flow_64to128_selfcond_input_allres_fullaux_noiseonly_density128_scratch_53303600
+```
+
+Useful checkpoint:
+
+```bash
+$ROOT/outputs/triangle_field_latent_sr_flow_64to128_selfcond_input_allres_fullaux_noiseonly_density128_scratch_53303600/ckpts/encoder_ema0.9999_step0140000.pt
+```
+
+Local config:
+
+```bash
+configs/gen/triangle_field_latent_sr_flow_64to128_film_selfcond_input_allres_fullaux_noiseonly_continue_density128_f16c32_fp16_objxl4k.json
+```
+
+Important training options:
+
+* Same base architecture and noise-only conditioning augmentation as the allres noise-only model.
+* Adds `density_conditioning=true` and reads channel `density_field` from
+  `density_triangle_field_voxel`.
+* Encoder input has 37 channels: the 36 allres-noise-only channels plus one density channel.
+* Initialized from the allres noise-only checkpoint at step `0200000`, but trained in a separate density output folder rather than resuming an old density run.
+* Uses the same latent self-conditioning, `cond_drop_prob=0.1`, velocity-parameterized latent loss, `latent_loss_t_min=0.05`, and allres VAE decoder step `0320000`.
+
+The 128-resolution density-field payload is:
+
+```bash
+$ROOT/triangle_field_voxels_density_field/triangle_field_voxels_128
+```
+
+### Density field definition
+
+Density fields are generated by:
+
+```bash
+voxelize_triangle_field_density_128_objxl4k.sh
+```
+
+and implemented in:
+
+```bash
+data_toolkit/voxelize_triangle_field.py
+```
+
+Run the existing 128-resolution GT-density job with:
+
+```bash
+cd /home/koussa/scratch/TRELLIS.2
+export ROOT=/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k
+sbatch voxelize_triangle_field_density_128_objxl4k.sh
+```
+
+The script defaults to:
+
+```bash
+DENSITY_ROOT=$ROOT/triangle_field_voxels_density_field
+RESOLUTION=128
+INSTANCES=$ROOT/instances_no_triangle_dense.txt
+MAX_WORKERS=8
+```
+
+It calls `data_toolkit/voxelize_triangle_field.py` with:
+
+```text
+--include_density_field
+--feature_dtype float16
+--npz_compression zstd
+--candidate_source native
+--projection_mode inside_barycentric
+```
+
+and then rebuilds metadata with `data_toolkit/build_metadata.py`. The expected
+payload and metadata live under:
+
+```bash
+$ROOT/triangle_field_voxels_density_field/triangle_field_voxels_128
+$ROOT/triangle_field_voxels_density_field/triangle_field_voxels_128/metadata.csv
+```
+
+For each mesh vertex `v`, compute:
+
+```text
+A_v = mean(area of triangles incident to v)
+```
+
+For each active voxel center `p`, project to the nearest triangle
+`T=(v0,v1,v2)`, compute clamped/renormalized barycentric weights `b_i`, and
+interpolate:
+
+```text
+area_value = b0 A_v0 + b1 A_v1 + b2 A_v2
+density_field = -log(area_value / voxel_size^2 + 1e-8)
+voxel_size = 1 / resolution
+```
+
+For evaluation at a higher resolution `R` from a base density value at
+resolution `B=128`, the voxel-size-scaled option uses:
+
+```text
+density_R = density_128 - 2 * log(R / 128)
+```
+
+Use this when the same underlying local triangle area should have the same
+meaning across resolutions. The unscaled option simply duplicates/maps density
+values to the target support without changing the values.
+
+### Evaluation tools
+
+Use these scripts for the current SR evaluation workflows:
+
+```bash
+eval_triangle_field_latent_sr_flow.py
+```
+
+Single-stage latent SR eval, usually `64 -> 128`. Key options include
+`--run_dir`, `--root`, `--split test`, `--instances`, `--ckpt`, `--ema_rate`,
+`--low_resolution`, `--high_resolution`, `--latent_name`, `--steps`,
+`--guidance_strength`, `--apply_conditioning_augmentation`, and
+`--disable_dataset_density_conditioning`.
+
+```bash
+eval_triangle_field_latent_sr_cascade.py
+```
+
+Regular cascade eval without per-stage repeats. Use this when each stage should
+run once. Key options include `--steps`, `--base_guidance_strength`,
+`--guidance_strength`, `--apply_conditioning_augmentation`, `--num_samples`,
+`--batch_size`, `--instances`, and `--output_dir`.
+
+```bash
+eval_triangle_field_latent_sr_stage_repeat_cascade.py
+```
+
+Repeat-cascade eval. This starts from unconditional `128`, averages to `64`,
+then runs `64 -> 128`, `128 -> 256`, and `256 -> 512`, repeating each stage
+with average-downsample feedback. The best current setting for comparison
+figures has been:
+
+```text
+--stage_repeats 3
+--steps 11
+--guidance_strength 1.0
+--base_guidance_strength 0.0
+--apply_conditioning_augmentation
+```
+
+Density options:
+
+* `--oracle_density_conditioning` loads density fields from a density voxel directory.
+* `--constant_density_conditioning` feeds a constant density value on the target support.
+* `--oracle_density_scale_mode {none,voxel_size}` and
+  `--constant_density_scale_mode {none,voxel_size}` control whether
+  `density_R = density_base - 2 log(R/base_R)` is applied.
+* `--oracle_density_base_resolution` and `--constant_density_base_resolution`
+  set the resolution where the density value is defined, usually `128`.
+
+```bash
+eval_obj_folder_latent_sr_stage_repeat_cascade.py
+```
+
+Remeshing-style support-only cascade eval from a folder of `.obj` or `.glb`
+files. It extracts sparse voxel support at `128, 256, 512` with `trimesh`,
+does not use GT triangle fields or GT latents, and then runs the same
+repeat-cascade path. Key options include `--mesh_dir`, `--run_dir`,
+`--stage_repeats`, `--max_active_voxels`, `--constant_density_conditioning`,
+`--constant_density_value`, `--constant_density_scale_mode`, and
+`--support_cache_dir`. If meshes are edited in-place, delete the relevant
+`support_cache` directory or use a fresh `--output_dir`.
+
+For the current density remeshing sweeps over test meshes, the typical command
+uses:
+
+```text
+--stage_repeats 12
+--steps 11
+--guidance_strength 1
+--base_guidance_strength 0
+--max_active_voxels 2000000
+--constant_density_conditioning
+--constant_density_base_resolution 128
+--constant_density_scale_mode voxel_size
+--apply_conditioning_augmentation
+--conditioning_augmentation_disable_blur
+--conditioning_augmentation_noise_level 0.25
+```
+
 
 ## 🚀 Usage
 

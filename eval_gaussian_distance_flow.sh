@@ -29,6 +29,8 @@ export RUN_DIR="${1:-$ROOT/outputs/$RUN_NAME}"
 # LATENT_NAME:-gaussian_distance_vae_step0230000_256
 #RUN_NAME:-michelangelo2gaussian_distance_flow_50023629
 
+export FLEX_GEMM_USE_AUTOTUNE_CACHE="${FLEX_GEMM_USE_AUTOTUNE_CACHE:-1}"
+export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE="${FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-1}"
 export EVAL_SPLIT="${EVAL_SPLIT:-test}"
 export EVAL_CKPT="${EVAL_CKPT:-latest}"
 export EVAL_RUN_NAME="${EVAL_RUN_NAME:-eval_${EVAL_SPLIT}_${SLURM_JOB_ID}}"

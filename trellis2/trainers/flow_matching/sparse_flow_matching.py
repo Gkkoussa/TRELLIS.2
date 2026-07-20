@@ -133,11 +133,12 @@ class SparseFlowMatchingTrainer(FlowMatchingTrainer):
         verbose: bool = False,
         steps: int = 12,
         guidance_strength: float = 3.0,
+        shuffle: bool = True,
     ) -> Dict:
         dataloader = DataLoader(
             copy.deepcopy(self.dataset),
             batch_size=num_samples,
-            shuffle=True,
+            shuffle=shuffle,
             num_workers=0,
             collate_fn=self.dataset.collate_fn if hasattr(self.dataset, 'collate_fn') else None,
         )

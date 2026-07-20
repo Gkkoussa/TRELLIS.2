@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="780" viewBox="0 0 1500 780" role="img" aria-labelledby="title desc">
+  <title id="title">Repeat Cascade Strategy for Triangle Field Super-Resolution Flow</title>
+  <desc id="desc">Diagram showing an unconditional base generation followed by repeated super-resolution refinement at each resolution stage. Each stage uses the generated high-resolution field, averages it down to the stage input resolution, and runs the same conditional super-resolution step again xN times before moving to the next stage.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f7f1e3"/>
+      <stop offset="55%" stop-color="#e9f2ee"/>
+      <stop offset="100%" stop-color="#dce8f5"/>
+    </linearGradient>
+    <linearGradient id="baseBox" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffe7b8"/>
+      <stop offset="100%" stop-color="#f7b267"/>
+    </linearGradient>
+    <linearGradient id="stageBox" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#d5f3e5"/>
+      <stop offset="100%" stop-color="#6fcf97"/>
+    </linearGradient>
+    <linearGradient id="latentBox" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#d8e9ff"/>
+      <stop offset="100%" stop-color="#6aa9ff"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#263238"/>
+    </marker>
+    <marker id="softArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#5b6670"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#1f2933" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      .title { font: 700 38px Georgia, "Times New Roman", serif; fill: #1f2a33; }
+      .subtitle { font: 400 18px Georgia, "Times New Roman", serif; fill: #4b5963; }
+      .label { font: 700 22px Verdana, Geneva, sans-serif; fill: #172026; }
+      .small { font: 500 15px Verdana, Geneva, sans-serif; fill: #34444f; }
+      .tiny { font: 500 13px Verdana, Geneva, sans-serif; fill: #52616b; }
+      .math { font: 700 20px Verdana, Geneva, sans-serif; fill: #20313b; }
+      .note { font: 500 17px Verdana, Geneva, sans-serif; fill: #263238; }
+      .box { stroke: rgba(31,42,51,0.3); stroke-width: 1.5; filter: url(#shadow); }
+      .arrow { stroke: #263238; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .softArrow { stroke: #5b6670; stroke-width: 2.4; stroke-dasharray: 7 7; fill: none; marker-end: url(#softArrow); }
+      .loop { stroke: #3b6f5a; stroke-width: 3.2; fill: none; marker-end: url(#arrow); }
+      .panel { fill: rgba(255,255,255,0.55); stroke: rgba(31,42,51,0.15); stroke-width: 1.2; }
+    </style>
+  </defs>
+
+  <rect width="1500" height="780" fill="url(#bg)"/>
+  <circle cx="1300" cy="130" r="210" fill="#ffffff" opacity="0.22"/>
+  <circle cx="170" cy="670" r="260" fill="#ffffff" opacity="0.22"/>
+
+  <text x="70" y="70" class="title">Repeat Cascade Strategy</text>
+  <text x="72" y="103" class="subtitle">At each super-resolution stage, generate high-res, average down, then condition on the downsampled result and repeat xN before moving upward.</text>
+
+  <rect x="55" y="145" width="1385" height="575" rx="30" class="panel"/>
+
+  <rect x="95" y="245" width="220" height="130" rx="24" fill="url(#baseBox)" class="box"/>
+  <text x="125" y="292" class="label">Base Flow</text>
+  <text x="126" y="322" class="small">unconditional</text>
+  <text x="126" y="349" class="math">64 or 128</text>
+
+  <path d="M315 310 C350 310, 365 310, 398 310" class="arrow"/>
+
+  <rect x="400" y="230" width="285" height="160" rx="26" fill="url(#stageBox)" class="box"/>
+  <text x="435" y="278" class="label">SR Stage r -> 2r</text>
+  <text x="435" y="309" class="small">latent/feature flow sampling</text>
+  <text x="435" y="337" class="small">conditioned on low-res field</text>
+  <text x="435" y="365" class="math">predict high-res field</text>
+
+  <path d="M685 310 C730 310, 747 310, 792 310" class="arrow"/>
+
+  <rect x="795" y="230" width="245" height="160" rx="26" fill="url(#latentBox)" class="box"/>
+  <text x="833" y="278" class="label">Generated</text>
+  <text x="833" y="309" class="small">high-res triangle field</text>
+  <text x="833" y="337" class="math">resolution 2r</text>
+  <text x="833" y="365" class="small">used for render/eval</text>
+
+  <path d="M917 390 C917 455, 746 475, 620 436 C559 417, 513 411, 465 431 C410 454, 402 500, 452 526 C520 561, 652 545, 721 503" class="loop"/>
+  <text x="465" y="492" class="label">repeat xN</text>
+  <text x="465" y="520" class="small">average downsample 2r -> r</text>
+  <text x="465" y="546" class="small">reuse as the next condition</text>
+
+  <path d="M1040 310 C1082 310, 1105 310, 1148 310" class="arrow"/>
+
+  <rect x="1150" y="230" width="235" height="160" rx="26" fill="#ffffff" class="box"/>
+  <text x="1183" y="278" class="label">Next Stage</text>
+  <text x="1183" y="309" class="small">set r := 2r</text>
+  <text x="1183" y="337" class="math">2r -> 4r</text>
+  <text x="1183" y="365" class="small">same repeat rule</text>
+
+  <path d="M1267 390 C1267 490, 1140 576, 1015 590 C846 608, 669 609, 499 592 C366 579, 228 521, 207 378" class="softArrow"/>
+  <text x="820" y="640" class="note">Cascade upward: 64 -> 128 -> 256 -> 512</text>
+
+  <rect x="105" y="455" width="255" height="170" rx="24" fill="#ffffff" opacity="0.86" stroke="#c5d0d8"/>
+  <text x="133" y="500" class="label">Per Stage</text>
+  <text x="133" y="532" class="small">1. Sample SR flow</text>
+  <text x="133" y="559" class="small">2. Decode/render high-res</text>
+  <text x="133" y="586" class="small">3. Average downsample</text>
+  <text x="133" y="613" class="small">4. Repeat until xN</text>
+
+  <rect x="1110" y="475" width="270" height="115" rx="22" fill="#ffffff" opacity="0.86" stroke="#c5d0d8"/>
+  <text x="1140" y="518" class="label">Why repeat?</text>
+  <text x="1140" y="550" class="small">Let the model refine using</text>
+  <text x="1140" y="577" class="small">its own low-res projection.</text>
+
+  <text x="70" y="745" class="tiny">Notation: r is the current conditioning resolution. xN means the same SR stage is rerun N times before advancing to the next resolution.</text>
+</svg>
