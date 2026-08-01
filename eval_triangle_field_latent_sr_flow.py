@@ -377,31 +377,62 @@ def predict_z0(
     cache_paths,
     t: float,
     density_cond: sp.SparseTensor | None = None,
+    elongation_cond: sp.SparseTensor | None = None,
+    dropped_condition_names: set[str] | None = None,
+    decoded_density_override: sp.SparseTensor | None = None,
+    decoded_density_external_condition_max: float | None = None,
+    high_resolution: int | torch.Tensor | None = None,
+    conditioning_noise_level: torch.Tensor | None = None,
 ) -> sp.SparseTensor:
-    x_t = trainer._decode_latents_with_cache(z_t, caches=caches, cache_paths=cache_paths)
-    if not torch.equal(x_t.coords, cond.coords):
-        raise ValueError(f"Decoded z_t coords must match cond coords: {x_t.coords.shape} vs {cond.coords.shape}")
-    mode = getattr(trainer, "latent_self_conditioning_mode", "none")
-    if mode == "input":
-        latent_cond_input, _ = trainer._latent_to_field_support(z_t, x_t)
-        enc_in = trainer._make_encoder_input(x_t, cond)
-        enc_in = enc_in.replace(torch.cat([enc_in.feats, latent_cond_input.feats], dim=-1))
+    decoded = trainer._decode_latents_with_cache(z_t, caches=caches, cache_paths=cache_paths)
+    if decoded_density_override is not None:
+        if decoded.feats.shape[1] != 3:
+            raise ValueError(
+                "Decoded density override requires exactly three decoder output channels, "
+                f"got {decoded.feats.shape[1]}"
+            )
+        if decoded_density_override.feats.shape[1] != 1:
+            raise ValueError(
+                "Decoded density override must have one feature channel, "
+                f"got {decoded_density_override.feats.shape[1]}"
+            )
+        if not torch.equal(decoded.coords, decoded_density_override.coords):
+            raise ValueError("Decoded density override coords must match decoded latent coords")
+        decoded = decoded.replace(torch.cat(
+            [decoded.feats[:, :2], decoded_density_override.feats],
+            dim=-1,
+        ))
+    if decoded_density_external_condition_max is not None:
+        if decoded.feats.shape[1] != 3:
+            raise ValueError(
+                "Decoded density external conditioning requires exactly three decoder "
+                f"output channels, got {decoded.feats.shape[1]}"
+            )
         if density_cond is not None:
-            if not torch.equal(enc_in.coords, density_cond.coords):
-                raise ValueError(
-                    f"density_cond coords must match encoder input coords: "
-                    f"{density_cond.coords.shape} vs {enc_in.coords.shape}"
-                )
-            enc_in = enc_in.replace(torch.cat([enc_in.feats, density_cond.feats], dim=-1))
-        encoder_kwargs = {}
-    elif mode == "bottleneck":
-        enc_in = trainer._make_encoder_input(x_t, cond, density_cond)
-        encoder_kwargs = {"latent_cond": z_t}
-    else:
-        enc_in = trainer._make_encoder_input(x_t, cond, density_cond)
-        encoder_kwargs = {}
+            raise ValueError(
+                "Decoded density external conditioning cannot also receive density_cond"
+            )
+        density_cond = decoded.replace(
+            decoded.feats[:, 2:3].clamp(max=float(decoded_density_external_condition_max))
+        )
+    enc_in, encoder_kwargs, _ = trainer.prepare_latent_encoder_input(
+        z_t,
+        decoded,
+        cond,
+        density_cond,
+        elongation_cond,
+        dropped_condition_names,
+    )
     batch_t = torch.full((z_t.shape[0],), t * 1000.0, device=z_t.feats.device, dtype=torch.float32)
-    pred_z0 = trainer.models["encoder"](enc_in, batch_t, sample_posterior=False, **encoder_kwargs)
+    if getattr(trainer.models["encoder"], "conditioning_noise_conditioning", False):
+        encoder_kwargs["conditioning_noise_level"] = conditioning_noise_level
+    pred_z0 = trainer.models["encoder"](
+        enc_in,
+        batch_t,
+        sample_posterior=False,
+        resolution=high_resolution,
+        **encoder_kwargs,
+    )
     if not torch.equal(pred_z0.coords, z_t.coords):
         raise ValueError(f"Predicted latent coords must match z_t coords: {pred_z0.coords.shape} vs {z_t.coords.shape}")
     return pred_z0
@@ -418,21 +449,145 @@ def sample_latent_sr(
     guidance_strength: float,
     apply_conditioning_augmentation: bool = False,
     density_cond: sp.SparseTensor | None = None,
+    density_guidance_strength: float | None = None,
+    elongation_cond: sp.SparseTensor | None = None,
+    elongation_guidance_strength: float | None = None,
+    override_decoded_density: bool = False,
+    always_dropped_condition_names: set[str] | None = None,
+    decoded_density_external_condition_max: float | None = None,
+    high_resolution: int | torch.Tensor | None = None,
 ):
+    decoded_density_condition = getattr(trainer, "decoded_density_mode", "none") == "condition"
+    decoded_density_state = getattr(trainer, "decoded_density_mode", "none") == "state"
+    dynamic_external_density = decoded_density_external_condition_max is not None
+    always_dropped_condition_names = set(always_dropped_condition_names or ())
+    if override_decoded_density:
+        if not decoded_density_condition:
+            raise ValueError(
+                "Decoded density override requires trainer decoded_density_mode='condition'"
+            )
+        if density_cond is None:
+            raise ValueError("Decoded density override requires density_cond")
+    if dynamic_external_density:
+        if not decoded_density_state:
+            raise ValueError(
+                "Decoded density external conditioning requires trainer "
+                "decoded_density_mode='state'"
+            )
+        if override_decoded_density or density_cond is not None:
+            raise ValueError(
+                "Decoded density external conditioning is mutually exclusive with "
+                "decoded density override and density_cond"
+            )
+    decoded_density_override = density_cond if override_decoded_density else None
+    model_density_cond = None if override_decoded_density else density_cond
+    guided_conditions = {
+        name: (condition, strength)
+        for name, condition, strength in (
+            ("density", density_cond, density_guidance_strength),
+            ("elongation", elongation_cond, elongation_guidance_strength),
+        )
+        if strength is not None
+    }
+    guided_strength = next(
+        (strength for _, strength in guided_conditions.values()),
+        None,
+    )
+    if guided_conditions:
+        if any(strength != guided_strength for _, strength in guided_conditions.values()):
+            raise ValueError("Joint scalar-condition CFG requires equal guidance strengths")
+        missing = [
+            name
+            for name, (condition, _) in guided_conditions.items()
+            if condition is None and not (
+                name == "density"
+                and (decoded_density_condition or dynamic_external_density)
+            )
+        ]
+        if missing:
+            raise ValueError(f"Scalar-condition CFG requires conditions: {', '.join(missing)}")
+        if guidance_strength not in (0.0, 1.0):
+            raise ValueError(
+                "Scalar-condition CFG requires low-resolution guidance strength 0 or 1"
+            )
+
     z_t = z_0.replace(torch.randn_like(z_0.feats))
-    cond_pos = trainer._augment_conditioning(cond) if apply_conditioning_augmentation else cond
+    if apply_conditioning_augmentation:
+        cond_pos, conditioning_noise_level = trainer._augment_conditioning(
+            cond,
+            return_noise_level=True,
+        )
+    else:
+        cond_pos = cond
+        conditioning_noise_level = torch.zeros(
+            cond.shape[0],
+            device=cond.feats.device,
+            dtype=torch.float32,
+        )
     zero_cond = cond.replace(torch.zeros_like(cond.feats))
+    dropped_guided_condition_names = always_dropped_condition_names | set(guided_conditions)
     t_seq = np.linspace(1.0, 0.0, steps + 1).tolist()
     pred_z0_last = None
     for t, t_prev in tqdm(list(zip(t_seq[:-1], t_seq[1:])), desc="Sampling latent SR"):
-        if guidance_strength == 0.0:
-            pred_z0 = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t), density_cond)
+        if guided_conditions:
+            field_cond = zero_cond if guidance_strength == 0.0 else cond_pos
+            pred_pos = predict_z0(
+                trainer, z_t, field_cond, caches, cache_paths, float(t),
+                model_density_cond, elongation_cond,
+                always_dropped_condition_names,
+                decoded_density_override=decoded_density_override,
+                decoded_density_external_condition_max=decoded_density_external_condition_max,
+                high_resolution=high_resolution,
+                conditioning_noise_level=conditioning_noise_level,
+            )
+            if guided_strength == 1.0:
+                pred_z0 = pred_pos
+            else:
+                pred_neg = predict_z0(
+                    trainer, z_t, field_cond, caches, cache_paths, float(t),
+                    model_density_cond, elongation_cond,
+                    dropped_guided_condition_names,
+                    decoded_density_override=decoded_density_override,
+                    decoded_density_external_condition_max=decoded_density_external_condition_max,
+                    high_resolution=high_resolution,
+                    conditioning_noise_level=conditioning_noise_level,
+                )
+                pred_z0 = pred_pos.replace(
+                    guided_strength * pred_pos.feats
+                    + (1.0 - guided_strength) * pred_neg.feats
+                )
+        elif guidance_strength == 0.0:
+            pred_z0 = predict_z0(
+                trainer, z_t, zero_cond, caches, cache_paths, float(t),
+                model_density_cond, elongation_cond,
+                always_dropped_condition_names,
+                decoded_density_override=decoded_density_override,
+                decoded_density_external_condition_max=decoded_density_external_condition_max,
+                high_resolution=high_resolution,
+                conditioning_noise_level=conditioning_noise_level,
+            )
         else:
-            pred_pos = predict_z0(trainer, z_t, cond_pos, caches, cache_paths, float(t), density_cond)
-        if guidance_strength == 1.0:
+            pred_pos = predict_z0(
+                trainer, z_t, cond_pos, caches, cache_paths, float(t),
+                model_density_cond, elongation_cond,
+                always_dropped_condition_names,
+                decoded_density_override=decoded_density_override,
+                decoded_density_external_condition_max=decoded_density_external_condition_max,
+                high_resolution=high_resolution,
+                conditioning_noise_level=conditioning_noise_level,
+            )
+        if not guided_conditions and guidance_strength == 1.0:
             pred_z0 = pred_pos
-        elif guidance_strength != 0.0:
-            pred_neg = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t), density_cond)
+        elif not guided_conditions and guidance_strength != 0.0:
+            pred_neg = predict_z0(
+                trainer, z_t, zero_cond, caches, cache_paths, float(t),
+                model_density_cond, elongation_cond,
+                always_dropped_condition_names,
+                decoded_density_override=decoded_density_override,
+                decoded_density_external_condition_max=decoded_density_external_condition_max,
+                high_resolution=high_resolution,
+                conditioning_noise_level=conditioning_noise_level,
+            )
             pred_z0 = pred_pos.replace(
                 guidance_strength * pred_pos.feats + (1.0 - guidance_strength) * pred_neg.feats
             )
@@ -506,6 +661,7 @@ def main():
             args.guidance_strength,
             args.apply_conditioning_augmentation,
             data.get("density_cond", None),
+            high_resolution=args.high_resolution,
         )
         gt = data["x_0"] if args.no_latents else trainer._decode_latents_with_cache(data["z_0"], caches=caches, cache_paths=cache_paths)
         sample = trainer._decode_latents_with_cache(sample_z, caches=caches, cache_paths=cache_paths)

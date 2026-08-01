@@ -32,9 +32,24 @@ EXTENDED_INPUT_LAYOUT = {
     'density_field': slice(20, 21),
 }
 
+ELONGATION_INPUT_LAYOUT = {
+    **INPUT_LAYOUT,
+    'elongation_field': slice(20, 21),
+}
+
+DENSITY_ELONGATION_INPUT_LAYOUT = {
+    **EXTENDED_INPUT_LAYOUT,
+    'elongation_field': slice(21, 22),
+}
+
 TARGET_LAYOUT = {
     'd_tri': slice(0, 1),
     'd_vert': slice(1, 2),
+}
+
+DENSITY_TARGET_LAYOUT = {
+    **TARGET_LAYOUT,
+    'density_field': slice(2, 3),
 }
 
 
@@ -98,7 +113,10 @@ class SparseVoxelTriangleFieldVisMixin:
 
         x = x.cuda()
         images = {}
-        layout = TARGET_LAYOUT if x.feats.shape[1] == 2 else INPUT_LAYOUT
+        target_layout = getattr(self, 'target_layout', TARGET_LAYOUT)
+        input_layout = getattr(self, 'input_layout', INPUT_LAYOUT)
+        target_channels = max(slc.stop for slc in target_layout.values())
+        layout = target_layout if x.feats.shape[1] == target_channels else input_layout
         for key, slc in layout.items():
             if slc.stop > x.feats.shape[1]:
                 continue
@@ -116,6 +134,11 @@ class SparseVoxelTriangleFieldVisMixin:
                     if getattr(self, 'distance_transform', 'none') == 'minus_one_one':
                         values = values * 0.5 + 0.5
                     attr = self._scalar_to_color(values)
+                elif key == 'density_field':
+                    values = values.float()
+                    lo = torch.quantile(values, 0.01)
+                    hi = torch.quantile(values, 0.99)
+                    attr = self._scalar_to_color((values - lo) / (hi - lo).clamp_min(1e-6))
                 elif key == 'face_normal':
                     attr = self._signed_vector_to_color(values)
                 else:
@@ -160,6 +183,8 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
         input_feature_scale: Union[float, list[float], None] = None,
         distance_transform: str = 'none',
         include_density_field: bool = False,
+        include_elongation_field: bool = False,
+        reconstruct_density_field: bool = False,
     ):
         self.resolution = resolution
         self.max_active_voxels = max_active_voxels
@@ -170,8 +195,19 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
         self.voxelized_flag_column = voxelized_flag_column
         self.num_voxels_column = num_voxels_column
         self.include_density_field = include_density_field
-        self.input_layout = EXTENDED_INPUT_LAYOUT if include_density_field else INPUT_LAYOUT
-        self.target_layout = TARGET_LAYOUT
+        self.include_elongation_field = include_elongation_field
+        self.reconstruct_density_field = reconstruct_density_field
+        if reconstruct_density_field and not include_density_field:
+            raise ValueError('reconstruct_density_field requires include_density_field=True')
+        if include_density_field and include_elongation_field:
+            self.input_layout = DENSITY_ELONGATION_INPUT_LAYOUT
+        elif include_density_field:
+            self.input_layout = EXTENDED_INPUT_LAYOUT
+        elif include_elongation_field:
+            self.input_layout = ELONGATION_INPUT_LAYOUT
+        else:
+            self.input_layout = INPUT_LAYOUT
+        self.target_layout = DENSITY_TARGET_LAYOUT if reconstruct_density_field else TARGET_LAYOUT
         self.value_range = (0, 1)
         self.distance_transform = distance_transform
         if self.distance_transform not in ('none', 'minus_one_one'):
@@ -197,6 +233,8 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
             f'  - Input feature scale: {None if self.input_feature_scale is None else "explicit"}',
             f'  - Distance transform: {self.distance_transform}',
             f'  - Include density field: {self.include_density_field}',
+            f'  - Include elongation field: {self.include_elongation_field}',
+            f'  - Reconstruct density field: {self.reconstruct_density_field}',
         ]
         return '\n'.join(lines)
 
@@ -240,7 +278,9 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
         if self.distance_transform == 'none':
             return features
         features = features.clone()
-        features[:, :self.num_target_channels] = features[:, :self.num_target_channels] * 2.0 - 1.0
+        for name in ('d_tri', 'd_vert'):
+            slc = self.input_layout[name]
+            features[:, slc] = features[:, slc] * 2.0 - 1.0
         return features
 
     def read_triangle_field_voxel(self, root, instance):
@@ -258,12 +298,16 @@ class SparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVisMixin, Standard
         if features.shape[1] < self.num_input_channels:
             raise ValueError(
                 f'{path} has {features.shape[1]} feature channels, but dataset requires '
-                f'{self.num_input_channels}. include_density_field={self.include_density_field}'
+                f'{self.num_input_channels}. include_density_field={self.include_density_field}, '
+                f'include_elongation_field={self.include_elongation_field}'
             )
 
         sparse_coords = torch.cat([torch.zeros_like(coords[:, 0:1]), coords], dim=-1)
         input_features = self._transform_distance_channels(features[:, :self.num_input_channels])
-        target_features = input_features[:, :self.num_target_channels]
+        target_features = torch.cat(
+            [input_features[:, self.input_layout[name]] for name in self.target_layout],
+            dim=1,
+        )
         x = sp.SparseTensor(
             self._scale_input_features(input_features).float(),
             sparse_coords,

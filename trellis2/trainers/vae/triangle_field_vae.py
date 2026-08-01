@@ -5,6 +5,7 @@ import functools
 import os
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
@@ -12,6 +13,7 @@ from easydict import EasyDict as edict
 from .pbr_vae import PbrVaeTrainer
 from ...modules import sparse as sp
 from ...utils.data_utils import recursive_to_device, cycle, BalancedResumableSampler
+from ...utils.dist_utils import read_file_dist
 
 
 class TriangleFieldVaeTrainer(PbrVaeTrainer):
@@ -19,7 +21,7 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
     VAE trainer for triangle-field voxels.
 
     The encoder consumes the full triangle-field input tensor `x`, while the
-    decoder reconstructs only the two-channel `target` tensor: d_tri and d_vert.
+    decoder reconstructs the channels selected by the dataset target layout.
     """
 
     def __init__(
@@ -32,11 +34,13 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
         debug_nans: bool = False,
         voxel_loss_weight: dict = None,
         aux_feature_dropout: dict = None,
+        partial_load_expanded_io: bool = False,
         **kwargs,
     ):
         self.debug_nans = debug_nans
         self.voxel_loss_weight = voxel_loss_weight
         self.aux_feature_dropout = aux_feature_dropout
+        self.partial_load_expanded_io = partial_load_expanded_io
         self.lambda_subdiv = lambda_subdiv
         self._zero_decoder_grad_for_step = False
         self._decoder_grad_hooks = []
@@ -63,6 +67,87 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
             **kwargs,
         )
         self._register_decoder_freeze_hooks()
+
+    def finetune_from(self, finetune_ckpt):
+        if not self.partial_load_expanded_io:
+            return super().finetune_from(finetune_ckpt)
+
+        if self.is_master:
+            print('\nFinetuning from with expanded VAE I/O:')
+            for name, path in finetune_ckpt.items():
+                print(f'  - {name}: {path}')
+
+        model_ckpts = {}
+        for name, model in self.models.items():
+            model_state = model.state_dict()
+            if name not in finetune_ckpt:
+                if self.is_master:
+                    print(f'Warning: {name} not found in finetune_ckpt, skipped.')
+                model_ckpts[name] = model_state
+                continue
+
+            raw = torch.load(
+                read_file_dist(finetune_ckpt[name]),
+                map_location=self.device,
+                weights_only=True,
+            )
+            loaded = {}
+            for key, target in model_state.items():
+                if key not in raw:
+                    loaded[key] = target
+                    if self.is_master:
+                        print(f'Warning: {name}.{key} missing from checkpoint; left initialized.')
+                    continue
+
+                source = raw[key]
+                if source.shape == target.shape:
+                    loaded[key] = source
+                    continue
+
+                expanded = None
+                if (
+                    name == 'encoder' and key == 'input_layer.weight' and
+                    source.ndim == target.ndim == 2 and
+                    source.shape[0] == target.shape[0] and
+                    source.shape[1] < target.shape[1]
+                ):
+                    expanded = torch.zeros_like(target)
+                    expanded[:, :source.shape[1]] = source
+                elif (
+                    name == 'decoder' and key in ('output_layer.weight', 'output_layer.bias') and
+                    source.ndim == target.ndim and
+                    source.shape[0] < target.shape[0] and
+                    source.shape[1:] == target.shape[1:]
+                ):
+                    expanded = torch.zeros_like(target)
+                    expanded[:source.shape[0]] = source
+
+                if expanded is not None:
+                    loaded[key] = expanded
+                    if self.is_master:
+                        print(
+                            f'Info: expanded {name}.{key} from {tuple(source.shape)} '
+                            f'to {tuple(target.shape)} with zero-initialized new channels.'
+                        )
+                else:
+                    loaded[key] = target
+                    if self.is_master:
+                        print(
+                            f'Warning: {name}.{key} shape mismatch '
+                            f'{tuple(source.shape)} vs {tuple(target.shape)}; left initialized.'
+                        )
+
+            model.load_state_dict(loaded)
+            model_ckpts[name] = loaded
+
+        self._state_dicts_to_master_params(self.master_params, model_ckpts)
+        if self.is_master:
+            for i, _ in enumerate(self.ema_rate):
+                self._state_dicts_to_master_params(self.ema_params[i], model_ckpts)
+        del model_ckpts
+
+        if self.world_size > 1:
+            dist.barrier()
 
     def _validate_aux_feature_dropout(self) -> None:
         if self.aux_feature_dropout is None:
@@ -105,8 +190,8 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
 
     def _aux_dropout_groups(self):
         layout = getattr(self.dataset, 'input_layout', None)
-        target_channels = getattr(self.dataset, 'num_target_channels', 2)
         if layout is None:
+            target_channels = getattr(self.dataset, 'num_target_channels', 2)
             return [('aux', slice(target_channels, None))]
 
         configured = None
@@ -115,7 +200,7 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
 
         groups = []
         for name, slc in layout.items():
-            if slc.stop <= target_channels:
+            if name in getattr(self.dataset, 'target_layout', {}):
                 continue
             if configured is not None and name not in configured:
                 continue
@@ -326,7 +411,7 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
 
         Args:
             x: Full encoder input features.
-            target: Two-channel reconstruction target containing d_tri, d_vert.
+            target: Reconstruction channels selected by the dataset target layout.
         """
         status = {}
         if self.debug_nans:

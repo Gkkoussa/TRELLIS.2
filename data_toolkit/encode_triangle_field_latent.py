@@ -15,6 +15,8 @@ from queue import Empty, Queue
 import trellis2.models as models
 import trellis2.modules.sparse as sp
 from trellis2.datasets.sparse_voxel_triangle_field import (
+    DENSITY_ELONGATION_INPUT_LAYOUT,
+    ELONGATION_INPUT_LAYOUT,
     EXTENDED_INPUT_LAYOUT,
     INPUT_LAYOUT,
     TARGET_LAYOUT,
@@ -99,6 +101,38 @@ def trim_decoder_spatial_cache(spatial_cache):
     return trimmed
 
 
+def read_unique_metadata(path):
+    metadata = pd.read_csv(path)
+    if 'sha256' not in metadata.columns:
+        raise ValueError(f'{path} is missing sha256')
+    duplicate_count = metadata['sha256'].duplicated(keep='last').sum()
+    if duplicate_count:
+        print(f'[Metadata] Dropping {duplicate_count} duplicate rows from {path}', flush=True)
+        metadata = metadata.drop_duplicates('sha256', keep='last')
+    return metadata.set_index('sha256')
+
+
+def atomic_save_npz(path, pack):
+    tmp_path = f'{path}.tmp.{os.getpid()}'
+    try:
+        with open(tmp_path, 'wb') as f:
+            np.savez_compressed(f, **pack)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def atomic_torch_save(path, value):
+    tmp_path = f'{path}.tmp.{os.getpid()}'
+    try:
+        torch.save(value, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 def require_triangle_field_dataset_args(cfg, resolution, allow_resolution_mismatch=False):
     if 'dataset' not in cfg:
         raise ValueError('VAE config is missing dataset settings.')
@@ -150,8 +184,20 @@ def require_triangle_field_dataset_args(cfg, resolution, allow_resolution_mismat
     return dataset_args
 
 
+def get_triangle_field_input_layout(dataset_args):
+    include_density = dataset_args.get('include_density_field', False)
+    include_elongation = dataset_args.get('include_elongation_field', False)
+    if include_density and include_elongation:
+        return DENSITY_ELONGATION_INPUT_LAYOUT
+    if include_density:
+        return EXTENDED_INPUT_LAYOUT
+    if include_elongation:
+        return ELONGATION_INPUT_LAYOUT
+    return INPUT_LAYOUT
+
+
 def build_triangle_field_sparse_tensor(path, dataset_args):
-    input_layout = EXTENDED_INPUT_LAYOUT if dataset_args.get('include_density_field', False) else INPUT_LAYOUT
+    input_layout = get_triangle_field_input_layout(dataset_args)
     num_input_channels = max(slc.stop for slc in input_layout.values())
     num_target_channels = max(slc.stop for slc in TARGET_LAYOUT.values())
 
@@ -242,9 +288,18 @@ if __name__ == '__main__':
         opt.resolution,
         allow_resolution_mismatch=opt.allow_resolution_mismatch,
     )
+    expected_in_channels = max(
+        slc.stop for slc in get_triangle_field_input_layout(dataset_args).values()
+    )
+    model_in_channels = int(cfg.models.encoder.args.in_channels)
+    if model_in_channels != expected_in_channels:
+        raise ValueError(
+            f'Encoder expects {model_in_channels} channels, but its dataset config builds '
+            f'{expected_in_channels} channels.'
+        )
     encoder = getattr(models, cfg.models.encoder.name)(**cfg.models.encoder.args).cuda()
     ckpt_path = os.path.join(opt.model_root, opt.enc_model, 'ckpts', f'encoder_{opt.ckpt}.pt')
-    encoder.load_state_dict(torch.load(ckpt_path), strict=False)
+    encoder.load_state_dict(torch.load(ckpt_path), strict=True)
     encoder.eval()
     print(f'Loaded model from {ckpt_path}')
 
@@ -253,19 +308,23 @@ if __name__ == '__main__':
 
     if not os.path.exists(os.path.join(opt.root, 'metadata.csv')):
         raise ValueError('metadata.csv not found')
-    metadata = pd.read_csv(os.path.join(opt.root, 'metadata.csv')).set_index('sha256')
+    metadata = read_unique_metadata(os.path.join(opt.root, 'metadata.csv'))
     if os.path.exists(os.path.join(opt.root, 'aesthetic_scores', 'metadata.csv')):
-        metadata = metadata.combine_first(pd.read_csv(os.path.join(opt.root, 'aesthetic_scores', 'metadata.csv')).set_index('sha256'))
+        metadata = read_unique_metadata(
+            os.path.join(opt.root, 'aesthetic_scores', 'metadata.csv')
+        ).combine_first(metadata)
     voxel_metadata_path = os.path.join(
         opt.triangle_field_voxel_root,
         f'{dataset_args.voxel_dirname}_{opt.resolution}',
         'metadata.csv',
     )
-    if os.path.exists(voxel_metadata_path):
-        metadata = metadata.combine_first(pd.read_csv(voxel_metadata_path).set_index('sha256'))
+    if not os.path.exists(voxel_metadata_path):
+        raise ValueError(f'Triangle-field metadata not found: {voxel_metadata_path}')
+    voxel_metadata = read_unique_metadata(voxel_metadata_path)
+    metadata = voxel_metadata.combine_first(metadata)
     latent_metadata_path = os.path.join(latent_root, 'metadata.csv')
     if os.path.exists(latent_metadata_path):
-        metadata = metadata.combine_first(pd.read_csv(latent_metadata_path).set_index('sha256'))
+        metadata = metadata.combine_first(read_unique_metadata(latent_metadata_path))
     metadata = metadata.reset_index()
     if opt.metadata_filter_csv is not None and opt.metadata_filter_csv.strip() != '':
         total_before_filter = len(metadata)
@@ -275,17 +334,30 @@ if __name__ == '__main__':
             f'Applied metadata filter: {total_before_filter} -> {len(metadata)} objects '
             f'using {opt.metadata_filter_csv}'
         )
-    if opt.instances is None:
-        if opt.filter_low_aesthetic_score is not None:
-            metadata = metadata[metadata['aesthetic_score'] >= opt.filter_low_aesthetic_score]
-        metadata = metadata[metadata[dataset_args.voxelized_flag_column] == True]
-    else:
+
+    if opt.filter_low_aesthetic_score is not None:
+        metadata = metadata[metadata['aesthetic_score'] >= opt.filter_low_aesthetic_score]
+
+    metadata = metadata[metadata[dataset_args.voxelized_flag_column] == True]
+    metadata = metadata[metadata[dataset_args.num_voxels_column] > 0]
+    metadata = metadata[
+        metadata[dataset_args.num_voxels_column] <= dataset_args.max_active_voxels
+    ]
+
+    if dataset_args.get('max_num_faces', None) is not None:
+        metadata = metadata[metadata['num_faces'] <= dataset_args.max_num_faces]
+
+    if opt.instances is not None:
         if os.path.exists(opt.instances):
             with open(opt.instances, 'r') as f:
                 instances = f.read().splitlines()
         else:
             instances = opt.instances.split(',')
         metadata = metadata[metadata['sha256'].isin(instances)]
+    print(
+        f'[Metadata] Eligible resolution-{opt.resolution} instances: {len(metadata)}',
+        flush=True,
+    )
 
     start = len(metadata) * opt.rank // opt.world_size
     end = len(metadata) * (opt.rank + 1) // opt.world_size
@@ -298,8 +370,23 @@ if __name__ == '__main__':
             latent_path = os.path.join(latent_root, f'{sha256}.npz')
             cache_path = os.path.join(latent_root, f'{sha256}.cache.pt')
             if os.path.exists(latent_path) and os.path.exists(cache_path):
-                coords = np.load(latent_path)['coords']
-                records.append({'sha256': sha256, 'triangle_field_latent_encoded': True, 'triangle_field_latent_tokens': coords.shape[0]})
+                try:
+                    with np.load(latent_path) as latent:
+                        coords = latent['coords']
+                        feats = latent['feats']
+                        if coords.ndim != 2 or coords.shape[1] != 3:
+                            raise ValueError(f'invalid coords shape {coords.shape}')
+                        if feats.ndim != 2 or feats.shape[0] != coords.shape[0]:
+                            raise ValueError(f'invalid feats shape {feats.shape}')
+                    if os.path.getsize(cache_path) == 0:
+                        raise ValueError('empty cache')
+                    records.append({
+                        'sha256': sha256,
+                        'triangle_field_latent_encoded': True,
+                        'triangle_field_latent_tokens': coords.shape[0],
+                    })
+                except Exception as e:
+                    print(f'[Resume] Reprocessing invalid output {sha256}: {e}', flush=True)
             pbar.update()
         executor.map(check_sha256, metadata['sha256'].values)
         executor.shutdown(wait=True)
@@ -314,6 +401,7 @@ if __name__ == '__main__':
     load_queue = Queue(maxsize=opt.queue_size)
     with ThreadPoolExecutor(max_workers=opt.loader_workers) as loader_executor, \
          ThreadPoolExecutor(max_workers=opt.saver_workers) as saver_executor:
+        saver_futures = []
 
         def loader(sha256):
             try:
@@ -342,10 +430,10 @@ if __name__ == '__main__':
             cache_path = os.path.join(latent_root, f'{sha256}.cache.pt')
             save_start_t = time.perf_counter()
             npz_start_t = time.perf_counter()
-            np.savez_compressed(save_path, **pack)
+            atomic_save_npz(save_path, pack)
             save_npz_s = time.perf_counter() - npz_start_t
             cache_start_t = time.perf_counter()
-            torch.save(cache_pack, cache_path)
+            atomic_torch_save(cache_path, cache_pack)
             save_cache_s = time.perf_counter() - cache_start_t
             records.append({'sha256': sha256, 'triangle_field_latent_encoded': True, 'triangle_field_latent_tokens': pack['coords'].shape[0]})
             if opt.benchmark:
@@ -358,6 +446,7 @@ if __name__ == '__main__':
                 )
 
         for _ in tqdm(range(len(sha256s)), desc="Extracting triangle-field latents"):
+            num_voxels = 0
             try:
                 while True:
                     try:
@@ -413,7 +502,7 @@ if __name__ == '__main__':
                 }
                 cache_pack_s = time.perf_counter() - cache_pack_start_t
                 save_submit_start_t = time.perf_counter()
-                saver_executor.submit(saver, sha256, pack, cache_pack)
+                saver_futures.append(saver_executor.submit(saver, sha256, pack, cache_pack))
                 save_submit_s = time.perf_counter() - save_submit_start_t
                 if opt.benchmark:
                     load_timing = load_timing or {}
@@ -441,6 +530,8 @@ if __name__ == '__main__':
                 continue
 
         saver_executor.shutdown(wait=True)
+        for future in saver_futures:
+            future.result()
 
     records = pd.DataFrame.from_records(records)
     records.to_csv(os.path.join(latent_root, 'new_records', f'part_{opt.rank}.csv'), index=False)

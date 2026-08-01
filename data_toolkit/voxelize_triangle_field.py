@@ -31,20 +31,32 @@ BASE_INPUT_LAYOUT = [
     ['offset_to_projection', 3],
 ]
 DENSITY_FIELD_LAYOUT = [['density_field', 1]]
+ELONGATION_FIELD_LAYOUT = [['elongation_field', 1]]
 INPUT_LAYOUT = BASE_INPUT_LAYOUT
 DEBUG_VERBOSE = False
 BENCHMARK_ENABLED = False
 
 
-def get_input_layout(include_density_field: bool = False):
+def get_input_layout(
+    include_density_field: bool = False,
+    include_elongation_field: bool = False,
+):
     layout = list(BASE_INPUT_LAYOUT)
     if include_density_field:
         layout += DENSITY_FIELD_LAYOUT
+    if include_elongation_field:
+        layout += ELONGATION_FIELD_LAYOUT
     return layout
 
 
-def feature_channel_count(include_density_field: bool = False) -> int:
-    return sum(width for _, width in get_input_layout(include_density_field))
+def feature_channel_count(
+    include_density_field: bool = False,
+    include_elongation_field: bool = False,
+) -> int:
+    return sum(width for _, width in get_input_layout(
+        include_density_field,
+        include_elongation_field,
+    ))
 
 
 def debug_log(message: str):
@@ -498,6 +510,7 @@ def assemble_triangle_features(
     closest: torch.Tensor,
     bary: torch.Tensor,
     face_vertex_area: torch.Tensor = None,
+    face_vertex_elongation: torch.Tensor = None,
     resolution: int = None,
 ) -> torch.Tensor:
     bary_clamped = bary.clamp(0.0, 1.0)
@@ -527,21 +540,40 @@ def assemble_triangle_features(
         voxel_size = 1.0 / float(resolution)
         density_field = -torch.log(area_value / (voxel_size * voxel_size) + 1e-8)
         features = torch.cat([features, density_field], dim=1)
+    if face_vertex_elongation is not None:
+        bary_value = bary_clamped / bary_clamped.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        elongation_field = (bary_value * face_vertex_elongation).sum(dim=1, keepdim=True)
+        features = torch.cat([features, elongation_field], dim=1)
     return features
 
 
-def compute_vertex_mean_incident_area(
-    vertices: torch.Tensor,
+def compute_vertex_mean_incident_value(
+    num_vertices: int,
     faces: torch.Tensor,
+    values: torch.Tensor,
+) -> torch.Tensor:
+    vertex_sum = torch.zeros(num_vertices, dtype=values.dtype, device=values.device)
+    vertex_count = torch.zeros(num_vertices, dtype=values.dtype, device=values.device)
+    ones = torch.ones_like(values)
+    for corner in range(3):
+        vertex_sum.scatter_add_(0, faces[:, corner], values)
+        vertex_count.scatter_add_(0, faces[:, corner], ones)
+    return vertex_sum / vertex_count.clamp_min(1.0)
+
+
+def compute_triangle_elongation(
+    tri_a: torch.Tensor,
+    tri_b: torch.Tensor,
+    tri_c: torch.Tensor,
     tri_areas: torch.Tensor,
 ) -> torch.Tensor:
-    vertex_area_sum = torch.zeros(vertices.shape[0], dtype=tri_areas.dtype, device=vertices.device)
-    vertex_area_count = torch.zeros(vertices.shape[0], dtype=tri_areas.dtype, device=vertices.device)
-    ones = torch.ones_like(tri_areas)
-    for corner in range(3):
-        vertex_area_sum.scatter_add_(0, faces[:, corner], tri_areas)
-        vertex_area_count.scatter_add_(0, faces[:, corner], ones)
-    return vertex_area_sum / vertex_area_count.clamp_min(1.0)
+    edge_sq_sum = (
+        (tri_b - tri_a).square().sum(dim=1)
+        + (tri_c - tri_b).square().sum(dim=1)
+        + (tri_a - tri_c).square().sum(dim=1)
+    )
+    quality = (4.0 * np.sqrt(3.0) * tri_areas / edge_sq_sum.clamp_min(1e-20)).clamp(1e-8, 1.0)
+    return -torch.log(quality)
 
 
 def nearest_triangle_features(
@@ -553,9 +585,13 @@ def nearest_triangle_features(
     triangle_batch: int,
     resolution: int,
     include_density_field: bool = False,
+    include_elongation_field: bool = False,
 ) -> np.ndarray:
     if points.numel() == 0:
-        return np.zeros((0, feature_channel_count(include_density_field)), dtype=np.float32)
+        return np.zeros(
+            (0, feature_channel_count(include_density_field, include_elongation_field)),
+            dtype=np.float32,
+        )
     if vertices.numel() == 0 or faces.numel() == 0:
         raise ValueError('mesh has no valid triangles')
 
@@ -571,7 +607,20 @@ def nearest_triangle_features(
     centroids_all = (tri_a_all + tri_b_all + tri_c_all) / 3.0
     vertex_area_all = None
     if include_density_field:
-        vertex_area_all = compute_vertex_mean_incident_area(vertices, faces, tri_areas_all)
+        vertex_area_all = compute_vertex_mean_incident_value(vertices.shape[0], faces, tri_areas_all)
+    vertex_elongation_all = None
+    if include_elongation_field:
+        tri_elongation_all = compute_triangle_elongation(
+            tri_a_all,
+            tri_b_all,
+            tri_c_all,
+            tri_areas_all,
+        )
+        vertex_elongation_all = compute_vertex_mean_incident_value(
+            vertices.shape[0],
+            faces,
+            tri_elongation_all,
+        )
 
     features = []
     for p0 in range(0, points.shape[0], point_batch):
@@ -609,6 +658,9 @@ def nearest_triangle_features(
         normal = normals_all[best_tri]
 
         face_vertex_area = vertex_area_all[faces[best_tri]] if include_density_field else None
+        face_vertex_elongation = (
+            vertex_elongation_all[faces[best_tri]] if include_elongation_field else None
+        )
         feats = assemble_triangle_features(
             p,
             tri_a,
@@ -619,6 +671,7 @@ def nearest_triangle_features(
             best_closest,
             best_bary,
             face_vertex_area=face_vertex_area,
+            face_vertex_elongation=face_vertex_elongation,
             resolution=resolution if include_density_field else None,
         )
         features.append(feats.cpu().numpy().astype(np.float32))
@@ -639,9 +692,14 @@ def triangle_features_from_native_candidates(
     projection_mode: str,
     resolution: int,
     include_density_field: bool = False,
+    include_elongation_field: bool = False,
+    return_projection: bool = False,
 ) -> Tuple[np.ndarray, dict]:
     if points.numel() == 0:
-        return np.zeros((0, feature_channel_count(include_density_field)), dtype=np.float32), {
+        return np.zeros(
+            (0, feature_channel_count(include_density_field, include_elongation_field)),
+            dtype=np.float32,
+        ), {
             'native_empty_candidates': 0,
             'native_mean_candidates': 0.0,
             'native_max_candidates': 0,
@@ -684,9 +742,27 @@ def triangle_features_from_native_candidates(
     centroids_all = (tri_a_all + tri_b_all + tri_c_all) / 3.0
     vertex_area_all = None
     if include_density_field:
-        vertex_area_all = compute_vertex_mean_incident_area(vertices, faces, tri_areas_all)
+        vertex_area_all = compute_vertex_mean_incident_value(vertices.shape[0], faces, tri_areas_all)
+    vertex_elongation_all = None
+    if include_elongation_field:
+        tri_elongation_all = compute_triangle_elongation(
+            tri_a_all,
+            tri_b_all,
+            tri_c_all,
+            tri_areas_all,
+        )
+        vertex_elongation_all = compute_vertex_mean_incident_value(
+            vertices.shape[0],
+            faces,
+            tri_elongation_all,
+        )
 
-    features = np.zeros((points.shape[0], feature_channel_count(include_density_field)), dtype=np.float32)
+    features = np.zeros(
+        (points.shape[0], feature_channel_count(include_density_field, include_elongation_field)),
+        dtype=np.float32,
+    )
+    selected_triangles = np.empty((points.shape[0],), dtype=np.int64) if return_projection else None
+    selected_barycentric = np.empty((points.shape[0], 3), dtype=np.float32) if return_projection else None
     subtimings = {
         'native_setup_s': 0.0,
         'native_projection_s': 0.0,
@@ -787,6 +863,9 @@ def triangle_features_from_native_candidates(
         normal = normals_all[best_tri]
 
         face_vertex_area = vertex_area_all[faces[best_tri]] if include_density_field else None
+        face_vertex_elongation = (
+            vertex_elongation_all[faces[best_tri]] if include_elongation_field else None
+        )
         feats = assemble_triangle_features(
             p,
             tri_a,
@@ -797,23 +876,122 @@ def triangle_features_from_native_candidates(
             best_closest,
             best_bary,
             face_vertex_area=face_vertex_area,
+            face_vertex_elongation=face_vertex_elongation,
             resolution=resolution if include_density_field else None,
         )
         features[p0:p1] = feats.cpu().numpy().astype(np.float32)
+        if return_projection:
+            selected_triangles[p0:p1] = best_tri.cpu().numpy()
+            selected_barycentric[p0:p1] = best_bary.cpu().numpy().astype(np.float32)
         subtimings['native_assemble_copy_s'] += time.perf_counter() - stage_t
 
-    return features, {
+    stats = {
         'native_empty_candidates': empty,
         'native_mean_candidates': float(counts.mean()) if counts.size else 0.0,
         'native_max_candidates': int(counts.max()) if counts.size else 0,
         'native_inside_fallback_points': inside_fallback_points,
         **subtimings,
     }
+    if return_projection:
+        return features, stats, selected_triangles, selected_barycentric
+    return features, stats
 
 
 def coords_to_linear_np(coords: np.ndarray, resolution: int) -> np.ndarray:
     coords = coords.astype(np.int64, copy=False)
     return (coords[:, 0] * resolution + coords[:, 1]) * resolution + coords[:, 2]
+
+
+def load_derived_support_coords(
+    support_source_root: str,
+    sha256: str,
+    target_resolution: int,
+    source_resolution: int,
+) -> torch.Tensor:
+    if source_resolution % target_resolution != 0:
+        raise ValueError(
+            f'support source resolution {source_resolution} must be divisible by '
+            f'target resolution {target_resolution}'
+        )
+    source_path = None
+    source_dir = os.path.join(
+        support_source_root,
+        f'triangle_field_voxels_{source_resolution}',
+    )
+    for suffix in ('.npz.zst', '.npz'):
+        candidate = os.path.join(source_dir, f'{sha256}{suffix}')
+        if os.path.exists(candidate):
+            source_path = candidate
+            break
+    if source_path is None:
+        raise FileNotFoundError(
+            f'missing source support for {sha256} at resolution {source_resolution} '
+            f'under {source_dir}'
+        )
+
+    with load_triangle_field_npz(source_path) as data:
+        source_coords = np.asarray(data['coords'], dtype=np.int32)
+    factor = source_resolution // target_resolution
+    coords = np.unique(source_coords // factor, axis=0).astype(np.int32, copy=False)
+    return torch.from_numpy(coords)
+
+
+def merge_native_features_onto_support(
+    support_coords: torch.Tensor,
+    native_coords: torch.Tensor,
+    native_features: np.ndarray,
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    device: torch.device,
+    point_batch: int,
+    triangle_batch: int,
+    resolution: int,
+    include_density_field: bool,
+    include_elongation_field: bool,
+) -> Tuple[np.ndarray, dict]:
+    support_np = support_coords.cpu().numpy().astype(np.int32, copy=False)
+    native_np = native_coords.cpu().numpy().astype(np.int32, copy=False)
+    support_keys = coords_to_linear_np(support_np, resolution)
+    native_keys = coords_to_linear_np(native_np, resolution)
+
+    order = np.argsort(support_keys)
+    sorted_keys = support_keys[order]
+    positions = np.searchsorted(sorted_keys, native_keys)
+    matched = positions < sorted_keys.shape[0]
+    matched[matched] &= sorted_keys[positions[matched]] == native_keys[matched]
+    support_rows = order[positions[matched]]
+
+    features = np.zeros(
+        (
+            support_coords.shape[0],
+            feature_channel_count(include_density_field, include_elongation_field),
+        ),
+        dtype=np.float32,
+    )
+    features[support_rows] = native_features[matched]
+    filled = np.zeros(support_coords.shape[0], dtype=bool)
+    filled[support_rows] = True
+    fallback_rows = np.flatnonzero(~filled)
+    if fallback_rows.size:
+        fallback_coords = support_coords[torch.from_numpy(fallback_rows)]
+        features[fallback_rows] = nearest_triangle_features(
+            points=voxel_coords_to_centers(fallback_coords, resolution),
+            vertices=vertices,
+            faces=faces,
+            device=device,
+            point_batch=point_batch,
+            triangle_batch=triangle_batch,
+            resolution=resolution,
+            include_density_field=include_density_field,
+            include_elongation_field=include_elongation_field,
+        )
+
+    return features, {
+        'derived_support_voxels': int(support_coords.shape[0]),
+        'derived_support_native_voxels': int(matched.sum()),
+        'derived_support_fallback_voxels': int(fallback_rows.size),
+        'native_voxels_outside_derived_support': int((~matched).sum()),
+    }
 
 
 def build_aabb_candidate_lists(
@@ -865,9 +1043,13 @@ def triangle_features_from_candidate_lists(
     fallback: str,
     resolution: int,
     include_density_field: bool = False,
+    include_elongation_field: bool = False,
 ) -> Tuple[np.ndarray, dict]:
     if points.numel() == 0:
-        return np.zeros((0, feature_channel_count(include_density_field)), dtype=np.float32), {
+        return np.zeros(
+            (0, feature_channel_count(include_density_field, include_elongation_field)),
+            dtype=np.float32,
+        ), {
             'aabb_fallback_points': 0,
         }
     if vertices.numel() == 0 or faces.numel() == 0:
@@ -889,9 +1071,25 @@ def triangle_features_from_candidate_lists(
     centroids_all = (tri_a_all + tri_b_all + tri_c_all) / 3.0
     vertex_area_all = None
     if include_density_field:
-        vertex_area_all = compute_vertex_mean_incident_area(vertices, faces, tri_areas_all)
+        vertex_area_all = compute_vertex_mean_incident_value(vertices.shape[0], faces, tri_areas_all)
+    vertex_elongation_all = None
+    if include_elongation_field:
+        tri_elongation_all = compute_triangle_elongation(
+            tri_a_all,
+            tri_b_all,
+            tri_c_all,
+            tri_areas_all,
+        )
+        vertex_elongation_all = compute_vertex_mean_incident_value(
+            vertices.shape[0],
+            faces,
+            tri_elongation_all,
+        )
 
-    features = np.zeros((points.shape[0], feature_channel_count(include_density_field)), dtype=np.float32)
+    features = np.zeros(
+        (points.shape[0], feature_channel_count(include_density_field, include_elongation_field)),
+        dtype=np.float32,
+    )
 
     for p0 in range(0, points.shape[0], point_batch):
         p1 = min(p0 + point_batch, points.shape[0])
@@ -935,6 +1133,9 @@ def triangle_features_from_candidate_lists(
         normal = normals_all[best_tri]
 
         face_vertex_area = vertex_area_all[faces[best_tri]] if include_density_field else None
+        face_vertex_elongation = (
+            vertex_elongation_all[faces[best_tri]] if include_elongation_field else None
+        )
         feats = assemble_triangle_features(
             p,
             tri_a,
@@ -945,6 +1146,7 @@ def triangle_features_from_candidate_lists(
             best_closest,
             best_bary,
             face_vertex_area=face_vertex_area,
+            face_vertex_elongation=face_vertex_elongation,
             resolution=resolution if include_density_field else None,
         )
         global_rows = p0 + batch_rows
@@ -961,6 +1163,7 @@ def triangle_features_from_candidate_lists(
             triangle_batch=opt.triangle_batch,
             resolution=resolution,
             include_density_field=include_density_field,
+            include_elongation_field=include_elongation_field,
         )
         features[np.array(empty_indices, dtype=np.int64)] = fallback_features
 
@@ -982,6 +1185,7 @@ def build_metadata_json(
     feature_dtype: str,
     npz_compression: str,
     include_density_field: bool = False,
+    include_elongation_field: bool = False,
 ) -> str:
     definitions = {
         'voxel_center': '(coords + 0.5) / resolution - 0.5',
@@ -995,7 +1199,14 @@ def build_metadata_json(
             'project to the nearest triangle and barycentrically interpolate those vertex areas into '
             'area_value. density_field = -log(area_value / voxel_size^2 + 1e-8).'
         )
-    return json.dumps({
+    if include_elongation_field:
+        definitions['elongation_field'] = (
+            'For each triangle, quality = 4*sqrt(3)*area/sum(edge_length^2) and '
+            'elongation = -log(clamp(quality, 1e-8, 1)). For each vertex, average '
+            'the elongation of its incident triangles. For each voxel center, project '
+            'to the nearest triangle and barycentrically interpolate its vertex values.'
+        )
+    metadata = {
         'format': FORMAT_NAME,
         'version': FORMAT_VERSION,
         'resolution': resolution,
@@ -1003,9 +1214,16 @@ def build_metadata_json(
         'npz_compression': npz_compression,
         'coordinate_frame': 'normalized_object_space',
         'normalization': 'same_as_voxelize_gaussian_distance.normalize_dump',
-        'feature_layout': get_input_layout(include_density_field),
+        'feature_layout': get_input_layout(include_density_field, include_elongation_field),
         'definitions': definitions,
-    })
+    }
+    if getattr(opt, 'support_source_root', None):
+        metadata['support_derivation'] = {
+            'method': 'integer_parent_mapping',
+            'source_resolution': opt.support_source_resolution,
+            'features': 'recomputed_at_target_voxel_centers',
+        }
+    return json.dumps(metadata)
 
 
 def compress_zstd(payload: bytes, level: int) -> bytes:
@@ -1048,6 +1266,7 @@ def matching_or_requested_output_path(
     feature_dtype: str,
     npz_compression: str,
     include_density_field: bool = False,
+    include_elongation_field: bool = False,
 ) -> Tuple[str, bool]:
     requested = triangle_field_output_path(root, sha256, resolution, npz_compression)
     legacy = triangle_field_output_path(root, sha256, resolution, 'none')
@@ -1055,7 +1274,13 @@ def matching_or_requested_output_path(
     if legacy != requested:
         candidates.append(legacy)
     for path in candidates:
-        if output_matches_expected_layout(path, resolution, feature_dtype, include_density_field):
+        if output_matches_expected_layout(
+            path,
+            resolution,
+            feature_dtype,
+            include_density_field,
+            include_elongation_field,
+        ):
             return path, False
     return requested, True
 
@@ -1069,6 +1294,7 @@ def save_triangle_field_npz(out_path: str, coords: torch.Tensor, features: np.nd
         opt.feature_dtype,
         opt.npz_compression,
         include_density_field=opt.include_density_field,
+        include_elongation_field=opt.include_elongation_field,
     ))
 
     if opt.npz_compression == 'compressed':
@@ -1108,6 +1334,7 @@ def output_matches_expected_layout(
     resolution: int,
     feature_dtype: str,
     include_density_field: bool = False,
+    include_elongation_field: bool = False,
 ) -> bool:
     if not os.path.exists(out_path):
         return False
@@ -1123,14 +1350,20 @@ def output_matches_expected_layout(
                 coords.ndim == 2
                 and coords.shape[1] == 3
                 and features.ndim == 2
-                and features.shape[1] == feature_channel_count(include_density_field)
+                and features.shape[1] == feature_channel_count(
+                    include_density_field,
+                    include_elongation_field,
+                )
                 and features.shape[0] == coords.shape[0]
                 and features.dtype == expected_dtype
                 and metadata.get('format') == FORMAT_NAME
                 and metadata.get('version') == FORMAT_VERSION
                 and metadata.get('resolution') == resolution
                 and metadata.get('feature_dtype') == feature_dtype
-                and metadata.get('feature_layout') == get_input_layout(include_density_field)
+                and metadata.get('feature_layout') == get_input_layout(
+                    include_density_field,
+                    include_elongation_field,
+                )
             )
     except Exception:
         return False
@@ -1168,6 +1401,7 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
                 opt.feature_dtype,
                 opt.npz_compression,
                 include_density_field=opt.include_density_field,
+                include_elongation_field=opt.include_elongation_field,
             )
 
             if not need_process:
@@ -1205,7 +1439,7 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
             debug_log(f'{sha256}: resolution={res} voxelizing active coords')
             stage_start_t = time.perf_counter()
             if opt.candidate_source == 'native':
-                coords, candidate_offsets, candidate_triangle_ids, candidate_barycentric = (
+                native_coords, candidate_offsets, candidate_triangle_ids, candidate_barycentric = (
                     o_voxel.convert.blender_dump_to_voxel_triangle_candidates(
                         dump,
                         grid_size=res,
@@ -1213,6 +1447,16 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
                         verbose=False,
                         timing=False,
                     )
+                )
+                coords = (
+                    load_derived_support_coords(
+                        opt.support_source_root,
+                        sha256,
+                        res,
+                        opt.support_source_resolution,
+                    )
+                    if opt.support_source_root
+                    else native_coords
                 )
                 stage_timings['voxelize_s'] += time.perf_counter() - stage_start_t
             else:
@@ -1231,7 +1475,13 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
             debug_log(f'{sha256}: resolution={res} voxelized active coords count={len(coords)}')
 
             if len(coords) == 0:
-                empty_features = np.zeros((0, feature_channel_count(opt.include_density_field)), dtype=np.float32)
+                empty_features = np.zeros(
+                    (0, feature_channel_count(
+                        opt.include_density_field,
+                        opt.include_elongation_field,
+                    )),
+                    dtype=np.float32,
+                )
                 stage_start_t = time.perf_counter()
                 save_triangle_field_npz(out_path, coords, empty_features, res)
                 stage_timings['write_s'] += time.perf_counter() - stage_start_t
@@ -1248,9 +1498,14 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
             if opt.candidate_source == 'native':
                 debug_log(f'{sha256}: resolution={res} computing triangle features from native candidates')
                 stage_start_t = time.perf_counter()
-                features, native_stats = triangle_features_from_native_candidates(
-                    coords=coords,
-                    points=points,
+                native_points = (
+                    voxel_coords_to_centers(native_coords, res)
+                    if opt.support_source_root
+                    else points
+                )
+                native_features, native_stats = triangle_features_from_native_candidates(
+                    coords=native_coords,
+                    points=native_points,
                     vertices=vertices,
                     faces=faces,
                     candidate_offsets=candidate_offsets,
@@ -1261,7 +1516,26 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
                     projection_mode=opt.projection_mode,
                     resolution=res,
                     include_density_field=opt.include_density_field,
+                    include_elongation_field=opt.include_elongation_field,
                 )
+                if opt.support_source_root:
+                    features, support_stats = merge_native_features_onto_support(
+                        support_coords=coords,
+                        native_coords=native_coords,
+                        native_features=native_features,
+                        vertices=vertices,
+                        faces=faces,
+                        device=device,
+                        point_batch=opt.point_batch,
+                        triangle_batch=opt.triangle_batch,
+                        resolution=res,
+                        include_density_field=opt.include_density_field,
+                        include_elongation_field=opt.include_elongation_field,
+                    )
+                    for key, value in support_stats.items():
+                        pack[f'{key}_{res}'] = value
+                else:
+                    features = native_features
                 stage_timings['nearest_triangle_s'] += time.perf_counter() - stage_start_t
                 pack[f'native_empty_candidates_{res}'] = native_stats['native_empty_candidates']
                 pack[f'native_mean_candidates_{res}'] = native_stats['native_mean_candidates']
@@ -1286,6 +1560,7 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
                     triangle_batch=opt.triangle_batch,
                     resolution=res,
                     include_density_field=opt.include_density_field,
+                    include_elongation_field=opt.include_elongation_field,
                 )
                 stage_timings['nearest_triangle_s'] += time.perf_counter() - stage_start_t
             else:
@@ -1324,6 +1599,7 @@ def _triangle_field_voxelize(file, metadatum, pbr_dump_root, root, device):
                     fallback=opt.aabb_fallback,
                     resolution=res,
                     include_density_field=opt.include_density_field,
+                    include_elongation_field=opt.include_elongation_field,
                 )
                 stage_timings['nearest_triangle_s'] += time.perf_counter() - stage_start_t
                 pack[f'aabb_empty_candidates_{res}'] = candidate_stats['aabb_empty_candidates']
@@ -1374,6 +1650,10 @@ if __name__ == '__main__':
                         help='Directory to load pbr dumps')
     parser.add_argument('--triangle_field_voxel_root', type=str, default=None,
                         help='Directory to save triangle-field voxel .npz files')
+    parser.add_argument('--support_source_root', type=str, default=None,
+                        help='Derive target support from source-resolution triangle-field coords in this root')
+    parser.add_argument('--support_source_resolution', type=int, default=512,
+                        help='Resolution whose support is integer-downsampled when --support_source_root is set')
     parser.add_argument('--filter_low_aesthetic_score', type=float, default=None,
                         help='Filter objects with aesthetic score lower than this value')
     parser.add_argument('--instances', type=str, default=None,
@@ -1403,6 +1683,9 @@ if __name__ == '__main__':
     parser.add_argument('--include_density_field', action='store_true',
                         help='Append density_field as an extra input channel: '
                              '-log(vertex-area-interpolated area / voxel_size^2 + 1e-8)')
+    parser.add_argument('--include_elongation_field', action='store_true',
+                        help='Append barycentrically interpolated vertex-mean triangle elongation: '
+                             '-log(4*sqrt(3)*area/sum(edge_length^2))')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable detailed per-object debug logging')
     parser.add_argument('--benchmark', action='store_true',
@@ -1471,8 +1754,14 @@ if __name__ == '__main__':
     print(f'Using device: {device}')
     print(f'Feature dtype: {opt.feature_dtype}')
     print(f'Include density field: {opt.include_density_field}')
+    print(f'Include elongation field: {opt.include_elongation_field}')
     print(f'NPZ compression: {opt.npz_compression}')
     print(f'Projection mode: {opt.projection_mode}')
+    if opt.support_source_root:
+        print(
+            f'Derived support: {opt.support_source_root} '
+            f'at resolution {opt.support_source_resolution}'
+        )
     if opt.npz_compression == 'zstd':
         print(f'Zstd level: {opt.zstd_level}')
     if len(metadata) > 0:

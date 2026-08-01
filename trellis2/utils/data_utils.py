@@ -224,3 +224,116 @@ class BalancedResumableSampler(ResumableSampler):
         indices = balanced_indices[self.idx:]
 
         return iter(indices)
+
+
+class GroupedBalancedResumableBatchSampler(Sampler[List[int]]):
+    """Yield synchronized, load-balanced DDP batches from separate index groups."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        groups: Dict[int, Sequence[int]],
+        batch_sizes: Dict[int, int],
+        group_weights: Optional[Dict[int, float]] = None,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> None:
+        if not hasattr(dataset, 'loads'):
+            raise ValueError('Dataset must have a loads attribute for balanced batching.')
+        self.dataset = dataset
+        self.groups = {int(key): list(indices) for key, indices in groups.items()}
+        self.batch_sizes = {int(key): int(value) for key, value in batch_sizes.items()}
+        if set(self.groups) != set(self.batch_sizes):
+            raise ValueError(
+                f'Batch-size groups must match dataset groups: {sorted(self.batch_sizes)} vs '
+                f'{sorted(self.groups)}'
+            )
+        if any(size <= 0 for size in self.batch_sizes.values()):
+            raise ValueError(f'Batch sizes must be positive, got {self.batch_sizes}')
+        self.group_weights = (
+            {int(key): float(value) for key, value in group_weights.items()}
+            if group_weights is not None
+            else None
+        )
+        if self.group_weights is not None:
+            if set(self.groups) != set(self.group_weights):
+                raise ValueError(
+                    f'Group weights must match dataset groups: {sorted(self.group_weights)} vs '
+                    f'{sorted(self.groups)}'
+                )
+            if any(weight <= 0 for weight in self.group_weights.values()):
+                raise ValueError(f'Group weights must be positive, got {self.group_weights}')
+            weight_sum = sum(self.group_weights.values())
+            self.group_weights = {
+                key: value / weight_sum
+                for key, value in self.group_weights.items()
+            }
+
+        self.loads = dataset.loads
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.idx = 0
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+
+    def _batches_per_group(self) -> Dict[int, int]:
+        capacities = {
+            key: len(indices) // (self.batch_sizes[key] * self.world_size)
+            for key, indices in self.groups.items()
+        }
+        if self.group_weights is None:
+            count = min(capacities.values())
+            return {key: count for key in self.groups}
+        scale = min(
+            capacities[key] / self.group_weights[key]
+            for key in self.groups
+        )
+        return {
+            key: max(1, min(capacities[key], int(scale * self.group_weights[key])))
+            for key in self.groups
+        }
+
+    def _batches(self) -> List[List[int]]:
+        batches = []
+        batches_per_group = self._batches_per_group()
+        for group_offset, group_key in enumerate(sorted(self.groups)):
+            indices = self.groups[group_key]
+            if self.shuffle:
+                generator = torch.Generator()
+                generator.manual_seed(self.seed + self.epoch * 1009 + group_offset)
+                order = torch.randperm(len(indices), generator=generator).tolist()
+                indices = [indices[index] for index in order]
+
+            local_batch_size = self.batch_sizes[group_key]
+            global_batch_size = local_batch_size * self.world_size
+            usable = batches_per_group[group_key] * global_batch_size
+            for start in range(0, usable, global_batch_size):
+                global_indices = indices[start:start + global_batch_size]
+                global_loads = [self.loads[index] for index in global_indices]
+                rank_groups = load_balanced_group_indices(
+                    global_loads,
+                    self.world_size,
+                    equal_size=True,
+                )
+                batches.append([global_indices[index] for index in rank_groups[self.rank]])
+
+        if self.shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self.epoch * 1009 + 100003)
+            order = torch.randperm(len(batches), generator=generator).tolist()
+            batches = [batches[index] for index in order]
+        return batches
+
+    def __iter__(self) -> Iterator[List[int]]:
+        return iter(self._batches()[self.idx:])
+
+    def __len__(self) -> int:
+        return sum(self._batches_per_group().values())
+
+    def state_dict(self) -> Dict[str, int]:
+        return {'epoch': self.epoch, 'idx': self.idx}
+
+    def load_state_dict(self, state_dict: Dict[str, int]) -> None:
+        self.epoch = int(state_dict['epoch'])
+        self.idx = int(state_dict['idx'])

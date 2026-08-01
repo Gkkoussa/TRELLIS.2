@@ -244,6 +244,7 @@ def main():
                 args.steps,
                 guidance,
                 args.apply_conditioning_augmentation,
+                high_resolution=high_res,
             )
             sample = trainer._decode_latents_with_cache(sample_z, caches=caches)
             pred_last = trainer._decode_latents_with_cache(pred_z0_last, caches=caches)

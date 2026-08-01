@@ -3,9 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
+from ...modules.utils import convert_module_to, convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
+from ...modules.sparse.transformer import SparseTransformerBlock, ModulatedSparseTransformerBlock
 
 
 def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
@@ -324,13 +325,16 @@ class SparseUnetVaeEncoder(nn.Module):
         down_block_type: List[str],
         block_args: List[Dict[str, Any]],
         use_fp16: bool = False,
+        use_bf16: bool = False,
+        output_transformer_block: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
+        if use_fp16 and use_bf16:
+            raise ValueError('use_fp16 and use_bf16 are mutually exclusive')
         self.in_channels = in_channels
         self.model_channels = model_channels
         self.num_blocks = num_blocks
-        self.dtype = torch.float16 if use_fp16 else torch.float32
-        self.dtype = torch.float16 if use_fp16 else torch.float32
+        self.dtype = torch.float16 if use_fp16 else torch.bfloat16 if use_bf16 else torch.float32
 
         self.input_layer = sp.SparseLinear(in_channels, model_channels[0])
         self.to_latent = sp.SparseLinear(model_channels[-1], 2 * latent_channels)
@@ -353,10 +357,54 @@ class SparseUnetVaeEncoder(nn.Module):
                         **block_args[i],
                     )
                 )
-                
+
+        self.output_transformer_modulated = False
+        if output_transformer_block is not None:
+            transformer_args = dict(output_transformer_block)
+            transformer_type = transformer_args.pop('block_type', 'SparseTransformerBlock')
+            transformer_depth = int(transformer_args.pop('num_blocks', 1))
+            if transformer_depth <= 0:
+                raise ValueError(f'output transformer num_blocks must be positive, got {transformer_depth}')
+            transformer_classes = {
+                'SparseTransformerBlock': SparseTransformerBlock,
+                'ModulatedSparseTransformerBlock': ModulatedSparseTransformerBlock,
+            }
+            if transformer_type not in transformer_classes:
+                raise ValueError(
+                    f'Unsupported output transformer block_type {transformer_type}; '
+                    f'expected one of {tuple(transformer_classes)}'
+                )
+            transformer_cls = transformer_classes[transformer_type]
+            self.output_transformer_modulated = transformer_cls is ModulatedSparseTransformerBlock
+            output_blocks = [
+                transformer_cls(model_channels[-1], **transformer_args)
+                for _ in range(transformer_depth)
+            ]
+            # Preserve legacy state-dict keys for existing one-block configs.
+            self.output_transformer_block = (
+                output_blocks[0] if transformer_depth == 1 else nn.ModuleList(output_blocks)
+            )
+        else:
+            self.output_transformer_block = None
+
         self.initialize_weights()
+        if self.output_transformer_block is not None:
+            output_blocks = (
+                self.output_transformer_block
+                if isinstance(self.output_transformer_block, nn.ModuleList)
+                else [self.output_transformer_block]
+            )
+            for block in output_blocks:
+                if self.output_transformer_modulated:
+                    nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                    nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+                else:
+                    zero_module(block.attn.to_out)
+                    zero_module(block.mlp.mlp[2])
         if use_fp16:
             self.convert_to_fp16()
+        elif use_bf16:
+            self.convert_to_bf16()
 
     @property
     def device(self) -> torch.device:
@@ -370,12 +418,29 @@ class SparseUnetVaeEncoder(nn.Module):
         Convert the torso of the model to float16.
         """
         self.blocks.apply(convert_module_to_f16)
+        if self.output_transformer_block is not None:
+            self.output_transformer_block.apply(convert_module_to_f16)
+        self.dtype = torch.float16
+
+    def convert_to_bf16(self) -> None:
+        """
+        Convert the torso of the model to bfloat16.
+        """
+        self.blocks.apply(lambda module: convert_module_to(module, torch.bfloat16))
+        if self.output_transformer_block is not None:
+            self.output_transformer_block.apply(
+                lambda module: convert_module_to(module, torch.bfloat16)
+            )
+        self.dtype = torch.bfloat16
 
     def convert_to_fp32(self) -> None:
         """
         Convert the torso of the model to float32.
         """
         self.blocks.apply(convert_module_to_f32)
+        if self.output_transformer_block is not None:
+            self.output_transformer_block.apply(convert_module_to_f32)
+        self.dtype = torch.float32
 
     def initialize_weights(self) -> None:
         # Initialize transformer layers:
@@ -386,12 +451,32 @@ class SparseUnetVaeEncoder(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
+    def _apply_output_transformer(
+        self,
+        h: sp.SparseTensor,
+        modulation: Optional[torch.Tensor] = None,
+    ) -> sp.SparseTensor:
+        if self.output_transformer_block is None:
+            return h
+        if self.output_transformer_modulated and modulation is None:
+            raise ValueError('Modulated output transformer requires timestep modulation')
+
+        output_blocks = (
+            self.output_transformer_block
+            if isinstance(self.output_transformer_block, nn.ModuleList)
+            else [self.output_transformer_block]
+        )
+        for block in output_blocks:
+            h = block(h, modulation) if self.output_transformer_modulated else block(h)
+        return h
+
     def forward(self, x: sp.SparseTensor, sample_posterior=False, return_raw=False):
         h = self.input_layer(x)
         h = h.type(self.dtype)
         for i, res in enumerate(self.blocks):
             for j, block in enumerate(res):
                 h = block(h)
+        h = self._apply_output_transformer(h)
         h = h.type(x.dtype)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
         h = self.to_latent(h)
@@ -424,6 +509,11 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         *args,
         time_embed_dim: int = 256,
         time_embed_max_period: int = 10000,
+        resolution_conditioning: bool = False,
+        resolution_reference: float = 128.0,
+        resolution_embed_zero_init: bool = True,
+        conditioning_noise_conditioning: bool = False,
+        conditioning_noise_embed_scale: float = 1000.0,
         latent_cond_channels: int = 0,
         latent_cond_mode: Optional[Literal['bottleneck']] = None,
         **kwargs,
@@ -431,6 +521,18 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         super().__init__(*args, **kwargs)
         self.time_embed_dim = time_embed_dim
         self.time_embed_max_period = time_embed_max_period
+        self.resolution_conditioning = bool(resolution_conditioning)
+        self.resolution_reference = float(resolution_reference)
+        self.resolution_embed_zero_init = bool(resolution_embed_zero_init)
+        self.conditioning_noise_conditioning = bool(conditioning_noise_conditioning)
+        self.conditioning_noise_embed_scale = float(conditioning_noise_embed_scale)
+        if self.resolution_reference <= 0:
+            raise ValueError(f'resolution_reference must be positive, got {resolution_reference}')
+        if self.conditioning_noise_embed_scale <= 0:
+            raise ValueError(
+                'conditioning_noise_embed_scale must be positive, got '
+                f'{conditioning_noise_embed_scale}'
+            )
         self.latent_cond_channels = int(latent_cond_channels)
         self.latent_cond_mode = latent_cond_mode
         if self.latent_cond_mode not in (None, 'bottleneck'):
@@ -443,6 +545,21 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
             nn.SiLU(),
             nn.Linear(time_embed_dim, time_embed_dim),
         )
+        if self.resolution_conditioning:
+            self.resolution_embed = nn.Sequential(
+                nn.Linear(1, time_embed_dim),
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, time_embed_dim),
+            )
+            if self.resolution_embed_zero_init:
+                nn.init.constant_(self.resolution_embed[-1].weight, 0)
+                nn.init.constant_(self.resolution_embed[-1].bias, 0)
+        if self.conditioning_noise_conditioning:
+            self.conditioning_noise_embed = nn.Sequential(
+                nn.Linear(time_embed_dim, time_embed_dim),
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, time_embed_dim),
+            )
         self.film_layers = nn.ModuleList([])
         for i, res in enumerate(self.blocks):
             film_res = nn.ModuleList([])
@@ -466,12 +583,22 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
                 self.latent_bottleneck_proj.weight[:, :self.model_channels[-1]].copy_(
                     torch.eye(self.model_channels[-1])
                 )
+        if self.output_transformer_modulated:
+            self.output_transformer_time_proj = nn.Linear(
+                self.time_embed_dim,
+                self.model_channels[-1],
+            )
+            nn.init.normal_(self.output_transformer_time_proj.weight, std=0.02)
+            nn.init.constant_(self.output_transformer_time_proj.bias, 0)
 
     def convert_to_fp16(self) -> None:
         """
         Convert the sparse torso to float16 while leaving time MLPs in fp32.
         """
         self.blocks.apply(convert_module_to_f16)
+        if self.output_transformer_block is not None:
+            self.output_transformer_block.apply(convert_module_to_f16)
+        self.dtype = torch.float16
 
     def _apply_film(self, h: sp.SparseTensor, emb: torch.Tensor, i: int, j: int) -> sp.SparseTensor:
         scale_shift = self.film_layers[i][j](emb).to(dtype=h.feats.dtype)
@@ -479,6 +606,62 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         batch_idx = h.coords[:, 0].long()
         feats = h.feats * (1.0 + scale[batch_idx]) + shift[batch_idx]
         return h.replace(feats)
+
+    def _embed_resolution(
+        self,
+        resolution: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not self.resolution_conditioning:
+            return None
+        if resolution is None:
+            raise ValueError('resolution must be provided when resolution_conditioning is enabled')
+        resolution = torch.as_tensor(resolution, device=device, dtype=torch.float32).reshape(-1)
+        if resolution.numel() == 1 and batch_size > 1:
+            resolution = resolution.expand(batch_size)
+        if resolution.numel() != batch_size:
+            raise ValueError(
+                f'resolution must have one value per sample, got {resolution.numel()} for batch {batch_size}'
+            )
+        if torch.any(resolution <= 0):
+            raise ValueError('resolution values must be positive')
+        resolution_scalar = torch.log2(resolution / self.resolution_reference).unsqueeze(-1)
+        return self.resolution_embed(resolution_scalar)
+
+    def _embed_conditioning_noise(
+        self,
+        conditioning_noise_level: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not self.conditioning_noise_conditioning:
+            return None
+        if conditioning_noise_level is None:
+            raise ValueError(
+                'conditioning_noise_level must be provided when '
+                'conditioning_noise_conditioning is enabled'
+            )
+        level = torch.as_tensor(
+            conditioning_noise_level,
+            device=device,
+            dtype=torch.float32,
+        ).reshape(-1)
+        if level.numel() == 1 and batch_size > 1:
+            level = level.expand(batch_size)
+        if level.numel() != batch_size:
+            raise ValueError(
+                'conditioning_noise_level must have one value per sample, got '
+                f'{level.numel()} for batch {batch_size}'
+            )
+        if torch.any((level < 0) | (level > 1)):
+            raise ValueError('conditioning_noise_level values must be in [0, 1]')
+        noise_emb = timestep_embedding(
+            level * self.conditioning_noise_embed_scale,
+            self.time_embed_dim,
+            self.time_embed_max_period,
+        )
+        return self.conditioning_noise_embed(noise_emb)
 
     @staticmethod
     def _check_matching_coords(a: sp.SparseTensor, b: sp.SparseTensor, name_a: str, name_b: str) -> None:
@@ -494,11 +677,23 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         sample_posterior: bool = False,
         return_raw: bool = False,
         latent_cond: Optional[sp.SparseTensor] = None,
+        resolution: Optional[torch.Tensor] = None,
+        conditioning_noise_level: Optional[torch.Tensor] = None,
     ):
         if t.ndim != 1:
             t = t.reshape(-1)
         emb = timestep_embedding(t, self.time_embed_dim, self.time_embed_max_period)
         emb = self.time_embed(emb)
+        resolution_emb = self._embed_resolution(resolution, t.shape[0], t.device)
+        if resolution_emb is not None:
+            emb = emb + resolution_emb
+        conditioning_noise_emb = self._embed_conditioning_noise(
+            conditioning_noise_level,
+            t.shape[0],
+            t.device,
+        )
+        if conditioning_noise_emb is not None:
+            emb = emb + conditioning_noise_emb
 
         h = self.input_layer(x)
         h = h.type(self.dtype)
@@ -515,6 +710,10 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
             for j, block in enumerate(res):
                 h = block(h)
                 h = self._apply_film(h, emb, i, j)
+        output_modulation = None
+        if self.output_transformer_modulated:
+            output_modulation = self.output_transformer_time_proj(emb).to(dtype=h.feats.dtype)
+        h = self._apply_output_transformer(h, output_modulation)
         h = h.type(x.dtype)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
         h = self.to_latent(h)
