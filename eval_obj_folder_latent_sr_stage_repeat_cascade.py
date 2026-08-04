@@ -98,6 +98,15 @@ def parse_args():
     parser.add_argument("--conditioning_augmentation_blur_sigma", type=float, default=None)
     parser.add_argument("--conditioning_augmentation_disable_blur", action="store_true")
     parser.add_argument("--constant_density_conditioning", action="store_true")
+    parser.add_argument(
+        "--density_payload_dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory of per-mesh 512-resolution coords+density payloads. "
+            "Density is averaged onto each nested support and voxel-size scaled."
+        ),
+    )
     parser.add_argument("--constant_density_value", type=float, default=-5.0)
     parser.add_argument("--constant_density_base_resolution", type=int, default=128)
     parser.add_argument("--constant_density_scale_mode", choices=("none", "voxel_size"), default="voxel_size")
@@ -257,6 +266,67 @@ def triangle_field_channels(tensor: sp.SparseTensor) -> sp.SparseTensor:
     return tensor if tensor.feats.shape[1] == 2 else tensor.replace(tensor.feats[:, :2])
 
 
+def load_multires_density_payloads(
+    payload_dir: Path,
+    mesh_hashes: list[str],
+    supports: dict[int, list[np.ndarray]],
+    resolutions: list[int],
+) -> dict[int, list[np.ndarray]]:
+    density_by_resolution = {resolution: [] for resolution in resolutions}
+    for mesh_idx, mesh_hash in enumerate(mesh_hashes):
+        payload_path = payload_dir / f"{mesh_hash}.npz"
+        if not payload_path.exists():
+            raise FileNotFoundError(payload_path)
+        with np.load(payload_path, allow_pickle=False) as payload:
+            coords_512 = payload["coords"].astype(np.int32, copy=False)
+            density_512 = payload["density"].astype(np.float32, copy=False).reshape(-1)
+            payload_resolution = int(payload["resolution"])
+        if payload_resolution != 512:
+            raise ValueError(f"{payload_path} has resolution {payload_resolution}, expected 512")
+        if coords_512.shape != (density_512.shape[0], 3):
+            raise ValueError(
+                f"Mismatched coords/density shapes in {payload_path}: "
+                f"{coords_512.shape} vs {density_512.shape}"
+            )
+
+        for resolution in resolutions:
+            factor = 512 // resolution
+            parent_coords = coords_512 if factor == 1 else coords_512 // factor
+            unique_coords, inverse = np.unique(
+                parent_coords,
+                axis=0,
+                return_inverse=True,
+            )
+            counts = np.bincount(inverse)
+            values = np.bincount(inverse, weights=density_512) / counts
+            expected_coords = supports[resolution][mesh_idx]
+            if not np.array_equal(unique_coords, expected_coords):
+                raise ValueError(
+                    f"Density payload support does not match nested {resolution} support "
+                    f"for mesh {mesh_hash}"
+                )
+            values += 2.0 * math.log(512.0 / float(resolution))
+            density_by_resolution[resolution].append(
+                values.astype(np.float32, copy=False)[:, None]
+            )
+    return density_by_resolution
+
+
+def make_density_tensor(
+    density_by_resolution: dict[int, list[np.ndarray]],
+    resolution: int,
+    start: int,
+    end: int,
+    high_support: sp.SparseTensor,
+) -> sp.SparseTensor:
+    feats = np.concatenate(density_by_resolution[resolution][start:end], axis=0)
+    return high_support.replace(torch.as_tensor(
+        feats,
+        dtype=high_support.feats.dtype,
+        device=high_support.device,
+    ))
+
+
 def shift_mean_then_upper_clamp(
     tensor: sp.SparseTensor,
     clamp_max: float,
@@ -308,6 +378,16 @@ def main():
     if args.drop_density_conditioning and args.constant_density_conditioning:
         raise ValueError(
             "Choose --drop_density_conditioning or --constant_density_conditioning, not both"
+        )
+    if args.density_payload_dir and (
+        args.constant_density_conditioning
+        or args.drop_density_conditioning
+        or args.override_decoded_density
+        or args.decoded_density_external_condition_max is not None
+        or args.propagate_decoded_density_conditioning
+    ):
+        raise ValueError(
+            "--density_payload_dir is mutually exclusive with other density source modes"
         )
     if args.decoded_density_external_condition_max is not None and (
         args.constant_density_conditioning
@@ -366,6 +446,7 @@ def main():
     if args.density_guidance_strength is not None:
         if (
             not args.constant_density_conditioning
+            and not args.density_payload_dir
             and args.decoded_density_external_condition_max is None
             and not args.propagate_decoded_density_conditioning
         ):
@@ -405,6 +486,7 @@ def main():
         f"eval_mesh_folder_stage_repeat{args.stage_repeats}_cascade_{cascade_range}"
         f"_step{ckpt_step:07d}_cfg{args.guidance_strength:g}"
         f"{f'_densitycfg{args.density_guidance_strength:g}' if args.density_guidance_strength is not None else ''}"
+        f"{'_densitypayload' if args.density_payload_dir else ''}"
         f"{f'_densitythrough{args.density_conditioning_max_resolution}' if args.density_conditioning_max_resolution is not None else ''}"
         f"{'_densitydrop' if args.drop_density_conditioning else ''}"
         f"{f'_decodedensitycondmax{args.decoded_density_external_condition_max:g}' if args.decoded_density_external_condition_max is not None else ''}"
@@ -451,6 +533,19 @@ def main():
                 )
             supports[resolution].append(coords)
 
+    density_by_resolution = None
+    density_payload_dir = None
+    if args.density_payload_dir:
+        if not args.nested_supports:
+            raise ValueError("--density_payload_dir requires --nested_supports")
+        density_payload_dir = Path(args.density_payload_dir).resolve()
+        density_by_resolution = load_multires_density_payloads(
+            density_payload_dir,
+            mesh_hashes,
+            supports,
+            target_resolutions,
+        )
+
     trainer = build_trainer(cfg, SupportOnlyDataset(target_resolutions[0]), output_dir)
     apply_conditioning_augmentation_overrides(trainer, args)
     ckpt_path = load_encoder_checkpoint(trainer, run_dir, ckpt_step, args.ema_rate)
@@ -478,6 +573,8 @@ def main():
         density_application = "propagated_final_decoded_density_condition"
     elif args.override_decoded_density:
         density_application = "decoded_density_override"
+    elif args.density_payload_dir:
+        density_application = "external_point_density_condition"
     else:
         density_application = "external_condition"
     print(f"Density application: {density_application}")
@@ -505,6 +602,7 @@ def main():
             density_cond = None
             density_source_enabled = (
                 args.constant_density_conditioning
+                or args.density_payload_dir
                 or args.decoded_density_external_condition_max is not None
                 or args.propagate_decoded_density_conditioning
             )
@@ -515,7 +613,24 @@ def main():
                     or high_res <= args.density_conditioning_max_resolution
                 )
             )
-            if args.propagate_decoded_density_conditioning:
+            if args.density_payload_dir:
+                if density_active:
+                    density_cond = make_density_tensor(
+                        density_by_resolution,
+                        high_res,
+                        start,
+                        end,
+                        high_support,
+                    )
+                else:
+                    density_cond = constant_density_to_high(
+                        high_support,
+                        trainer.condition_drop_values["density"],
+                        high_res,
+                        high_res,
+                        "none",
+                    )
+            elif args.propagate_decoded_density_conditioning:
                 if stage_idx == 0:
                     density_cond = constant_density_to_high(
                         high_support,
@@ -710,6 +825,7 @@ def main():
         f"step{ckpt_step:07d}_stage_repeat{args.stage_repeats}_{cascade_range}"
         f"_cfg{args.guidance_strength:g}_basecfg{args.base_guidance_strength:g}"
         f"{f'_densitycfg{args.density_guidance_strength:g}' if args.density_guidance_strength is not None else ''}"
+        f"{'_densitypayload' if args.density_payload_dir else ''}"
         f"{f'_densitythrough{args.density_conditioning_max_resolution}' if args.density_conditioning_max_resolution is not None else ''}"
         f"{'_densitydrop' if args.drop_density_conditioning else ''}"
         f"{f'_decodedensitycondmax{args.decoded_density_external_condition_max:g}' if args.decoded_density_external_condition_max is not None else ''}"
@@ -799,6 +915,13 @@ def main():
         "checkpoint": ckpt_path,
         "support_cache_dir": str(cache_dir),
         "constant_density_conditioning": args.constant_density_conditioning,
+        "density_payload_dir": (
+            str(density_payload_dir) if density_payload_dir is not None else None
+        ),
+        "density_payload_downsampling": (
+            "mean 512 child densities on nested support, then +2*log(512/resolution)"
+            if density_payload_dir is not None else None
+        ),
         "constant_density_value": args.constant_density_value,
         "constant_density_base_resolution": args.constant_density_base_resolution,
         "constant_density_scale_mode": args.constant_density_scale_mode,

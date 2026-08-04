@@ -68,6 +68,19 @@ def main(local_rank, cfg):
 
     # Load data
     dataset = getattr(datasets, cfg.dataset.name)(cfg.data_dir, **cfg.dataset.args)
+    validation_dataset = None
+    if 'validation_dataset' in cfg:
+        validation_data_dir = cfg.validation_data_dir
+        if validation_data_dir is None:
+            validation_data_dir = cfg.validation_dataset.get('data_dir', None)
+        if validation_data_dir is None:
+            raise ValueError(
+                'validation_dataset requires --validation_data_dir or validation_dataset.data_dir'
+            )
+        validation_dataset = getattr(datasets, cfg.validation_dataset.name)(
+            validation_data_dir,
+            **cfg.validation_dataset.args,
+        )
 
     # Build model
     model_dict = {
@@ -84,7 +97,15 @@ def main(local_rank, cfg):
                 print(model_summary, file=fp)
 
     # Build trainer
-    trainer = getattr(trainers, cfg.trainer.name)(model_dict, dataset, **cfg.trainer.args, output_dir=cfg.output_dir, load_dir=cfg.load_dir, step=cfg.load_ckpt)
+    trainer_kwargs = dict(
+        **cfg.trainer.args,
+        output_dir=cfg.output_dir,
+        load_dir=cfg.load_dir,
+        step=cfg.load_ckpt,
+    )
+    if validation_dataset is not None:
+        trainer_kwargs['validation_dataset'] = validation_dataset
+    trainer = getattr(trainers, cfg.trainer.name)(model_dict, dataset, **trainer_kwargs)
 
     # Train
     if not cfg.tryrun:
@@ -104,6 +125,12 @@ if __name__ == '__main__':
     parser.add_argument('--load_dir', type=str, default='', help='Load directory, default to output_dir')
     parser.add_argument('--ckpt', type=str, default='latest', help='Checkpoint step to resume training, default to latest')
     parser.add_argument('--data_dir', type=str, default='./data/', help='Data directory')
+    parser.add_argument(
+        '--validation_data_dir',
+        type=str,
+        default=None,
+        help='Optional validation data roots used by configs with validation_dataset',
+    )
     parser.add_argument('--auto_retry', type=int, default=3, help='Number of retries on error')
     ## dubug
     parser.add_argument('--tryrun', action='store_true', help='Try run without training')
@@ -155,4 +182,3 @@ if __name__ == '__main__':
             except Exception as e:
                 print(f'Error: {e}')
                 print(f'Retrying ({rty + 1}/{cfg.auto_retry})...')
-            

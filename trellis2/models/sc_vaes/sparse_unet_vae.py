@@ -514,6 +514,7 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         resolution_embed_zero_init: bool = True,
         conditioning_noise_conditioning: bool = False,
         conditioning_noise_embed_scale: float = 1000.0,
+        density_statistics_conditioning: bool = False,
         latent_cond_channels: int = 0,
         latent_cond_mode: Optional[Literal['bottleneck']] = None,
         **kwargs,
@@ -526,6 +527,7 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         self.resolution_embed_zero_init = bool(resolution_embed_zero_init)
         self.conditioning_noise_conditioning = bool(conditioning_noise_conditioning)
         self.conditioning_noise_embed_scale = float(conditioning_noise_embed_scale)
+        self.density_statistics_conditioning = bool(density_statistics_conditioning)
         if self.resolution_reference <= 0:
             raise ValueError(f'resolution_reference must be positive, got {resolution_reference}')
         if self.conditioning_noise_embed_scale <= 0:
@@ -560,6 +562,15 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
                 nn.SiLU(),
                 nn.Linear(time_embed_dim, time_embed_dim),
             )
+        if self.density_statistics_conditioning:
+            self.density_statistics_embed = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(time_embed_dim + 2, time_embed_dim),
+                    nn.SiLU(),
+                    nn.Linear(time_embed_dim, time_embed_dim),
+                )
+                for _ in range(3)
+            ])
         self.film_layers = nn.ModuleList([])
         for i, res in enumerate(self.blocks):
             film_res = nn.ModuleList([])
@@ -663,6 +674,68 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         )
         return self.conditioning_noise_embed(noise_emb)
 
+    def _embed_density_statistics(
+        self,
+        density_statistics: Optional[torch.Tensor],
+        density_statistics_presence: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not self.density_statistics_conditioning:
+            return None
+        if density_statistics is None:
+            raise ValueError(
+                'density_statistics must be provided when '
+                'density_statistics_conditioning is enabled'
+            )
+        values = torch.as_tensor(
+            density_statistics,
+            device=device,
+            dtype=torch.float32,
+        ).reshape(batch_size, -1)
+        if values.shape != (batch_size, 3):
+            raise ValueError(
+                f'density_statistics must have shape ({batch_size}, 3), got {tuple(values.shape)}'
+            )
+        if density_statistics_presence is None:
+            presence = torch.ones_like(values)
+        else:
+            presence = torch.as_tensor(
+                density_statistics_presence,
+                device=device,
+                dtype=torch.float32,
+            ).reshape(batch_size, -1)
+            if presence.shape != values.shape:
+                raise ValueError(
+                    'density_statistics_presence must match density_statistics shape, got '
+                    f'{tuple(presence.shape)} and {tuple(values.shape)}'
+                )
+            if torch.any((presence < 0) | (presence > 1)):
+                raise ValueError('density_statistics_presence values must be in [0, 1]')
+        if not torch.isfinite(values).all():
+            raise ValueError('density_statistics contains non-finite values')
+
+        result = torch.zeros(
+            (batch_size, self.time_embed_dim),
+            device=device,
+            dtype=torch.float32,
+        )
+        for index, embed in enumerate(self.density_statistics_embed):
+            value = values[:, index]
+            available = presence[:, index:index + 1]
+            fourier = timestep_embedding(
+                value,
+                self.time_embed_dim,
+                self.time_embed_max_period,
+            )
+            embed_input = torch.cat([
+                fourier * available,
+                value.unsqueeze(-1) * available,
+                available,
+            ], dim=-1)
+            result = result + embed(embed_input)
+        return result
+
     @staticmethod
     def _check_matching_coords(a: sp.SparseTensor, b: sp.SparseTensor, name_a: str, name_b: str) -> None:
         if not torch.equal(a.coords, b.coords):
@@ -679,6 +752,8 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         latent_cond: Optional[sp.SparseTensor] = None,
         resolution: Optional[torch.Tensor] = None,
         conditioning_noise_level: Optional[torch.Tensor] = None,
+        density_statistics: Optional[torch.Tensor] = None,
+        density_statistics_presence: Optional[torch.Tensor] = None,
     ):
         if t.ndim != 1:
             t = t.reshape(-1)
@@ -694,6 +769,14 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         )
         if conditioning_noise_emb is not None:
             emb = emb + conditioning_noise_emb
+        density_statistics_emb = self._embed_density_statistics(
+            density_statistics,
+            density_statistics_presence,
+            t.shape[0],
+            t.device,
+        )
+        if density_statistics_emb is not None:
+            emb = emb + density_statistics_emb
 
         h = self.input_layer(x)
         h = h.type(self.dtype)

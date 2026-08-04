@@ -12,6 +12,7 @@ __attributes = {
     'TriangleFieldSuperResolutionDataset': 'triangle_field_super_resolution',
     'TriangleFieldLatentSuperResolutionDataset': 'triangle_field_super_resolution',
     'MultiResolutionTriangleFieldLatentSuperResolutionDataset': 'triangle_field_super_resolution',
+    'PointDensityMeshDataset': 'point_density_mesh',
     
     'SparseStructureLatent': 'sparse_structure_latent',
     'TextConditionedSparseStructureLatent': 'sparse_structure_latent',
@@ -53,6 +54,7 @@ if __name__ == '__main__':
     from .sparse_voxel_occupancy import SparseVoxelOccupancyDataset
     from .sparse_voxel_triangle_field import SparseVoxelTriangleFieldDataset, MultiResolutionSparseVoxelTriangleFieldDataset
     from .triangle_field_super_resolution import TriangleFieldSuperResolutionDataset, TriangleFieldLatentSuperResolutionDataset, MultiResolutionTriangleFieldLatentSuperResolutionDataset
+    from .point_density_mesh import PointDensityMeshDataset
     
     from .sparse_structure_latent import SparseStructureLatent, ImageConditionedSparseStructureLatent
     from .structured_latent import SLat, ImageConditionedSLat

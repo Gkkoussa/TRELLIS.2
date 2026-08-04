@@ -23,6 +23,13 @@ from ...utils.data_utils import (
 )
 
 
+DENSITY_STATISTIC_CONDITION_NAMES = (
+    'density_minimum',
+    'density_median',
+    'density_maximum',
+)
+
+
 class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
     """
     Decoder-constrained feature-space flow for triangle-field super-resolution.
@@ -67,6 +74,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             'field': 0.0,
             'density': 0.0,
             'elongation': 0.0,
+            **{name: 0.0 for name in DENSITY_STATISTIC_CONDITION_NAMES},
         }
         if condition_drop_values is not None:
             unknown = set(condition_drop_values) - set(self.condition_drop_values)
@@ -683,10 +691,12 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         density_cond: Optional[sp.SparseTensor] = None,
         elongation_cond: Optional[sp.SparseTensor] = None,
         force_field_drop: Optional[torch.Tensor] = None,
+        density_statistics: Optional[torch.Tensor] = None,
     ) -> Tuple[
         sp.SparseTensor,
         Optional[sp.SparseTensor],
         Optional[sp.SparseTensor],
+        Optional[torch.Tensor],
         Dict[str, torch.Tensor],
     ]:
         batch_size = cond.shape[0]
@@ -704,6 +714,22 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
                 )
             condition_names.append(name)
             conditions.append(tensor)
+        if density_statistics is not None:
+            density_statistics = torch.as_tensor(
+                density_statistics,
+                device=cond.feats.device,
+                dtype=torch.float32,
+            )
+            if density_statistics.shape != (batch_size, 3):
+                raise ValueError(
+                    f'density_statistics must have shape ({batch_size}, 3), '
+                    f'got {tuple(density_statistics.shape)}'
+                )
+            if not torch.isfinite(density_statistics).all():
+                raise ValueError('density_statistics contains non-finite values')
+            for index, name in enumerate(DENSITY_STATISTIC_CONDITION_NAMES):
+                condition_names.append(name)
+                conditions.append(density_statistics[:, index:index + 1])
 
         event = torch.rand(batch_size, device=cond.feats.device)
         drop_all = event < self.cond_drop_prob
@@ -769,15 +795,21 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             drop_masks.unbind(dim=1),
         ):
             if sample_drop.any():
-                feats = tensor.feats.clone()
-                drop_value = (
-                    0.0
-                    if getattr(self, 'scalar_condition_presence', False) and
-                    name in ('density', 'elongation')
-                    else self.condition_drop_values[name]
+                use_presence = (
+                    name in DENSITY_STATISTIC_CONDITION_NAMES or
+                    (
+                        getattr(self, 'scalar_condition_presence', False) and
+                        name in ('density', 'elongation')
+                    )
                 )
-                feats[sample_drop[tensor.coords[:, 0].long()]] = drop_value
-                tensor = tensor.replace(feats)
+                drop_value = 0.0 if use_presence else self.condition_drop_values[name]
+                if isinstance(tensor, sp.SparseTensor):
+                    feats = tensor.feats.clone()
+                    feats[sample_drop[tensor.coords[:, 0].long()]] = drop_value
+                    tensor = tensor.replace(feats)
+                else:
+                    tensor = tensor.clone()
+                    tensor[sample_drop] = drop_value
             dropped_conditions.append(tensor)
 
         masks = {
@@ -789,10 +821,17 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             for index, name in enumerate(condition_names)
         })
         dropped_by_name = dict(zip(condition_names, dropped_conditions))
+        dropped_density_statistics = None
+        if density_statistics is not None:
+            dropped_density_statistics = torch.cat([
+                dropped_by_name[name]
+                for name in DENSITY_STATISTIC_CONDITION_NAMES
+            ], dim=-1)
         return (
             dropped_by_name['field'],
             dropped_by_name.get('density'),
             dropped_by_name.get('elongation'),
+            dropped_density_statistics,
             masks,
         )
 
@@ -906,7 +945,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             high_resolution=kwargs.get('high_resolution', None),
             return_noise_level=True,
         )
-        cond, density_cond, elongation_cond, cond_drop = self._drop_conditions(
+        cond, density_cond, elongation_cond, _, cond_drop = self._drop_conditions(
             cond,
             density_cond,
             elongation_cond,
@@ -1076,6 +1115,8 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         latent_self_conditioning: dict = None,
         decoded_density_mode: str = 'none',
         scalar_condition_presence: bool = False,
+        density_statistics_relax_probability: float = 0.0,
+        density_statistics_relax_std: float = 1.5,
         batch_size_per_gpu_by_high_resolution: dict = None,
         resolution_sampling_weights: dict = None,
         **kwargs,
@@ -1088,6 +1129,10 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         self.latent_self_conditioning_upsample_factor = self.latent_self_conditioning.get('upsample_factor', None)
         self.decoded_density_mode = str(decoded_density_mode)
         self.scalar_condition_presence = bool(scalar_condition_presence)
+        self.density_statistics_relax_probability = float(
+            density_statistics_relax_probability
+        )
+        self.density_statistics_relax_std = float(density_statistics_relax_std)
         self.batch_size_per_gpu_by_high_resolution = (
             {int(key): int(value) for key, value in batch_size_per_gpu_by_high_resolution.items()}
             if batch_size_per_gpu_by_high_resolution is not None else None
@@ -1113,7 +1158,29 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 "decoded_density_mode must be 'none', 'condition', or 'state', "
                 f'got {self.decoded_density_mode}'
             )
+        if not (0.0 <= self.density_statistics_relax_probability <= 1.0):
+            raise ValueError(
+                'density_statistics_relax_probability must be in [0, 1], got '
+                f'{self.density_statistics_relax_probability}'
+            )
+        if self.density_statistics_relax_std < 0:
+            raise ValueError(
+                'density_statistics_relax_std must be non-negative, got '
+                f'{self.density_statistics_relax_std}'
+            )
         super().__init__(*args, **kwargs)
+        model_uses_statistics = bool(getattr(
+            self.models['encoder'],
+            'density_statistics_conditioning',
+            False,
+        ))
+        dataset_has_statistics = getattr(self.dataset, 'density_statistics', None) is not None
+        if model_uses_statistics != dataset_has_statistics:
+            raise ValueError(
+                'Encoder density_statistics_conditioning and dataset density_statistics_path '
+                f'must be enabled together, got {model_uses_statistics} and '
+                f'{dataset_has_statistics}'
+            )
         if (
             self.decoded_density_mode == 'condition' and
             getattr(self.dataset, 'density_conditioning', False)
@@ -1199,6 +1266,9 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             f'  - Latent self-conditioning: {self.latent_self_conditioning}',
             f'  - Decoded density mode: {self.decoded_density_mode}',
             f'  - Scalar condition presence: {self.scalar_condition_presence}',
+            '  - Density statistics relax probability: '
+            f'{self.density_statistics_relax_probability}',
+            f'  - Density statistics relax std: {self.density_statistics_relax_std}',
         ]
         if self.batch_size_per_gpu_by_high_resolution is not None:
             lines.append(
@@ -1211,6 +1281,48 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 f'{self.resolution_sampling_weights}'
             )
         return '\n'.join(lines)
+
+    def _relax_density_statistics(
+        self,
+        density_statistics: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+        if density_statistics is None:
+            return None, None
+        density_statistics = density_statistics.float()
+        if density_statistics.ndim != 2 or density_statistics.shape[1] != 3:
+            raise ValueError(
+                f'density_statistics must have shape (batch, 3), got '
+                f'{tuple(density_statistics.shape)}'
+            )
+        if not torch.isfinite(density_statistics).all():
+            raise ValueError('density_statistics contains non-finite values')
+        if torch.any(density_statistics[:, 0] > density_statistics[:, 1]) or torch.any(
+            density_statistics[:, 1] > density_statistics[:, 2]
+        ):
+            raise ValueError('density_statistics must be ordered as min <= median <= max')
+
+        relax_mask = torch.rand(
+            (density_statistics.shape[0], 2),
+            device=density_statistics.device,
+        ) < self.density_statistics_relax_probability
+        slack = (
+            torch.randn(
+                (density_statistics.shape[0], 2),
+                device=density_statistics.device,
+                dtype=torch.float32,
+            ).abs()
+            * self.density_statistics_relax_std
+            * relax_mask.float()
+        )
+        relaxed = density_statistics.clone()
+        relaxed[:, 0] -= slack[:, 0]
+        relaxed[:, 2] += slack[:, 1]
+        return relaxed, {
+            'minimum_mask': relax_mask[:, 0],
+            'maximum_mask': relax_mask[:, 1],
+            'minimum_slack': slack[:, 0],
+            'maximum_slack': slack[:, 1],
+        }
 
     def _load_latent_cache(self, cache_path: str) -> Dict[str, Any]:
         try:
@@ -1509,6 +1621,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         density_cond: Optional[sp.SparseTensor] = None,
         elongation_cond: Optional[sp.SparseTensor] = None,
         dropped_condition_names: Optional[Set[str]] = None,
+        density_statistics: Optional[torch.Tensor] = None,
     ) -> Tuple[sp.SparseTensor, Dict[str, sp.SparseTensor], Optional[torch.Tensor]]:
         x_t, density_cond = self._resolve_decoded_density(decoded, density_cond)
         if not torch.equal(x_t.coords, cond.coords):
@@ -1517,7 +1630,11 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             )
 
         dropped_condition_names = set(dropped_condition_names or ())
-        unknown = dropped_condition_names - {'density', 'elongation'}
+        unknown = dropped_condition_names - {
+            'density',
+            'elongation',
+            *DENSITY_STATISTIC_CONDITION_NAMES,
+        }
         if unknown:
             raise ValueError(f'Unknown dropped scalar conditions: {sorted(unknown)}')
         drop_masks = {}
@@ -1540,7 +1657,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 density_cond = tensor
             else:
                 elongation_cond = tensor
-        return self._build_latent_encoder_input(
+        enc_in, encoder_kwargs, latent_cond_missing = self._build_latent_encoder_input(
             z_t,
             x_t,
             cond,
@@ -1548,6 +1665,28 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             elongation_cond,
             drop_masks,
         )
+        model_uses_statistics = bool(getattr(
+            self.models['encoder'],
+            'density_statistics_conditioning',
+            False,
+        ))
+        if model_uses_statistics:
+            if density_statistics is None:
+                raise ValueError('density_statistics must be provided by the dataset')
+            density_statistics = density_statistics.float().clone()
+            presence = torch.ones_like(density_statistics)
+            for index, name in enumerate(DENSITY_STATISTIC_CONDITION_NAMES):
+                if name in dropped_condition_names:
+                    density_statistics[:, index] = 0
+                    presence[:, index] = 0
+            encoder_kwargs['density_statistics'] = density_statistics
+            encoder_kwargs['density_statistics_presence'] = presence
+        elif density_statistics is not None:
+            raise ValueError(
+                'Dataset provided density_statistics but encoder '
+                'density_statistics_conditioning is disabled'
+            )
+        return enc_in, encoder_kwargs, latent_cond_missing
 
     def training_losses(
         self,
@@ -1561,6 +1700,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         density_missing_parent_frac: torch.Tensor = None,
         elongation_cond: sp.SparseTensor = None,
         elongation_missing_parent_frac: torch.Tensor = None,
+        density_statistics: torch.Tensor = None,
         force_field_drop: torch.Tensor = None,
         high_resolution: torch.Tensor = None,
         **kwargs,
@@ -1584,11 +1724,17 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             high_resolution=high_resolution,
             return_noise_level=True,
         )
-        cond, density_cond, elongation_cond, cond_drop = self._drop_conditions(
+        true_density_statistics = density_statistics
+        density_statistics, density_statistics_relaxation = self._relax_density_statistics(
+            density_statistics
+        )
+        relaxed_density_statistics = density_statistics
+        cond, density_cond, elongation_cond, density_statistics, cond_drop = self._drop_conditions(
             cond,
             density_cond,
             elongation_cond,
             force_field_drop,
+            density_statistics,
         )
         enc_in, encoder_kwargs, latent_cond_missing = self._build_latent_encoder_input(
             z_t,
@@ -1598,6 +1744,24 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             elongation_cond,
             cond_drop,
         )
+        model_uses_statistics = bool(getattr(
+            self.models['encoder'],
+            'density_statistics_conditioning',
+            False,
+        ))
+        if model_uses_statistics:
+            if density_statistics is None:
+                raise ValueError('density_statistics must be provided by the dataset')
+            encoder_kwargs['density_statistics'] = density_statistics
+            encoder_kwargs['density_statistics_presence'] = torch.stack([
+                ~cond_drop[name]
+                for name in DENSITY_STATISTIC_CONDITION_NAMES
+            ], dim=-1)
+        elif density_statistics is not None:
+            raise ValueError(
+                'Dataset provided density_statistics but encoder '
+                'density_statistics_conditioning is disabled'
+            )
         if getattr(
             self.models['encoder'],
             'conditioning_noise_conditioning',
@@ -1634,6 +1798,26 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             status['cond/density_drop_frac'] = cond_drop['density'].float().mean()
         if 'elongation' in cond_drop:
             status['cond/elongation_drop_frac'] = cond_drop['elongation'].float().mean()
+        for name in DENSITY_STATISTIC_CONDITION_NAMES:
+            if name in cond_drop:
+                status[f'cond/{name}_drop_frac'] = cond_drop[name].float().mean()
+        if true_density_statistics is not None:
+            statistic_labels = ('minimum', 'median', 'maximum')
+            for index, label in enumerate(statistic_labels):
+                status[f'density_statistics/true_{label}_mean'] = (
+                    true_density_statistics[:, index].float().mean()
+                )
+                status[f'density_statistics/conditioned_{label}_mean'] = (
+                    relaxed_density_statistics[:, index].float().mean()
+                )
+        if density_statistics_relaxation is not None:
+            for label in ('minimum', 'maximum'):
+                status[f'density_statistics/{label}_relax_frac'] = (
+                    density_statistics_relaxation[f'{label}_mask'].float().mean()
+                )
+                status[f'density_statistics/{label}_slack_mean'] = (
+                    density_statistics_relaxation[f'{label}_slack'].mean()
+                )
         if missing_low_parent_frac is not None:
             missing_low_parent_frac = missing_low_parent_frac.float()
             status['cond/missing_low_parent_frac'] = missing_low_parent_frac.mean()
@@ -1719,6 +1903,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 snapshot_cond,
                 args.get('density_cond', None),
                 args.get('elongation_cond', None),
+                density_statistics=args.get('density_statistics', None),
             )
             if getattr(
                 self.models['encoder'],

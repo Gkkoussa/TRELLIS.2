@@ -50,6 +50,12 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         elongation_conditioning: bool = False,
         elongation_voxel_root_key: str = 'elongation_triangle_field_voxel',
         elongation_channel: str = 'elongation_field',
+        density_statistics_path: str = None,
+        density_statistics_columns: Tuple[str, str, str] = (
+            'density_field_min_128',
+            'density_field_median_128',
+            'density_field_max_128',
+        ),
         force_dropped_field_condition: bool = False,
         instances_path: str = None,
     ):
@@ -75,6 +81,8 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         self.elongation_conditioning = bool(elongation_conditioning)
         self.elongation_voxel_root_key = elongation_voxel_root_key
         self.elongation_channel = elongation_channel
+        self.density_statistics_path = density_statistics_path
+        self.density_statistics_columns = tuple(density_statistics_columns)
         self.force_dropped_field_condition = bool(force_dropped_field_condition)
         self.instances_path = instances_path
         if self.density_conditioning and self.elongation_conditioning:
@@ -103,6 +111,7 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         super().__init__(roots)
         self._filter_paired_instances()
         self._filter_instances_path()
+        self._load_density_statistics()
         self.loads = [
             self.metadata.loc[sha256, self.num_voxels_column]
             if self.num_voxels_column in self.metadata.columns else 1
@@ -124,9 +133,58 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
             f'  - Elongation conditioning: {self.elongation_conditioning}',
             f'  - Elongation voxel root key: {self.elongation_voxel_root_key}',
             f'  - Elongation channel: {self.elongation_channel}',
+            f'  - Density statistics path: {self.density_statistics_path}',
+            f'  - Density statistics columns: {self.density_statistics_columns}',
             f'  - Force dropped field condition: {self.force_dropped_field_condition}',
         ]
         return '\n'.join(lines)
+
+    def _load_density_statistics(self) -> None:
+        self.density_statistics = None
+        if self.density_statistics_path is None:
+            return
+        if not os.path.exists(self.density_statistics_path):
+            raise FileNotFoundError(
+                f'density_statistics_path not found: {self.density_statistics_path}'
+            )
+        if len(self.density_statistics_columns) != 3:
+            raise ValueError(
+                'density_statistics_columns must contain min, median, and max columns, '
+                f'got {self.density_statistics_columns}'
+            )
+        frame = pd.read_csv(self.density_statistics_path)
+        required = {'sha256', *self.density_statistics_columns}
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(
+                f'{self.density_statistics_path} is missing columns: {sorted(missing)}'
+            )
+        if frame['sha256'].duplicated().any():
+            raise ValueError(f'{self.density_statistics_path} contains duplicate sha256 rows')
+        frame = frame.set_index('sha256').loc[:, list(self.density_statistics_columns)]
+        values = frame.to_numpy(dtype=np.float32, copy=True)
+        if not np.isfinite(values).all():
+            raise ValueError(f'{self.density_statistics_path} contains non-finite values')
+        self.density_statistics = pd.DataFrame(
+            values,
+            index=frame.index.astype(str),
+            columns=self.density_statistics_columns,
+        )
+        keep = set(self.density_statistics.index)
+        self.instances = [
+            (root, sha256) for root, sha256 in self.instances if sha256 in keep
+        ]
+        if len(self.metadata) > 0:
+            self.metadata = self.metadata[self.metadata.index.astype(str).isin(keep)]
+        for stats in self._stats.values():
+            stats['Matched density statistics'] = len(self.instances)
+
+    def _get_density_statistics(self, instance: str) -> Optional[torch.Tensor]:
+        if self.density_statistics is None:
+            return None
+        return torch.from_numpy(
+            self.density_statistics.loc[instance].to_numpy(dtype=np.float32, copy=True)
+        )
 
     def _filter_instances_path(self) -> None:
         if self.instances_path is None:
@@ -485,6 +543,9 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
                 elongation_missing_frac,
                 dtype=torch.float32,
             )
+        density_statistics = self._get_density_statistics(instance)
+        if density_statistics is not None:
+            pack['density_statistics'] = density_statistics
         return pack
 
     @staticmethod
@@ -688,6 +749,9 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
                 elongation_missing_frac,
                 dtype=torch.float32,
             )
+        density_statistics = self._get_density_statistics(instance)
+        if density_statistics is not None:
+            pack['density_statistics'] = density_statistics
         pack['triangle_field_slat_cache_path'] = cache_path
         pack['triangle_field_slat_cache'] = self._read_latent_cache(cache_path)
         return pack

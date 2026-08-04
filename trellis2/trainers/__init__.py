@@ -21,6 +21,7 @@ __attributes = {
     'MultiImageConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
     'TriangleFieldSuperResolutionFlowTrainer': 'flow_matching.triangle_field_super_resolution',
     'TriangleFieldLatentSuperResolutionFlowTrainer': 'flow_matching.triangle_field_super_resolution',
+    'PointDensityFlowTrainer': 'flow_matching.point_density_flow',
     
     'DinoV2FeatureExtractor': 'flow_matching.mixins.image_conditioned',
     'DinoV3FeatureExtractor': 'flow_matching.mixins.image_conditioned',
@@ -68,6 +69,7 @@ if __name__ == '__main__':
         ImageConditionedSparseFlowMatchingCFGTrainer,
     )
     from .flow_matching.triangle_field_super_resolution import TriangleFieldSuperResolutionFlowTrainer, TriangleFieldLatentSuperResolutionFlowTrainer
+    from .flow_matching.point_density_flow import PointDensityFlowTrainer
     
     from .flow_matching.mixins.image_conditioned import (
         DinoV2FeatureExtractor,

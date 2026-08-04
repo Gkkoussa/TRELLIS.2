@@ -15,7 +15,10 @@ __attributes = {
     'SparseUnetVaeDecoder': 'sc_vaes.sparse_unet_vae',
     'SparseUNetDiTFlowModel': 'sc_vaes.sparse_unet_dit_flow',
     'FlexiDualGridVaeEncoder': 'sc_vaes.fdg_vae',
-    'FlexiDualGridVaeDecoder': 'sc_vaes.fdg_vae'
+    'FlexiDualGridVaeDecoder': 'sc_vaes.fdg_vae',
+
+    # Point Density Flow
+    'HunyuanPointDensityFlowModel': 'point_density_flow',
 }
 
 __submodules = []
@@ -78,3 +81,4 @@ if __name__ == '__main__':
     from .sc_vaes.sparse_unet_vae import SparseUnetVaeEncoder, SparseUnetVaeDecoder
     from .sc_vaes.sparse_unet_dit_flow import SparseUNetDiTFlowModel
     from .sc_vaes.fdg_vae import FlexiDualGridVaeEncoder, FlexiDualGridVaeDecoder
+    from .point_density_flow import HunyuanPointDensityFlowModel
