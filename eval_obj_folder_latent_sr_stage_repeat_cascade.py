@@ -29,10 +29,11 @@ from eval_triangle_field_latent_sr_stage_repeat_cascade import (
 
 
 class SupportOnlyDataset(SparseVoxelTriangleFieldVisMixin):
-    def __init__(self, resolution: int):
+    def __init__(self, resolution: int, density_statistics_conditioning: bool = False):
         self.resolution = int(resolution)
         self.distance_transform = "minus_one_one"
         self.loads = [1]
+        self.density_statistics = object() if density_statistics_conditioning else None
 
     def __len__(self):
         return 1
@@ -165,6 +166,17 @@ def parse_args():
     parser.add_argument("--constant_elongation_value", type=float, default=0.0)
     parser.add_argument("--elongation_guidance_strength", type=float, default=None)
     parser.add_argument("--drop_elongation_conditioning", action="store_true")
+    parser.add_argument("--density_stat_minimum", type=float, default=None)
+    parser.add_argument("--density_stat_minimum_guidance_strength", type=float, default=None)
+    parser.add_argument("--density_stat_median", type=float, default=None)
+    parser.add_argument("--density_stat_maximum", type=float, default=None)
+    parser.add_argument("--density_stat_maximum_guidance_strength", type=float, default=None)
+    parser.add_argument("--density_statistics_base_resolution", type=int, default=128)
+    parser.add_argument(
+        "--density_statistics_scale_mode",
+        choices=("none", "voxel_size"),
+        default="voxel_size",
+    )
     parser.add_argument(
         "--elongation_conditioning_max_resolution",
         type=int,
@@ -439,6 +451,32 @@ def main():
         raise ValueError(
             "--decoded_density_external_condition_base_resolution must be positive"
         )
+    if args.density_statistics_base_resolution <= 0:
+        raise ValueError("--density_statistics_base_resolution must be positive")
+    if args.density_stat_minimum_guidance_strength is not None:
+        if args.density_stat_minimum is None:
+            raise ValueError(
+                "--density_stat_minimum_guidance_strength requires --density_stat_minimum"
+            )
+        if (
+            args.base_guidance_strength not in (0.0, 1.0)
+            or args.guidance_strength not in (0.0, 1.0)
+        ):
+            raise ValueError(
+                "Density-minimum CFG requires low-resolution guidance strengths of 0 or 1"
+            )
+    if args.density_stat_maximum_guidance_strength is not None:
+        if args.density_stat_maximum is None:
+            raise ValueError(
+                "--density_stat_maximum_guidance_strength requires --density_stat_maximum"
+            )
+        if (
+            args.base_guidance_strength not in (0.0, 1.0)
+            or args.guidance_strength not in (0.0, 1.0)
+        ):
+            raise ValueError(
+                "Density-maximum CFG requires low-resolution guidance strengths of 0 or 1"
+            )
     if args.drop_elongation_conditioning and args.constant_elongation_conditioning:
         raise ValueError(
             "Choose --drop_elongation_conditioning or --constant_elongation_conditioning, not both"
@@ -467,6 +505,19 @@ def main():
             raise ValueError(
                 "Elongation-only CFG requires low-resolution guidance strengths of 0 or 1"
             )
+    scalar_guidance_strengths = [
+        strength
+        for strength in (
+            args.elongation_guidance_strength,
+            args.density_stat_minimum_guidance_strength,
+            args.density_stat_maximum_guidance_strength,
+        )
+        if strength is not None
+    ]
+    if len(set(scalar_guidance_strengths)) > 1:
+        raise ValueError(
+            "Joint elongation and density-statistic CFG requires equal guidance strengths"
+        )
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
@@ -474,6 +525,26 @@ def main():
     run_dir = Path(args.run_dir).resolve()
     cfg = load_config(run_dir)
     cfg["trainer"]["args"].pop("batch_size_per_gpu_by_high_resolution", None)
+    model_uses_density_statistics = bool(
+        cfg["models"]["encoder"]["args"].get("density_statistics_conditioning", False)
+    )
+    requested_density_statistics = (
+        args.density_stat_minimum,
+        args.density_stat_median,
+        args.density_stat_maximum,
+    )
+    if any(value is not None for value in requested_density_statistics) and not model_uses_density_statistics:
+        raise ValueError("Density statistics were provided, but the encoder does not use them")
+    density_statistics_suffix = ""
+    if model_uses_density_statistics:
+        density_statistics_suffix = (
+            f"{f'_densitymin{args.density_stat_minimum:g}' if args.density_stat_minimum is not None else '_densitymindrop'}"
+            f"{f'_densitymincfg{args.density_stat_minimum_guidance_strength:g}' if args.density_stat_minimum_guidance_strength is not None else ''}"
+            f"{f'_densitymedian{args.density_stat_median:g}' if args.density_stat_median is not None else '_densitymediandrop'}"
+            f"{f'_densitymax{args.density_stat_maximum:g}' if args.density_stat_maximum is not None else '_densitymaxdrop'}"
+            f"{f'_densitymaxcfg{args.density_stat_maximum_guidance_strength:g}' if args.density_stat_maximum_guidance_strength is not None else ''}"
+            f"{'_densitystatsvoxelscale' if args.density_statistics_scale_mode == 'voxel_size' else ''}"
+        )
     ckpt_step = find_ckpt_step(run_dir, args.ckpt)
     stages = []
     low_resolution = args.start_resolution
@@ -497,6 +568,7 @@ def main():
         f"{f'_elongcfg{args.elongation_guidance_strength:g}' if args.elongation_guidance_strength is not None else ''}"
         f"{f'_elongthrough{args.elongation_conditioning_max_resolution}' if args.elongation_conditioning_max_resolution is not None else ''}"
         f"{'_elongdrop' if args.drop_elongation_conditioning else ''}"
+        f"{density_statistics_suffix}"
         f"{'_nested_supports' if args.nested_supports else ''}"
         f"{f'_earlyrepeat{args.early_stage_repeats}through{args.early_stage_repeats_through_resolution}' if args.early_stage_repeats is not None else ''}"
         f"_basecfg{args.base_guidance_strength:g}_steps{args.steps}"
@@ -546,7 +618,14 @@ def main():
             target_resolutions,
         )
 
-    trainer = build_trainer(cfg, SupportOnlyDataset(target_resolutions[0]), output_dir)
+    trainer = build_trainer(
+        cfg,
+        SupportOnlyDataset(
+            target_resolutions[0],
+            density_statistics_conditioning=model_uses_density_statistics,
+        ),
+        output_dir,
+    )
     apply_conditioning_augmentation_overrides(trainer, args)
     ckpt_path = load_encoder_checkpoint(trainer, run_dir, ckpt_step, args.ema_rate)
     latent_channels = int(cfg["models"]["encoder"]["args"]["latent_channels"])
@@ -718,6 +797,24 @@ def main():
                 ))
             density_guidance = args.density_guidance_strength if density_active else None
             elongation_guidance = args.elongation_guidance_strength if elongation_active else None
+            density_statistics = None
+            if model_uses_density_statistics:
+                density_statistics_shift = (
+                    2.0
+                    * math.log(
+                        float(high_res) / float(args.density_statistics_base_resolution)
+                    )
+                    if args.density_statistics_scale_mode == "voxel_size"
+                    else 0.0
+                )
+                density_statistics = torch.tensor(
+                    [
+                        0.0 if value is None else value - density_statistics_shift
+                        for value in requested_density_statistics
+                    ],
+                    dtype=torch.float32,
+                    device=trainer.device,
+                ).reshape(1, 3).expand(high_support.shape[0], -1)
             always_dropped_condition_names = {
                 name
                 for name, dropped in (
@@ -730,6 +827,14 @@ def main():
                 )
                 if dropped
             }
+            always_dropped_condition_names.update(
+                name
+                for name, value in zip(
+                    ("density_minimum", "density_median", "density_maximum"),
+                    requested_density_statistics,
+                )
+                if model_uses_density_statistics and value is None
+            )
 
             prefix = f"stage{low_res}to{high_res}"
             sample = None
@@ -759,6 +864,13 @@ def main():
                     always_dropped_condition_names,
                     decoded_density_external_condition_max,
                     high_resolution=high_res,
+                    density_statistics=density_statistics,
+                    density_stat_minimum_guidance_strength=(
+                        args.density_stat_minimum_guidance_strength
+                    ),
+                    density_stat_maximum_guidance_strength=(
+                        args.density_stat_maximum_guidance_strength
+                    ),
                 )
                 add_visuals(images, visualizer, f"{prefix}_iter{repeat_num}_cond", cond)
                 add_visuals(images, visualizer, f"{prefix}_iter{repeat_num}_sample", sample)
@@ -835,6 +947,7 @@ def main():
         f"{f'_elong{args.constant_elongation_value:g}' if args.constant_elongation_conditioning else ''}"
         f"{f'_elongcfg{args.elongation_guidance_strength:g}' if args.elongation_guidance_strength is not None else ''}"
         f"{f'_elongthrough{args.elongation_conditioning_max_resolution}' if args.elongation_conditioning_max_resolution is not None else ''}"
+        f"{density_statistics_suffix}"
         f"{f'_earlyrepeat{args.early_stage_repeats}through{args.early_stage_repeats_through_resolution}' if args.early_stage_repeats is not None else ''}"
     )
     for name, chunks in images.items():
@@ -912,6 +1025,38 @@ def main():
         "density_conditioning_max_resolution": args.density_conditioning_max_resolution,
         "elongation_guidance_strength": args.elongation_guidance_strength,
         "elongation_conditioning_max_resolution": args.elongation_conditioning_max_resolution,
+        "density_statistics": {
+            "minimum": args.density_stat_minimum,
+            "minimum_guidance_strength": args.density_stat_minimum_guidance_strength,
+            "median": args.density_stat_median,
+            "maximum": args.density_stat_maximum,
+            "maximum_guidance_strength": args.density_stat_maximum_guidance_strength,
+            "base_resolution": args.density_statistics_base_resolution,
+            "scale_mode": args.density_statistics_scale_mode,
+            "values_by_stage": {
+                str(high_resolution): {
+                    name: (
+                        None
+                        if value is None
+                        else value
+                        - (
+                            2.0
+                            * math.log(
+                                float(high_resolution)
+                                / float(args.density_statistics_base_resolution)
+                            )
+                            if args.density_statistics_scale_mode == "voxel_size"
+                            else 0.0
+                        )
+                    )
+                    for name, value in zip(
+                        ("minimum", "median", "maximum"),
+                        requested_density_statistics,
+                    )
+                }
+                for _, high_resolution in stages
+            },
+        },
         "checkpoint": ckpt_path,
         "support_cache_dir": str(cache_dir),
         "constant_density_conditioning": args.constant_density_conditioning,

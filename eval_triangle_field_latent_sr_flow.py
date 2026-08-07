@@ -383,6 +383,7 @@ def predict_z0(
     decoded_density_external_condition_max: float | None = None,
     high_resolution: int | torch.Tensor | None = None,
     conditioning_noise_level: torch.Tensor | None = None,
+    density_statistics: torch.Tensor | None = None,
 ) -> sp.SparseTensor:
     decoded = trainer._decode_latents_with_cache(z_t, caches=caches, cache_paths=cache_paths)
     if decoded_density_override is not None:
@@ -422,6 +423,7 @@ def predict_z0(
         density_cond,
         elongation_cond,
         dropped_condition_names,
+        density_statistics=density_statistics,
     )
     batch_t = torch.full((z_t.shape[0],), t * 1000.0, device=z_t.feats.device, dtype=torch.float32)
     if getattr(trainer.models["encoder"], "conditioning_noise_conditioning", False):
@@ -456,6 +458,9 @@ def sample_latent_sr(
     always_dropped_condition_names: set[str] | None = None,
     decoded_density_external_condition_max: float | None = None,
     high_resolution: int | torch.Tensor | None = None,
+    density_statistics: torch.Tensor | None = None,
+    density_stat_minimum_guidance_strength: float | None = None,
+    density_stat_maximum_guidance_strength: float | None = None,
 ):
     decoded_density_condition = getattr(trainer, "decoded_density_mode", "none") == "condition"
     decoded_density_state = getattr(trainer, "decoded_density_mode", "none") == "state"
@@ -486,9 +491,25 @@ def sample_latent_sr(
         for name, condition, strength in (
             ("density", density_cond, density_guidance_strength),
             ("elongation", elongation_cond, elongation_guidance_strength),
+            (
+                "density_minimum",
+                density_statistics,
+                density_stat_minimum_guidance_strength,
+            ),
+            (
+                "density_maximum",
+                density_statistics,
+                density_stat_maximum_guidance_strength,
+            ),
         )
         if strength is not None
     }
+    guided_but_dropped = set(guided_conditions) & always_dropped_condition_names
+    if guided_but_dropped:
+        raise ValueError(
+            "Guided conditions cannot also be permanently dropped: "
+            f"{sorted(guided_but_dropped)}"
+        )
     guided_strength = next(
         (strength for _, strength in guided_conditions.values()),
         None,
@@ -539,6 +560,7 @@ def sample_latent_sr(
                 decoded_density_external_condition_max=decoded_density_external_condition_max,
                 high_resolution=high_resolution,
                 conditioning_noise_level=conditioning_noise_level,
+                density_statistics=density_statistics,
             )
             if guided_strength == 1.0:
                 pred_z0 = pred_pos
@@ -551,6 +573,7 @@ def sample_latent_sr(
                     decoded_density_external_condition_max=decoded_density_external_condition_max,
                     high_resolution=high_resolution,
                     conditioning_noise_level=conditioning_noise_level,
+                    density_statistics=density_statistics,
                 )
                 pred_z0 = pred_pos.replace(
                     guided_strength * pred_pos.feats
@@ -565,6 +588,7 @@ def sample_latent_sr(
                 decoded_density_external_condition_max=decoded_density_external_condition_max,
                 high_resolution=high_resolution,
                 conditioning_noise_level=conditioning_noise_level,
+                density_statistics=density_statistics,
             )
         else:
             pred_pos = predict_z0(
@@ -575,6 +599,7 @@ def sample_latent_sr(
                 decoded_density_external_condition_max=decoded_density_external_condition_max,
                 high_resolution=high_resolution,
                 conditioning_noise_level=conditioning_noise_level,
+                density_statistics=density_statistics,
             )
         if not guided_conditions and guidance_strength == 1.0:
             pred_z0 = pred_pos
@@ -587,6 +612,7 @@ def sample_latent_sr(
                 decoded_density_external_condition_max=decoded_density_external_condition_max,
                 high_resolution=high_resolution,
                 conditioning_noise_level=conditioning_noise_level,
+                density_statistics=density_statistics,
             )
             pred_z0 = pred_pos.replace(
                 guidance_strength * pred_pos.feats + (1.0 - guidance_strength) * pred_neg.feats

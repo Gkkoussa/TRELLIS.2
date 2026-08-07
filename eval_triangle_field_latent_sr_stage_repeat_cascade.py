@@ -203,6 +203,9 @@ def run_stage(
     always_dropped_condition_names: set[str] | None = None,
     decoded_density_external_condition_max: float | None = None,
     high_resolution: int | None = None,
+    density_statistics: torch.Tensor | None = None,
+    density_stat_minimum_guidance_strength: float | None = None,
+    density_stat_maximum_guidance_strength: float | None = None,
 ):
     z_0, caches = build_support_latents(data["x_0"], latent_channels)
     sample_z, pred_z0_last = sample_latent_sr(
@@ -221,7 +224,10 @@ def run_stage(
         override_decoded_density,
         always_dropped_condition_names,
         decoded_density_external_condition_max,
-        high_resolution,
+        high_resolution=high_resolution,
+        density_statistics=density_statistics,
+        density_stat_minimum_guidance_strength=density_stat_minimum_guidance_strength,
+        density_stat_maximum_guidance_strength=density_stat_maximum_guidance_strength,
     )
     sample = trainer._decode_latents_with_cache(sample_z, caches=caches)
     pred_last = trainer._decode_latents_with_cache(pred_z0_last, caches=caches)

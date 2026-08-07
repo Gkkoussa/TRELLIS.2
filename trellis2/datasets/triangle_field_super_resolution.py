@@ -2,6 +2,7 @@ from typing import *
 
 import bisect
 import json
+import math
 import os
 import torch
 import numpy as np
@@ -56,6 +57,7 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
             'density_field_median_128',
             'density_field_max_128',
         ),
+        density_statistics_reference_resolution: float = None,
         force_dropped_field_condition: bool = False,
         instances_path: str = None,
     ):
@@ -83,6 +85,15 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         self.elongation_channel = elongation_channel
         self.density_statistics_path = density_statistics_path
         self.density_statistics_columns = tuple(density_statistics_columns)
+        self.density_statistics_reference_resolution = density_statistics_reference_resolution
+        if (
+            self.density_statistics_reference_resolution is not None
+            and self.density_statistics_reference_resolution <= 0
+        ):
+            raise ValueError(
+                'density_statistics_reference_resolution must be positive, got '
+                f'{self.density_statistics_reference_resolution}'
+            )
         self.force_dropped_field_condition = bool(force_dropped_field_condition)
         self.instances_path = instances_path
         if self.density_conditioning and self.elongation_conditioning:
@@ -135,6 +146,8 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
             f'  - Elongation channel: {self.elongation_channel}',
             f'  - Density statistics path: {self.density_statistics_path}',
             f'  - Density statistics columns: {self.density_statistics_columns}',
+            f'  - Density statistics reference resolution: '
+            f'{self.density_statistics_reference_resolution}',
             f'  - Force dropped field condition: {self.force_dropped_field_condition}',
         ]
         return '\n'.join(lines)
@@ -182,9 +195,14 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
     def _get_density_statistics(self, instance: str) -> Optional[torch.Tensor]:
         if self.density_statistics is None:
             return None
-        return torch.from_numpy(
+        statistics = torch.from_numpy(
             self.density_statistics.loc[instance].to_numpy(dtype=np.float32, copy=True)
         )
+        if self.density_statistics_reference_resolution is not None:
+            statistics -= 2.0 * math.log(
+                self.high_resolution / self.density_statistics_reference_resolution
+            )
+        return statistics
 
     def _filter_instances_path(self) -> None:
         if self.instances_path is None:
@@ -845,6 +863,7 @@ class MultiResolutionTriangleFieldLatentSuperResolutionDataset(SparseVoxelTriang
         self.distance_transform = self.datasets[0].distance_transform
         self.density_conditioning = density_conditioning
         self.elongation_conditioning = elongation_conditioning
+        self.density_statistics = self.datasets[0].density_statistics
         self._datasets_by_high_resolution = {
             dataset.high_resolution: dataset for dataset in self.datasets
         }
