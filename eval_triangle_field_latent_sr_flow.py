@@ -33,6 +33,8 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--steps", type=int, default=12)
     parser.add_argument("--guidance_strength", type=float, default=3.0)
+    parser.add_argument("--shape_guidance_strength", type=float, default=None)
+    parser.add_argument("--drop_shape_conditioning", action="store_true")
     parser.add_argument(
         "--apply_conditioning_augmentation",
         action="store_true",
@@ -169,6 +171,8 @@ def build_data_dir(
             "high_triangle_field_voxel": str(triangle_field_voxel_root(high_resolution)),
         }
     }
+    if cfg["models"]["encoder"]["args"].get("shape_conditioning", None) is not None:
+        data_dir["objxl4k_filtered"]["mesh"] = str(root)
     if require_latents:
         data_dir["objxl4k_filtered"]["triangle_field_latent"] = str(latent_root)
     return attach_eval_metadata_filter(data_dir, root, split, args)
@@ -382,8 +386,10 @@ def predict_z0(
     decoded_density_override: sp.SparseTensor | None = None,
     decoded_density_external_condition_max: float | None = None,
     high_resolution: int | torch.Tensor | None = None,
+    resolution_condition: int | float | torch.Tensor | None = None,
     conditioning_noise_level: torch.Tensor | None = None,
     density_statistics: torch.Tensor | None = None,
+    shape_tokens: torch.Tensor | None = None,
 ) -> sp.SparseTensor:
     decoded = trainer._decode_latents_with_cache(z_t, caches=caches, cache_paths=cache_paths)
     if decoded_density_override is not None:
@@ -424,6 +430,7 @@ def predict_z0(
         elongation_cond,
         dropped_condition_names,
         density_statistics=density_statistics,
+        shape_tokens=shape_tokens,
     )
     batch_t = torch.full((z_t.shape[0],), t * 1000.0, device=z_t.feats.device, dtype=torch.float32)
     if getattr(trainer.models["encoder"], "conditioning_noise_conditioning", False):
@@ -433,6 +440,7 @@ def predict_z0(
         batch_t,
         sample_posterior=False,
         resolution=high_resolution,
+        resolution_condition=resolution_condition,
         **encoder_kwargs,
     )
     if not torch.equal(pred_z0.coords, z_t.coords):
@@ -458,9 +466,15 @@ def sample_latent_sr(
     always_dropped_condition_names: set[str] | None = None,
     decoded_density_external_condition_max: float | None = None,
     high_resolution: int | torch.Tensor | None = None,
+    resolution_condition: int | float | torch.Tensor | None = None,
     density_statistics: torch.Tensor | None = None,
     density_stat_minimum_guidance_strength: float | None = None,
+    density_stat_median_guidance_strength: float | None = None,
     density_stat_maximum_guidance_strength: float | None = None,
+    shape_points: torch.Tensor | None = None,
+    shape_normals: torch.Tensor | None = None,
+    shape_tokens: torch.Tensor | None = None,
+    shape_guidance_strength: float | None = None,
 ):
     decoded_density_condition = getattr(trainer, "decoded_density_mode", "none") == "condition"
     decoded_density_state = getattr(trainer, "decoded_density_mode", "none") == "state"
@@ -486,6 +500,19 @@ def sample_latent_sr(
             )
     decoded_density_override = density_cond if override_decoded_density else None
     model_density_cond = None if override_decoded_density else density_cond
+    model_uses_shape = bool(getattr(trainer.models["encoder"], "shape_conditioning", False))
+    if shape_tokens is not None and (shape_points is not None or shape_normals is not None):
+        raise ValueError("Provide cached shape_tokens or raw shape geometry, not both")
+    if shape_tokens is None and shape_points is not None:
+        if shape_normals is None:
+            raise ValueError("shape_normals are required with shape_points")
+        shape_tokens = trainer.models["encoder"].encode_shape(
+            shape_points,
+            shape_normals,
+            random_start_point=False,
+        )
+    if model_uses_shape and shape_tokens is None:
+        raise ValueError("Shape-conditioned evaluation requires shape geometry or cached tokens")
     guided_conditions = {
         name: (condition, strength)
         for name, condition, strength in (
@@ -497,10 +524,16 @@ def sample_latent_sr(
                 density_stat_minimum_guidance_strength,
             ),
             (
+                "density_median",
+                density_statistics,
+                density_stat_median_guidance_strength,
+            ),
+            (
                 "density_maximum",
                 density_statistics,
                 density_stat_maximum_guidance_strength,
             ),
+            ("shape", shape_tokens, shape_guidance_strength),
         )
         if strength is not None
     }
@@ -559,8 +592,10 @@ def sample_latent_sr(
                 decoded_density_override=decoded_density_override,
                 decoded_density_external_condition_max=decoded_density_external_condition_max,
                 high_resolution=high_resolution,
+                resolution_condition=resolution_condition,
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
+                shape_tokens=shape_tokens,
             )
             if guided_strength == 1.0:
                 pred_z0 = pred_pos
@@ -572,8 +607,10 @@ def sample_latent_sr(
                     decoded_density_override=decoded_density_override,
                     decoded_density_external_condition_max=decoded_density_external_condition_max,
                     high_resolution=high_resolution,
+                    resolution_condition=resolution_condition,
                     conditioning_noise_level=conditioning_noise_level,
                     density_statistics=density_statistics,
+                    shape_tokens=shape_tokens,
                 )
                 pred_z0 = pred_pos.replace(
                     guided_strength * pred_pos.feats
@@ -587,8 +624,10 @@ def sample_latent_sr(
                 decoded_density_override=decoded_density_override,
                 decoded_density_external_condition_max=decoded_density_external_condition_max,
                 high_resolution=high_resolution,
+                resolution_condition=resolution_condition,
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
+                shape_tokens=shape_tokens,
             )
         else:
             pred_pos = predict_z0(
@@ -598,8 +637,10 @@ def sample_latent_sr(
                 decoded_density_override=decoded_density_override,
                 decoded_density_external_condition_max=decoded_density_external_condition_max,
                 high_resolution=high_resolution,
+                resolution_condition=resolution_condition,
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
+                shape_tokens=shape_tokens,
             )
         if not guided_conditions and guidance_strength == 1.0:
             pred_z0 = pred_pos
@@ -611,8 +652,10 @@ def sample_latent_sr(
                 decoded_density_override=decoded_density_override,
                 decoded_density_external_condition_max=decoded_density_external_condition_max,
                 high_resolution=high_resolution,
+                resolution_condition=resolution_condition,
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
+                shape_tokens=shape_tokens,
             )
             pred_z0 = pred_pos.replace(
                 guidance_strength * pred_pos.feats + (1.0 - guidance_strength) * pred_neg.feats
@@ -638,6 +681,18 @@ def main():
     root = Path(args.root).resolve()
     cfg = load_config(run_dir)
     ckpt_step = find_ckpt_step(run_dir, args.ckpt)
+    model_uses_shape = (
+        cfg["models"]["encoder"]["args"].get("shape_conditioning", None)
+        is not None
+    )
+    if args.shape_guidance_strength is not None and not model_uses_shape:
+        raise ValueError("--shape_guidance_strength requires a shape-conditioned model")
+    if args.drop_shape_conditioning and not model_uses_shape:
+        raise ValueError("--drop_shape_conditioning requires a shape-conditioned model")
+    if args.drop_shape_conditioning and args.shape_guidance_strength is not None:
+        raise ValueError(
+            "--drop_shape_conditioning and --shape_guidance_strength are mutually exclusive"
+        )
     output_dir = (
         Path(args.output_dir).resolve()
         if args.output_dir is not None
@@ -646,6 +701,8 @@ def main():
             f"eval_filtered_{args.split}_{args.low_resolution}to{args.high_resolution}"
             f"{'_support_only' if args.no_latents else ''}"
             f"_latent_flow_sampling_step{ckpt_step:07d}_cfg{args.guidance_strength:g}_n{args.num_samples}"
+            f"{f'_shapecfg{args.shape_guidance_strength:g}' if args.shape_guidance_strength is not None else ''}"
+            f"{'_shapedrop' if args.drop_shape_conditioning else ''}"
         )
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -687,7 +744,13 @@ def main():
             args.guidance_strength,
             args.apply_conditioning_augmentation,
             data.get("density_cond", None),
+            always_dropped_condition_names=(
+                {"shape"} if args.drop_shape_conditioning else None
+            ),
             high_resolution=args.high_resolution,
+            shape_points=data.get("shape_points", None),
+            shape_normals=data.get("shape_normals", None),
+            shape_guidance_strength=args.shape_guidance_strength,
         )
         gt = data["x_0"] if args.no_latents else trainer._decode_latents_with_cache(data["z_0"], caches=caches, cache_paths=cache_paths)
         sample = trainer._decode_latents_with_cache(sample_z, caches=caches, cache_paths=cache_paths)
@@ -719,6 +782,8 @@ def main():
         "num_workers": args.num_workers,
         "steps": args.steps,
         "guidance_strength": args.guidance_strength,
+        "shape_guidance_strength": args.shape_guidance_strength,
+        "drop_shape_conditioning": args.drop_shape_conditioning,
         "apply_conditioning_augmentation": args.apply_conditioning_augmentation,
         "conditioning_augmentation": getattr(trainer, "conditioning_augmentation", None),
         "low_resolution": args.low_resolution,

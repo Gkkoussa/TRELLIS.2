@@ -45,8 +45,10 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         decoder_model: dict,
         decoder_ckpt: str,
         num_workers: int = None,
+        dataloader_multiprocessing_context: str = None,
         cond_drop_prob: float = 0.1,
         cond_partial_drop_prob: float = 0.0,
+        cond_independent_drop_prob: float = None,
         cfg_drop_field_condition: bool = True,
         condition_drop_values: dict = None,
         loss_type: str = 'l1',
@@ -67,13 +69,20 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         self.decoder_model_config = decoder_model
         self.decoder_ckpt = decoder_ckpt
         self.num_workers = num_workers
+        self.dataloader_multiprocessing_context = dataloader_multiprocessing_context
         self.cond_drop_prob = float(cond_drop_prob)
         self.cond_partial_drop_prob = float(cond_partial_drop_prob)
+        self.cond_independent_drop_prob = (
+            None
+            if cond_independent_drop_prob is None
+            else float(cond_independent_drop_prob)
+        )
         self.cfg_drop_field_condition = bool(cfg_drop_field_condition)
         self.condition_drop_values = {
             'field': 0.0,
             'density': 0.0,
             'elongation': 0.0,
+            'shape': 0.0,
             **{name: 0.0 for name in DENSITY_STATISTIC_CONDITION_NAMES},
         }
         if condition_drop_values is not None:
@@ -157,6 +166,21 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             raise ValueError(
                 f'cond_partial_drop_prob must be in [0, 1], got {self.cond_partial_drop_prob}'
             )
+        if (
+            self.cond_independent_drop_prob is not None
+            and not 0.0 <= self.cond_independent_drop_prob <= 1.0
+        ):
+            raise ValueError(
+                'cond_independent_drop_prob must be in [0, 1], got '
+                f'{self.cond_independent_drop_prob}'
+            )
+        if (
+            self.cond_independent_drop_prob is not None
+            and self.cond_partial_drop_prob != 0.0
+        ):
+            raise ValueError(
+                'cond_independent_drop_prob and cond_partial_drop_prob are mutually exclusive'
+            )
         if self.cond_drop_prob + self.cond_partial_drop_prob > 1.0:
             raise ValueError(
                 'cond_drop_prob + cond_partial_drop_prob must be <= 1, got '
@@ -211,6 +235,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             f'  - Decoder checkpoint: {self.decoder_ckpt}',
             f'  - Cond drop prob: {self.cond_drop_prob}',
             f'  - Cond partial drop prob: {self.cond_partial_drop_prob}',
+            f'  - Cond independent drop prob: {self.cond_independent_drop_prob}',
             f'  - CFG drops field condition: {self.cfg_drop_field_condition}',
             f'  - Condition drop values: {self.condition_drop_values}',
             f'  - Loss type: {self.loss_type}',
@@ -549,6 +574,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             self.dataset,
             batch_size=self.batch_size_per_gpu,
             num_workers=self.num_workers if self.num_workers is not None else int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
+            multiprocessing_context=self.dataloader_multiprocessing_context,
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,
@@ -692,13 +718,8 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         elongation_cond: Optional[sp.SparseTensor] = None,
         force_field_drop: Optional[torch.Tensor] = None,
         density_statistics: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        sp.SparseTensor,
-        Optional[sp.SparseTensor],
-        Optional[sp.SparseTensor],
-        Optional[torch.Tensor],
-        Dict[str, torch.Tensor],
-    ]:
+        shape_presence: Optional[torch.Tensor] = None,
+    ) -> Tuple:
         batch_size = cond.shape[0]
         condition_names = ['field']
         conditions = [cond]
@@ -730,15 +751,31 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             for index, name in enumerate(DENSITY_STATISTIC_CONDITION_NAMES):
                 condition_names.append(name)
                 conditions.append(density_statistics[:, index:index + 1])
+        if shape_presence is not None:
+            shape_presence = torch.as_tensor(
+                shape_presence,
+                device=cond.feats.device,
+                dtype=torch.float32,
+            ).reshape(-1, 1)
+            if shape_presence.shape != (batch_size, 1):
+                raise ValueError(
+                    f'shape_presence must have shape ({batch_size}, 1), got '
+                    f'{tuple(shape_presence.shape)}'
+                )
+            condition_names.append('shape')
+            conditions.append(shape_presence)
 
         event = torch.rand(batch_size, device=cond.feats.device)
         drop_all = event < self.cond_drop_prob
+        independent_dropout = self.cond_independent_drop_prob is not None
         drop_partial = (
-            (event >= self.cond_drop_prob) &
-            (event < self.cond_drop_prob + self.cond_partial_drop_prob)
+            torch.zeros_like(drop_all)
+            if independent_dropout
+            else (
+                (event >= self.cond_drop_prob) &
+                (event < self.cond_drop_prob + self.cond_partial_drop_prob)
+            )
         )
-        if drop_partial.any() and len(conditions) < 2:
-            raise ValueError('Partial condition dropout requires at least two condition groups.')
 
         drop_masks = torch.zeros(
             (batch_size, len(conditions)),
@@ -759,8 +796,20 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         )
         droppable_mask[droppable_indices] = True
         drop_masks[drop_all] = droppable_mask
+        if independent_dropout:
+            independent_rows = (~drop_all).nonzero(as_tuple=False).reshape(-1)
+            if independent_rows.numel() > 0 and droppable_indices:
+                independent_masks = torch.rand(
+                    (independent_rows.numel(), len(droppable_indices)),
+                    device=cond.feats.device,
+                ) < self.cond_independent_drop_prob
+                for local_index, condition_index in enumerate(droppable_indices):
+                    drop_masks[independent_rows, condition_index] = (
+                        independent_masks[:, local_index]
+                    )
+                drop_partial[independent_rows] = independent_masks.any(dim=1)
         num_partial = int(drop_partial.sum().item())
-        if num_partial > 0:
+        if num_partial > 0 and not independent_dropout:
             num_conditions = len(droppable_indices)
             if num_conditions < 2:
                 raise ValueError(
@@ -832,6 +881,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             dropped_by_name.get('density'),
             dropped_by_name.get('elongation'),
             dropped_density_statistics,
+            dropped_by_name.get('shape'),
             masks,
         )
 
@@ -945,7 +995,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             high_resolution=kwargs.get('high_resolution', None),
             return_noise_level=True,
         )
-        cond, density_cond, elongation_cond, _, cond_drop = self._drop_conditions(
+        cond, density_cond, elongation_cond, _, _, cond_drop = self._drop_conditions(
             cond,
             density_cond,
             elongation_cond,
@@ -1181,6 +1231,25 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 f'must be enabled together, got {model_uses_statistics} and '
                 f'{dataset_has_statistics}'
             )
+        model_uses_shape = bool(getattr(
+            self.models['encoder'],
+            'shape_conditioning',
+            False,
+        ))
+        dataset_has_shape = bool(getattr(self.dataset, 'shape_conditioning', False))
+        if model_uses_shape != dataset_has_shape:
+            raise ValueError(
+                'Encoder and dataset shape_conditioning must be enabled together, '
+                f'got {model_uses_shape} and {dataset_has_shape}'
+            )
+        if model_uses_shape:
+            model_shape_points = int(self.models['encoder'].shape_context_points)
+            dataset_shape_points = int(self.dataset.shape_context_points)
+            if model_shape_points != dataset_shape_points:
+                raise ValueError(
+                    'Encoder and dataset shape context point counts must match, '
+                    f'got {model_shape_points} and {dataset_shape_points}'
+                )
         if (
             self.decoded_density_mode == 'condition' and
             getattr(self.dataset, 'density_conditioning', False)
@@ -1234,6 +1303,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 if self.num_workers is not None
                 else int(np.ceil(os.cpu_count() / torch.cuda.device_count()))
             ),
+            multiprocessing_context=self.dataloader_multiprocessing_context,
             pin_memory=True,
             persistent_workers=True,
             collate_fn=self.dataset.collate_fn,
@@ -1622,7 +1692,11 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         elongation_cond: Optional[sp.SparseTensor] = None,
         dropped_condition_names: Optional[Set[str]] = None,
         density_statistics: Optional[torch.Tensor] = None,
-    ) -> Tuple[sp.SparseTensor, Dict[str, sp.SparseTensor], Optional[torch.Tensor]]:
+        shape_points: Optional[torch.Tensor] = None,
+        shape_normals: Optional[torch.Tensor] = None,
+        shape_tokens: Optional[torch.Tensor] = None,
+        shape_presence: Optional[torch.Tensor] = None,
+    ) -> Tuple[sp.SparseTensor, Dict[str, Any], Optional[torch.Tensor]]:
         x_t, density_cond = self._resolve_decoded_density(decoded, density_cond)
         if not torch.equal(x_t.coords, cond.coords):
             raise ValueError(
@@ -1633,6 +1707,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         unknown = dropped_condition_names - {
             'density',
             'elongation',
+            'shape',
             *DENSITY_STATISTIC_CONDITION_NAMES,
         }
         if unknown:
@@ -1686,6 +1761,50 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 'Dataset provided density_statistics but encoder '
                 'density_statistics_conditioning is disabled'
             )
+        model_uses_shape = bool(getattr(
+            self.models['encoder'],
+            'shape_conditioning',
+            False,
+        ))
+        shape_inputs_provided = shape_tokens is not None or (
+            shape_points is not None and shape_normals is not None
+        )
+        if model_uses_shape:
+            if not shape_inputs_provided:
+                raise ValueError(
+                    'Shape-conditioned encoder requires cached shape_tokens or '
+                    'shape_points and shape_normals'
+                )
+            batch_size = z_t.shape[0]
+            if shape_presence is None:
+                shape_presence = torch.ones(
+                    batch_size,
+                    device=z_t.feats.device,
+                    dtype=torch.float32,
+                )
+            else:
+                shape_presence = torch.as_tensor(
+                    shape_presence,
+                    device=z_t.feats.device,
+                    dtype=torch.float32,
+                ).reshape(-1)
+                if shape_presence.numel() != batch_size:
+                    raise ValueError(
+                        f'shape_presence must have {batch_size} values, got '
+                        f'{shape_presence.numel()}'
+                    )
+            if 'shape' in dropped_condition_names:
+                shape_presence = torch.zeros_like(shape_presence)
+            encoder_kwargs.update({
+                'shape_points': shape_points,
+                'shape_normals': shape_normals,
+                'shape_tokens': shape_tokens,
+                'shape_presence': shape_presence,
+            })
+        elif shape_inputs_provided or shape_presence is not None:
+            raise ValueError(
+                'Shape inputs were provided but encoder shape_conditioning is disabled'
+            )
         return enc_in, encoder_kwargs, latent_cond_missing
 
     def training_losses(
@@ -1703,6 +1822,8 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         density_statistics: torch.Tensor = None,
         force_field_drop: torch.Tensor = None,
         high_resolution: torch.Tensor = None,
+        shape_points: torch.Tensor = None,
+        shape_normals: torch.Tensor = None,
         **kwargs,
     ) -> Tuple[Dict, Dict]:
         t = self.sample_t(z_0.shape[0]).to(z_0.feats.device).float()
@@ -1729,12 +1850,29 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             density_statistics
         )
         relaxed_density_statistics = density_statistics
-        cond, density_cond, elongation_cond, density_statistics, cond_drop = self._drop_conditions(
+        shape_presence = None
+        if (shape_points is None) != (shape_normals is None):
+            raise ValueError('shape_points and shape_normals must be provided together')
+        if shape_points is not None:
+            shape_presence = torch.ones(
+                (cond.shape[0], 1),
+                device=cond.feats.device,
+                dtype=torch.float32,
+            )
+        (
+            cond,
+            density_cond,
+            elongation_cond,
+            density_statistics,
+            shape_presence,
+            cond_drop,
+        ) = self._drop_conditions(
             cond,
             density_cond,
             elongation_cond,
             force_field_drop,
             density_statistics,
+            shape_presence,
         )
         enc_in, encoder_kwargs, latent_cond_missing = self._build_latent_encoder_input(
             z_t,
@@ -1768,6 +1906,25 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             False,
         ):
             encoder_kwargs['conditioning_noise_level'] = conditioning_noise_level
+        model_uses_shape = bool(getattr(
+            self.models['encoder'],
+            'shape_conditioning',
+            False,
+        ))
+        if model_uses_shape:
+            if shape_points is None or shape_normals is None:
+                raise ValueError(
+                    'Shape-conditioned encoder requires shape_points and shape_normals'
+                )
+            encoder_kwargs.update({
+                'shape_points': shape_points,
+                'shape_normals': shape_normals,
+                'shape_presence': shape_presence,
+            })
+        elif shape_points is not None or shape_normals is not None:
+            raise ValueError(
+                'Dataset provided shape geometry but encoder shape_conditioning is disabled'
+            )
         pred_z0 = self.training_models['encoder'](
             enc_in,
             t * 1000.0,
@@ -1798,6 +1955,8 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             status['cond/density_drop_frac'] = cond_drop['density'].float().mean()
         if 'elongation' in cond_drop:
             status['cond/elongation_drop_frac'] = cond_drop['elongation'].float().mean()
+        if 'shape' in cond_drop:
+            status['cond/shape_drop_frac'] = cond_drop['shape'].float().mean()
         for name in DENSITY_STATISTIC_CONDITION_NAMES:
             if name in cond_drop:
                 status[f'cond/{name}_drop_frac'] = cond_drop[name].float().mean()
@@ -1904,6 +2063,8 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 args.get('density_cond', None),
                 args.get('elongation_cond', None),
                 density_statistics=args.get('density_statistics', None),
+                shape_points=args.get('shape_points', None),
+                shape_normals=args.get('shape_normals', None),
             )
             if getattr(
                 self.models['encoder'],

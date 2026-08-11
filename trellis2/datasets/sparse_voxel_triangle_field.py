@@ -118,6 +118,9 @@ class SparseVoxelTriangleFieldVisMixin:
         target_channels = max(slc.stop for slc in target_layout.values())
         layout = target_layout if x.feats.shape[1] == target_channels else input_layout
         for key, slc in layout.items():
+            visualization_keys = getattr(self, 'visualization_keys', None)
+            if visualization_keys is not None and key not in visualization_keys:
+                continue
             if slc.stop > x.feats.shape[1]:
                 continue
             rendered = []

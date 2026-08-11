@@ -1,6 +1,7 @@
 from typing import *
 
 import bisect
+import hashlib
 import json
 import math
 import os
@@ -9,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .components import StandardDatasetBase
+from .point_density_mesh import load_normalized_mesh, sample_surface_geometry
 from .sparse_voxel_triangle_field import (
     DENSITY_ELONGATION_INPUT_LAYOUT,
     ELONGATION_INPUT_LAYOUT,
@@ -59,6 +61,11 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         ),
         density_statistics_reference_resolution: float = None,
         force_dropped_field_condition: bool = False,
+        shape_conditioning: bool = False,
+        shape_mesh_root_key: str = 'mesh',
+        shape_context_points: int = 16384,
+        shape_deterministic_sampling: bool = False,
+        shape_sampling_seed: int = 0,
         instances_path: str = None,
     ):
         if high_resolution % low_resolution != 0:
@@ -95,6 +102,15 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
                 f'{self.density_statistics_reference_resolution}'
             )
         self.force_dropped_field_condition = bool(force_dropped_field_condition)
+        self.shape_conditioning = bool(shape_conditioning)
+        self.shape_mesh_root_key = str(shape_mesh_root_key)
+        self.shape_context_points = int(shape_context_points)
+        self.shape_deterministic_sampling = bool(shape_deterministic_sampling)
+        self.shape_sampling_seed = int(shape_sampling_seed)
+        if self.shape_context_points <= 0:
+            raise ValueError(
+                f'shape_context_points must be positive, got {shape_context_points}'
+            )
         self.instances_path = instances_path
         if self.density_conditioning and self.elongation_conditioning:
             self.conditioning_input_layout = DENSITY_ELONGATION_INPUT_LAYOUT
@@ -149,8 +165,42 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
             f'  - Density statistics reference resolution: '
             f'{self.density_statistics_reference_resolution}',
             f'  - Force dropped field condition: {self.force_dropped_field_condition}',
+            f'  - Shape conditioning: {self.shape_conditioning}',
+            f'  - Shape context points: {self.shape_context_points}',
+            f'  - Shape mesh root key: {self.shape_mesh_root_key}',
+            f'  - Shape deterministic sampling: {self.shape_deterministic_sampling}',
         ]
         return '\n'.join(lines)
+
+    def _shape_sample_seed(self, instance: str) -> int:
+        if not self.shape_deterministic_sampling:
+            return int(np.random.randint(0, np.iinfo(np.int32).max))
+        digest = hashlib.sha256(
+            f'{self.shape_sampling_seed}:{instance}'.encode()
+        ).digest()
+        return int.from_bytes(digest[:4], byteorder='little', signed=False)
+
+    def _sample_shape_geometry(self, root, instance: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.shape_mesh_root_key not in root:
+            raise KeyError(
+                f'Shape conditioning requires root key {self.shape_mesh_root_key}. '
+                f'Available keys: {sorted(root.keys())}'
+            )
+        if 'local_path' not in self.metadata.columns:
+            raise KeyError('Shape conditioning requires a local_path metadata column')
+        local_path = str(self.metadata.loc[instance, 'local_path'])
+        mesh_path = (
+            local_path
+            if os.path.isabs(local_path)
+            else os.path.join(root[self.shape_mesh_root_key], local_path)
+        )
+        mesh = load_normalized_mesh(mesh_path)
+        points, normals = sample_surface_geometry(
+            mesh,
+            self.shape_context_points,
+            seed=self._shape_sample_seed(instance),
+        )
+        return torch.from_numpy(points), torch.from_numpy(normals)
 
     def _load_density_statistics(self) -> None:
         self.density_statistics = None
@@ -564,6 +614,10 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         density_statistics = self._get_density_statistics(instance)
         if density_statistics is not None:
             pack['density_statistics'] = density_statistics
+        if self.shape_conditioning:
+            shape_points, shape_normals = self._sample_shape_geometry(root, instance)
+            pack['shape_points'] = shape_points
+            pack['shape_normals'] = shape_normals
         return pack
 
     @staticmethod
@@ -770,6 +824,10 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
         density_statistics = self._get_density_statistics(instance)
         if density_statistics is not None:
             pack['density_statistics'] = density_statistics
+        if self.shape_conditioning:
+            shape_points, shape_normals = self._sample_shape_geometry(root, instance)
+            pack['shape_points'] = shape_points
+            pack['shape_normals'] = shape_normals
         pack['triangle_field_slat_cache_path'] = cache_path
         pack['triangle_field_slat_cache'] = self._read_latent_cache(cache_path)
         return pack
@@ -814,6 +872,8 @@ class MultiResolutionTriangleFieldLatentSuperResolutionDataset(SparseVoxelTriang
         elongation_root_key = kwargs.get('elongation_voxel_root_key', 'elongation_triangle_field_voxel')
         density_conditioning = bool(kwargs.get('density_conditioning', False))
         elongation_conditioning = bool(kwargs.get('elongation_conditioning', False))
+        shape_conditioning = bool(kwargs.get('shape_conditioning', False))
+        shape_mesh_root_key = kwargs.get('shape_mesh_root_key', 'mesh')
 
         self.datasets = []
         self._cumulative_sizes = []
@@ -841,6 +901,14 @@ class MultiResolutionTriangleFieldLatentSuperResolutionDataset(SparseVoxelTriang
                     pair_root[elongation_root_key] = self._resolve_root(
                         source_roots, elongation_root_key, high_resolution
                     )
+                if shape_conditioning:
+                    if shape_mesh_root_key not in source_roots:
+                        raise KeyError(
+                            f'Shape conditioning requires source root key '
+                            f'{shape_mesh_root_key}. Available keys: '
+                            f'{sorted(source_roots.keys())}'
+                        )
+                    pair_root[shape_mesh_root_key] = source_roots[shape_mesh_root_key]
                 pair_root.update({key: value for key, value in source_roots.items() if key.startswith('_')})
                 pair_roots[source_name] = pair_root
 
@@ -863,6 +931,8 @@ class MultiResolutionTriangleFieldLatentSuperResolutionDataset(SparseVoxelTriang
         self.distance_transform = self.datasets[0].distance_transform
         self.density_conditioning = density_conditioning
         self.elongation_conditioning = elongation_conditioning
+        self.shape_conditioning = shape_conditioning
+        self.shape_context_points = int(kwargs.get('shape_context_points', 16384))
         self.density_statistics = self.datasets[0].density_statistics
         self._datasets_by_high_resolution = {
             dataset.high_resolution: dataset for dataset in self.datasets

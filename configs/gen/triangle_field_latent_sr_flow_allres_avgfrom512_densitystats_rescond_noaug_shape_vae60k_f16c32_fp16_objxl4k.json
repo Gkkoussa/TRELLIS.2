@@ -1,0 +1,187 @@
+{
+    "models": {
+        "encoder": {
+            "name": "SparseUnetVaeEncoderTimeFiLM",
+            "args": {
+                "in_channels": 40,
+                "model_channels": [64, 128, 256, 512, 1024],
+                "latent_channels": 32,
+                "num_blocks": [0, 4, 8, 16, 4],
+                "block_type": [
+                    "SparseConvNeXtBlock3d",
+                    "SparseConvNeXtBlock3d",
+                    "SparseConvNeXtBlock3d",
+                    "SparseConvNeXtBlock3d",
+                    "SparseConvNeXtBlock3d"
+                ],
+                "down_block_type": [
+                    "SparseResBlockS2C3d",
+                    "SparseResBlockS2C3d",
+                    "SparseResBlockS2C3d",
+                    "SparseResBlockS2C3d"
+                ],
+                "block_args": [
+                    {"use_checkpoint": true},
+                    {"use_checkpoint": true},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false},
+                    {"use_checkpoint": false}
+                ],
+                "use_fp16": true,
+                "time_embed_dim": 256,
+                "density_statistics_conditioning": true,
+                "resolution_conditioning": true,
+                "resolution_reference": 128.0,
+                "resolution_embed_zero_init": false,
+                "shape_conditioning": {
+                    "context_points": 16384,
+                    "num_tokens": 1024,
+                    "width": 1024,
+                    "heads": 16,
+                    "encoder_layers": 8,
+                    "num_freqs": 8,
+                    "include_pi": true,
+                    "qkv_bias": true,
+                    "qk_norm": false,
+                    "use_ln_post": true,
+                    "post_blocks": 2
+                }
+            }
+        }
+    },
+    "dataset": {
+        "name": "MultiResolutionTriangleFieldLatentSuperResolutionDataset",
+        "args": {
+            "resolutions": [16, 32, 64, 128, 256, 512],
+            "force_drop_low_condition_high_resolutions": [32],
+            "voxel_root_key": "triangle_field_voxel",
+            "min_aesthetic_score": null,
+            "max_active_voxels": 1000000,
+            "max_num_faces": null,
+            "low_voxel_root_key": "low_triangle_field_voxel",
+            "high_voxel_root_key": "high_triangle_field_voxel",
+            "latent_root_key": "triangle_field_latent",
+            "density_conditioning": true,
+            "density_voxel_root_key": "density_triangle_field_voxel",
+            "density_channel": "density_field",
+            "elongation_conditioning": true,
+            "elongation_voxel_root_key": "density_triangle_field_voxel",
+            "elongation_channel": "elongation_field",
+            "density_statistics_path": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/triangle_field_density_stats/density128_avgfrom512_filtered_train_per_mesh.csv",
+            "density_statistics_reference_resolution": 128.0,
+            "shape_conditioning": true,
+            "shape_mesh_root_key": "mesh",
+            "shape_context_points": 16384,
+            "shape_deterministic_sampling": false,
+            "voxelized_flag_column": "triangle_field_voxelized",
+            "num_voxels_column": "num_triangle_field_voxels",
+            "latent_encoded_flag_column": "triangle_field_latent_encoded",
+            "latent_tokens_column": "triangle_field_latent_tokens",
+            "max_latent_tokens": 32768,
+            "distance_transform": "minus_one_one",
+            "return_area_offsets": false,
+            "instances_path": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/splits/train_triangle_field_512/instances.txt"
+        }
+    },
+    "trainer": {
+        "name": "TriangleFieldLatentSuperResolutionFlowTrainer",
+        "args": {
+            "decoder_model": {
+                "name": "SparseUnetVaeDecoder",
+                "args": {
+                    "out_channels": 2,
+                    "model_channels": [1024, 512, 256, 128, 64],
+                    "latent_channels": 32,
+                    "num_blocks": [4, 16, 8, 4, 0],
+                    "block_type": [
+                        "SparseConvNeXtBlock3d",
+                        "SparseConvNeXtBlock3d",
+                        "SparseConvNeXtBlock3d",
+                        "SparseConvNeXtBlock3d",
+                        "SparseConvNeXtBlock3d"
+                    ],
+                    "up_block_type": [
+                        "SparseResBlockC2S3d",
+                        "SparseResBlockC2S3d",
+                        "SparseResBlockC2S3d",
+                        "SparseResBlockC2S3d"
+                    ],
+                    "block_args": [
+                        {"use_checkpoint": false},
+                        {"use_checkpoint": false},
+                        {"use_checkpoint": false},
+                        {"use_checkpoint": true},
+                        {"use_checkpoint": true}
+                    ],
+                    "use_fp16": true,
+                    "pred_subdiv": false
+                }
+            },
+            "decoder_ckpt": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/outputs/triangle_field_vae_allres_avgfrom512_invarea_fullaux_52727251/ckpts/decoder_step0060000.pt",
+            "max_steps": 1000000,
+            "batch_size_per_gpu": 16,
+            "batch_split": 1,
+            "batch_size_per_gpu_by_high_resolution": {
+                "32": 16,
+                "64": 16,
+                "128": 16,
+                "256": 4,
+                "512": 1
+            },
+            "num_workers": 8,
+            "dataloader_multiprocessing_context": "spawn",
+            "optimizer": {
+                "name": "AdamW",
+                "args": {
+                    "lr": 0.0001,
+                    "weight_decay": 0.0
+                }
+            },
+            "lr_scheduler": {
+                "name": "LinearWarmupLRScheduler",
+                "args": {"warmup_steps": 1000}
+            },
+            "ema_rate": [0.9999],
+            "fp16_mode": "inflat_all",
+            "fp16_scale_growth": 0.001,
+            "grad_clip": {
+                "name": "AdaptiveGradClipper",
+                "args": {"max_norm": 1.0, "clip_percentile": 95}
+            },
+            "i_log": 500,
+            "i_sample": 10000,
+            "i_save": 10000,
+            "t_schedule": {
+                "name": "logitNormal",
+                "args": {"mean": 0.0, "std": 1.0}
+            },
+            "sigma_min": 1e-5,
+            "cond_drop_prob": 0.1,
+            "cond_partial_drop_prob": 0.0,
+            "cond_independent_drop_prob": 0.5,
+            "condition_drop_values": {"elongation": -1.0},
+            "loss_type": "l1",
+            "latent_loss_parameterization": "velocity",
+            "latent_loss_t_min": 0.05,
+            "batched_cache_decode": true,
+            "scalar_condition_presence": true,
+            "density_statistics_relax_probability": 0.5,
+            "density_statistics_relax_std": 1.5,
+            "latent_self_conditioning": {
+                "mode": "input",
+                "upsample_factor": 16
+            },
+            "input_layer_channel_map": [
+                0, 1, null, null, null, null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null
+            ],
+            "sample_posterior": false,
+            "snapshot_t": 0.5,
+            "finetune_ckpt": {
+                "encoder": "/nfs/turbo/coe-jjparkcv-medium/gpranav/objxl_4k/outputs/triangle_field_vae_allres_avgfrom512_invarea_fullaux_52727251/ckpts/encoder_step0060000.pt"
+            }
+        }
+    }
+}

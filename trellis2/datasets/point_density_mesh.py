@@ -46,6 +46,18 @@ def load_normalized_mesh(path: str) -> trimesh.Trimesh:
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False, validate=False)
 
 
+def sample_surface_geometry(
+    mesh: trimesh.Trimesh,
+    count: int,
+    *,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample normalized surface points and their source-face normals."""
+    points, face_indices = trimesh.sample.sample_surface(mesh, count, seed=seed)
+    normals = np.asarray(mesh.face_normals, dtype=np.float32)[face_indices]
+    return points.astype(np.float32), normals
+
+
 def sample_surface_field(
     mesh: trimesh.Trimesh,
     count: int,

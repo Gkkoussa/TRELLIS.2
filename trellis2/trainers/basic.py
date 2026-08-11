@@ -502,8 +502,9 @@ class BasicTrainer:
             collate_fn=self.dataset.collate_fn if hasattr(self.dataset, 'collate_fn') else None,
         )
         save_cfg = {}
+        data_iterator = iter(dataloader)
         for i in range(0, num_samples, batch_size):
-            data = next(iter(dataloader))
+            data = next(data_iterator)
             data = {k: v[:min(num_samples - i, batch_size)] for k, v in data.items()}
             data = recursive_to_device(data, self.device)
             vis = self.visualize_sample(data)

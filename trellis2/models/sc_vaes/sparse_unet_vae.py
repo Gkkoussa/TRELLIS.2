@@ -7,6 +7,8 @@ from ...modules.utils import convert_module_to, convert_module_to_f16, convert_m
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
 from ...modules.sparse.transformer import SparseTransformerBlock, ModulatedSparseTransformerBlock
+from ...modules.sparse.transformer.modulated import ModulatedSparseTransformerCrossBlock
+from ..shape_token_encoder import HunyuanShapeTokenEncoder
 
 
 def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
@@ -515,6 +517,7 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         conditioning_noise_conditioning: bool = False,
         conditioning_noise_embed_scale: float = 1000.0,
         density_statistics_conditioning: bool = False,
+        shape_conditioning: Optional[Dict[str, Any]] = None,
         latent_cond_channels: int = 0,
         latent_cond_mode: Optional[Literal['bottleneck']] = None,
         **kwargs,
@@ -528,6 +531,7 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         self.conditioning_noise_conditioning = bool(conditioning_noise_conditioning)
         self.conditioning_noise_embed_scale = float(conditioning_noise_embed_scale)
         self.density_statistics_conditioning = bool(density_statistics_conditioning)
+        self.shape_conditioning = shape_conditioning is not None
         if self.resolution_reference <= 0:
             raise ValueError(f'resolution_reference must be positive, got {resolution_reference}')
         if self.conditioning_noise_embed_scale <= 0:
@@ -571,6 +575,100 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
                 )
                 for _ in range(3)
             ])
+        if self.shape_conditioning:
+            shape_args = dict(shape_conditioning)
+            context_points = int(shape_args.pop('context_points', 16384))
+            num_tokens = int(shape_args.pop('num_tokens', 1024))
+            shape_width = int(shape_args.pop('width', self.model_channels[-1]))
+            shape_heads = int(shape_args.pop('heads', 16))
+            shape_layers = int(shape_args.pop('encoder_layers', 8))
+            num_freqs = int(shape_args.pop('num_freqs', 8))
+            include_pi = bool(shape_args.pop('include_pi', True))
+            qkv_bias = bool(shape_args.pop('qkv_bias', True))
+            qk_norm = bool(shape_args.pop('qk_norm', False))
+            use_ln_post = bool(shape_args.pop('use_ln_post', True))
+            post_blocks = int(shape_args.pop('post_blocks', 2))
+            cross_block_args = dict(shape_args.pop('cross_block_args', {}))
+            post_block_args = dict(shape_args.pop('post_block_args', {}))
+            if shape_args:
+                raise ValueError(
+                    f'Unknown shape_conditioning options: {sorted(shape_args)}'
+                )
+            if post_blocks < 0:
+                raise ValueError(f'post_blocks must be non-negative, got {post_blocks}')
+
+            bottleneck_channels = self.model_channels[-1]
+            self.shape_context_points = context_points
+            self.shape_num_tokens = num_tokens
+            self.shape_encoder_downsample_factor = 2 ** (len(self.model_channels) - 1)
+            self.shape_token_encoder = HunyuanShapeTokenEncoder(
+                context_points=context_points,
+                num_tokens=num_tokens,
+                width=shape_width,
+                heads=shape_heads,
+                layers=shape_layers,
+                num_freqs=num_freqs,
+                include_pi=include_pi,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_ln_post=use_ln_post,
+            )
+            self.shape_query_position_proj = nn.Sequential(
+                nn.Linear(self.shape_token_encoder.fourier_embedder.out_dim, bottleneck_channels),
+                nn.SiLU(),
+                nn.Linear(bottleneck_channels, bottleneck_channels),
+            )
+            cross_defaults = {
+                'num_heads': 8,
+                'mlp_ratio': 5.3334,
+                'attn_mode': 'full',
+                'use_checkpoint': False,
+                'use_rope': True,
+                'rope_freq': (1.0, 10000.0),
+                'qk_rms_norm': True,
+                'qk_rms_norm_cross': True,
+            }
+            cross_defaults.update(cross_block_args)
+            self.shape_cross_block = ModulatedSparseTransformerCrossBlock(
+                bottleneck_channels,
+                ctx_channels=shape_width,
+                **cross_defaults,
+            )
+            post_defaults = {
+                'num_heads': 8,
+                'mlp_ratio': 5.3334,
+                'attn_mode': 'full',
+                'use_checkpoint': False,
+                'use_rope': True,
+                'rope_freq': (1.0, 10000.0),
+                'qk_rms_norm': True,
+            }
+            post_defaults.update(post_block_args)
+            self.shape_post_blocks = nn.ModuleList([
+                ModulatedSparseTransformerBlock(
+                    bottleneck_channels,
+                    **post_defaults,
+                )
+                for _ in range(post_blocks)
+            ])
+            self.shape_condition_time_proj = nn.Linear(
+                self.time_embed_dim,
+                bottleneck_channels,
+            )
+            nn.init.normal_(self.shape_condition_time_proj.weight, std=0.02)
+            nn.init.constant_(self.shape_condition_time_proj.bias, 0)
+
+            # Preserve the pretrained encoder function at initialization. The
+            # zero output projection receives gradients immediately; earlier
+            # shape modules begin receiving gradients after its first update.
+            nn.init.constant_(self.shape_cross_block.cross_attn.to_out.weight, 0)
+            nn.init.constant_(self.shape_cross_block.cross_attn.to_out.bias, 0)
+            nn.init.constant_(self.shape_cross_block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.shape_cross_block.adaLN_modulation[-1].bias, 0)
+            for block in self.shape_post_blocks:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            self._convert_shape_modules(self.dtype)
         self.film_layers = nn.ModuleList([])
         for i, res in enumerate(self.blocks):
             film_res = nn.ModuleList([])
@@ -609,7 +707,29 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         self.blocks.apply(convert_module_to_f16)
         if self.output_transformer_block is not None:
             self.output_transformer_block.apply(convert_module_to_f16)
+        self._convert_shape_modules(torch.float16)
         self.dtype = torch.float16
+
+    def convert_to_bf16(self) -> None:
+        super().convert_to_bf16()
+        self._convert_shape_modules(torch.bfloat16)
+
+    def convert_to_fp32(self) -> None:
+        super().convert_to_fp32()
+        self._convert_shape_modules(torch.float32)
+
+    def _convert_shape_modules(self, dtype: torch.dtype) -> None:
+        if not hasattr(self, 'shape_token_encoder'):
+            return
+        converter = lambda module: convert_module_to(module, dtype)
+        # Hunyuan uses ordinary nn.LayerNorm rather than LayerNorm32, so its
+        # normalization parameters must match the projected token dtype.
+        self.shape_token_encoder.to(dtype=dtype)
+        self.shape_query_position_proj.apply(converter)
+        self.shape_cross_block.apply(converter)
+        self.shape_post_blocks.apply(converter)
+        # Match the existing FiLM projections: consume the fp32 timestep
+        # embedding, then cast the projected modulation at the call site.
 
     def _apply_film(self, h: sp.SparseTensor, emb: torch.Tensor, i: int, j: int) -> sp.SparseTensor:
         scale_shift = self.film_layers[i][j](emb).to(dtype=h.feats.dtype)
@@ -743,6 +863,140 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
                 f'{name_a} and {name_b} coords must match, got {a.coords.shape} vs {b.coords.shape}'
             )
 
+    @staticmethod
+    def normalized_bottleneck_centers(
+        coords: torch.Tensor,
+        resolution: torch.Tensor,
+        downsample_factor: int,
+    ) -> torch.Tensor:
+        """Map bottleneck voxel coordinates into normalized object space."""
+        if coords.ndim != 2 or coords.shape[1] != 4:
+            raise ValueError(f'coords must have shape [N, 4], got {tuple(coords.shape)}')
+        if downsample_factor <= 0:
+            raise ValueError(f'downsample_factor must be positive, got {downsample_factor}')
+        batch_size = int(coords[:, 0].max().item()) + 1 if coords.numel() else 0
+        resolution = torch.as_tensor(
+            resolution,
+            device=coords.device,
+            dtype=torch.float32,
+        ).reshape(-1)
+        if resolution.numel() == 1 and batch_size > 1:
+            resolution = resolution.expand(batch_size)
+        if resolution.numel() != batch_size:
+            raise ValueError(
+                f'resolution must have one value per sample, got {resolution.numel()} '
+                f'for batch {batch_size}'
+            )
+        if torch.any(resolution <= 0) or torch.any(
+            resolution.remainder(float(downsample_factor)) != 0
+        ):
+            raise ValueError(
+                f'resolution must be positive and divisible by {downsample_factor}'
+            )
+        bottleneck_resolution = resolution / float(downsample_factor)
+        voxel_resolution = bottleneck_resolution[coords[:, 0].long()].unsqueeze(-1)
+        centers = (coords[:, 1:].float() + 0.5) / voxel_resolution - 0.5
+        tolerance = 1e-5
+        if torch.any(centers < -0.5 - tolerance) or torch.any(centers > 0.5 + tolerance):
+            raise ValueError('Bottleneck coordinates fall outside normalized object space')
+        return centers
+
+    def encode_shape(
+        self,
+        shape_points: torch.Tensor,
+        shape_normals: torch.Tensor,
+        *,
+        random_start_point: Optional[bool] = None,
+    ) -> torch.Tensor:
+        if not self.shape_conditioning:
+            raise ValueError('encode_shape requires shape_conditioning to be enabled')
+        tokens, _ = self.shape_token_encoder(
+            shape_points,
+            shape_normals,
+            random_start_point=random_start_point,
+        )
+        return tokens
+
+    def _apply_shape_conditioning(
+        self,
+        h: sp.SparseTensor,
+        emb: torch.Tensor,
+        resolution: Optional[torch.Tensor],
+        shape_points: Optional[torch.Tensor],
+        shape_normals: Optional[torch.Tensor],
+        shape_tokens: Optional[torch.Tensor],
+        shape_presence: Optional[torch.Tensor],
+    ) -> sp.SparseTensor:
+        if not self.shape_conditioning:
+            if any(value is not None for value in (
+                shape_points,
+                shape_normals,
+                shape_tokens,
+                shape_presence,
+            )):
+                raise ValueError('Shape inputs were provided but shape_conditioning is disabled')
+            return h
+        if resolution is None:
+            raise ValueError('Shape conditioning requires the high-resolution value')
+        if shape_tokens is not None and (shape_points is not None or shape_normals is not None):
+            raise ValueError('Provide either cached shape_tokens or raw shape points, not both')
+        if shape_tokens is None:
+            if shape_points is None or shape_normals is None:
+                raise ValueError(
+                    'Shape conditioning requires shape_tokens or both shape_points and shape_normals'
+                )
+            shape_tokens = self.encode_shape(shape_points, shape_normals)
+        if shape_tokens.ndim != 3:
+            raise ValueError(
+                f'shape_tokens must have shape [B, L, C], got {tuple(shape_tokens.shape)}'
+            )
+        batch_size = h.shape[0]
+        if shape_tokens.shape[:2] != (batch_size, self.shape_num_tokens):
+            raise ValueError(
+                f'Expected shape tokens [{batch_size}, {self.shape_num_tokens}, C], '
+                f'got {tuple(shape_tokens.shape)}'
+            )
+        if shape_presence is None:
+            shape_presence = torch.ones(
+                batch_size,
+                device=h.feats.device,
+                dtype=torch.float32,
+            )
+        else:
+            shape_presence = torch.as_tensor(
+                shape_presence,
+                device=h.feats.device,
+                dtype=torch.float32,
+            ).reshape(-1)
+            if shape_presence.numel() != batch_size:
+                raise ValueError(
+                    f'shape_presence must have {batch_size} values, got '
+                    f'{shape_presence.numel()}'
+                )
+            if torch.any((shape_presence < 0) | (shape_presence > 1)):
+                raise ValueError('shape_presence values must be in [0, 1]')
+        context = shape_tokens.to(device=h.feats.device, dtype=h.feats.dtype)
+        context = context * shape_presence.to(context.dtype)[:, None, None]
+
+        centers = self.normalized_bottleneck_centers(
+            h.coords,
+            resolution,
+            self.shape_encoder_downsample_factor,
+        )
+        position_features = self.shape_token_encoder.fourier_embedder(centers)
+        position_features = self.shape_query_position_proj(
+            position_features.to(dtype=h.feats.dtype)
+        )
+        positioned_h = h.replace(h.feats + position_features)
+        modulation = self.shape_condition_time_proj(emb).to(dtype=h.feats.dtype)
+        conditioned_h = self.shape_cross_block(positioned_h, modulation, context)
+        # Remove the temporary absolute-position residual; only the learned
+        # attention/MLP residuals are applied to the original sparse features.
+        h = h.replace(h.feats + conditioned_h.feats - positioned_h.feats)
+        for block in self.shape_post_blocks:
+            h = block(h, modulation)
+        return h
+
     def forward(
         self,
         x: sp.SparseTensor,
@@ -751,15 +1005,24 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         return_raw: bool = False,
         latent_cond: Optional[sp.SparseTensor] = None,
         resolution: Optional[torch.Tensor] = None,
+        resolution_condition: Optional[torch.Tensor] = None,
         conditioning_noise_level: Optional[torch.Tensor] = None,
         density_statistics: Optional[torch.Tensor] = None,
         density_statistics_presence: Optional[torch.Tensor] = None,
+        shape_points: Optional[torch.Tensor] = None,
+        shape_normals: Optional[torch.Tensor] = None,
+        shape_tokens: Optional[torch.Tensor] = None,
+        shape_presence: Optional[torch.Tensor] = None,
     ):
         if t.ndim != 1:
             t = t.reshape(-1)
         emb = timestep_embedding(t, self.time_embed_dim, self.time_embed_max_period)
         emb = self.time_embed(emb)
-        resolution_emb = self._embed_resolution(resolution, t.shape[0], t.device)
+        resolution_emb = self._embed_resolution(
+            resolution if resolution_condition is None else resolution_condition,
+            t.shape[0],
+            t.device,
+        )
         if resolution_emb is not None:
             emb = emb + resolution_emb
         conditioning_noise_emb = self._embed_conditioning_noise(
@@ -793,6 +1056,15 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
             for j, block in enumerate(res):
                 h = block(h)
                 h = self._apply_film(h, emb, i, j)
+        h = self._apply_shape_conditioning(
+            h,
+            emb,
+            resolution,
+            shape_points,
+            shape_normals,
+            shape_tokens,
+            shape_presence,
+        )
         output_modulation = None
         if self.output_transformer_modulated:
             output_modulation = self.output_transformer_time_proj(emb).to(dtype=h.feats.dtype)
