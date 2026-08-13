@@ -63,6 +63,13 @@ def main(local_rank, cfg):
     if world_size > 1:
         setup_dist(rank, local_rank, world_size, cfg.master_addr, cfg.master_port)
 
+        # flex_gemm autosaves through one shared .tmp path. Restrict writes to
+        # global rank 0 while every rank can still load the shared cache.
+        if rank != 0:
+            from flex_gemm.utils import autotuner as flex_gemm_autotuner
+
+            flex_gemm_autotuner.AUTOSAVE_AUTOTUNE_CACHE = False
+
     # Seed rngs
     setup_rng(rank)
 

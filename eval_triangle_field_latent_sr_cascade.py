@@ -252,8 +252,16 @@ def main():
                 args.apply_conditioning_augmentation,
                 high_resolution=high_res,
             )
-            sample = trainer._decode_latents_with_cache(sample_z, caches=caches)
-            pred_last = trainer._decode_latents_with_cache(pred_z0_last, caches=caches)
+            decode_kwargs = {
+                't': torch.zeros(sample_z.shape[0], device=sample_z.device),
+                'resolution': high_res,
+            }
+            sample = trainer._decode_latents_with_cache(
+                sample_z, caches=caches, **decode_kwargs
+            )
+            pred_last = trainer._decode_latents_with_cache(
+                pred_z0_last, caches=caches, **decode_kwargs
+            )
 
             for prefix, tensor in (
                 (f"gt_{high_res}", data["x_0"]),

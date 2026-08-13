@@ -660,12 +660,14 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
         latent_encoded_flag_column: str = 'triangle_field_latent_encoded',
         latent_tokens_column: str = 'triangle_field_latent_tokens',
         max_latent_tokens: int = 32768,
+        return_high_target_fields: bool = False,
         **kwargs,
     ):
         self.latent_root_key = latent_root_key
         self.latent_encoded_flag_column = latent_encoded_flag_column
         self.latent_tokens_column = latent_tokens_column
         self.max_latent_tokens = max_latent_tokens
+        self.return_high_target_fields = bool(return_high_target_fields)
         super().__init__(*args, **kwargs)
 
     def __str__(self):
@@ -673,6 +675,7 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
             super().__str__(),
             f'  - Latent root key: {self.latent_root_key}',
             f'  - Max latent tokens: {self.max_latent_tokens}',
+            f'  - Return high target fields: {self.return_high_target_fields}',
         ]
         return '\n'.join(lines)
 
@@ -776,7 +779,14 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
             return torch.load(cache_path, map_location='cpu')
 
     def get_instance(self, root, instance):
-        high_coords = self._read_coords(root[self.high_voxel_root_key], instance)
+        high_target = None
+        if self.return_high_target_fields:
+            high_coords, high_target, _ = self._read_target_features(
+                root[self.high_voxel_root_key],
+                instance,
+            )
+        else:
+            high_coords = self._read_coords(root[self.high_voxel_root_key], instance)
         if self.force_dropped_field_condition:
             cond = torch.zeros((high_coords.shape[0], 2), dtype=torch.float32)
             missing_frac = 1.0
@@ -812,6 +822,8 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
             'z_0': z_0,
             'force_field_drop': torch.tensor(self.force_dropped_field_condition, dtype=torch.bool),
         }
+        if self.return_high_target_fields:
+            pack['x_0'] = sp.SparseTensor(high_target.float(), sparse_coords)
         if self.density_conditioning:
             pack['density_cond'] = sp.SparseTensor(density_cond.float(), sparse_coords)
             pack['density_missing_parent_frac'] = torch.tensor(density_missing_frac, dtype=torch.float32)
@@ -932,6 +944,9 @@ class MultiResolutionTriangleFieldLatentSuperResolutionDataset(SparseVoxelTriang
         self.density_conditioning = density_conditioning
         self.elongation_conditioning = elongation_conditioning
         self.shape_conditioning = shape_conditioning
+        self.return_high_target_fields = all(
+            dataset.return_high_target_fields for dataset in self.datasets
+        )
         self.shape_context_points = int(kwargs.get('shape_context_points', 16384))
         self.density_statistics = self.datasets[0].density_statistics
         self._datasets_by_high_resolution = {

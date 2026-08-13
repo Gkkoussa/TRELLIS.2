@@ -43,18 +43,25 @@ def find_render(eval_dir, low, high, iteration, channel):
     return Image.open(matches[0]).convert("RGB")
 
 
-def main():
-    args = parse_args()
-    summary = json.loads((args.eval_dir / "summary.json").read_text())
+def compose_progression(
+    eval_dir: Path,
+    output_dir: Path | None = None,
+    channel: str = "d_tri",
+    panel_size: int = 384,
+) -> Path:
+    eval_dir = Path(eval_dir)
+    if channel not in ("d_tri", "d_vert"):
+        raise ValueError(f"Unsupported progression channel: {channel}")
+    summary = json.loads((eval_dir / "summary.json").read_text())
     meshes = summary["meshes"]
     stages = [tuple(stage) for stage in summary["stages"]]
     repeats = int(summary["stage_repeats"])
-    output_dir = args.output_dir or args.eval_dir / f"progression_{args.channel}_first_view"
+    output_dir = output_dir or eval_dir / f"progression_{channel}_first_view"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     renders = {
         (low, high, iteration): find_render(
-            args.eval_dir, low, high, iteration, args.channel
+            eval_dir, low, high, iteration, channel
         )
         for low, high in stages
         for iteration in range(1, repeats + 1)
@@ -64,27 +71,38 @@ def main():
     pad, title_h, header_h, row_label_w = 10, 48, 40, 150
 
     for mesh_index, mesh in enumerate(meshes):
-        width = row_label_w + repeats * (args.panel_size + pad) + pad
-        height = title_h + header_h + len(stages) * (args.panel_size + pad) + pad
+        width = row_label_w + repeats * (panel_size + pad) + pad
+        height = title_h + header_h + len(stages) * (panel_size + pad) + pad
         sheet = Image.new("RGB", (width, height), "white")
         draw = ImageDraw.Draw(sheet)
         name = Path(mesh["path"]).stem
         draw.text((pad, 8), name, fill="black", font=title_font)
         for iteration in range(1, repeats + 1):
-            x = row_label_w + (iteration - 1) * (args.panel_size + pad)
+            x = row_label_w + (iteration - 1) * (panel_size + pad)
             draw.text((x + pad, title_h + 5), f"Iteration {iteration}", fill="black", font=label_font)
         for row, (low, high) in enumerate(stages):
-            y = title_h + header_h + row * (args.panel_size + pad)
+            y = title_h + header_h + row * (panel_size + pad)
             draw.text((pad, y + 10), f"{low} -> {high}", fill="black", font=label_font)
             for iteration in range(1, repeats + 1):
                 view = crop_first_view(
                     renders[(low, high, iteration)], mesh_index, len(meshes)
-                ).resize((args.panel_size, args.panel_size), Image.Resampling.LANCZOS)
-                x = row_label_w + (iteration - 1) * (args.panel_size + pad)
+                ).resize((panel_size, panel_size), Image.Resampling.LANCZOS)
+                x = row_label_w + (iteration - 1) * (panel_size + pad)
                 sheet.paste(view, (x, y))
         sheet.save(output_dir / f"{mesh_index:02d}_{name}_progression.jpg", quality=95)
 
     print(f"Saved {len(meshes)} progression sheets to {output_dir}")
+    return output_dir
+
+
+def main():
+    args = parse_args()
+    compose_progression(
+        args.eval_dir,
+        output_dir=args.output_dir,
+        channel=args.channel,
+        panel_size=args.panel_size,
+    )
 
 
 if __name__ == "__main__":

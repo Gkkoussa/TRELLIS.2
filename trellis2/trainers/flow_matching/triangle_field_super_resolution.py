@@ -3,6 +3,7 @@ from typing import *
 import copy
 import functools
 import os
+import random
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -229,9 +230,14 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             param.requires_grad_(True)
 
     def __str__(self):
+        decoder_label = (
+            'Trainable timestep decoder'
+            if getattr(self, 'train_timestep_decoder', False)
+            else 'Frozen decoder'
+        )
         lines = [
             super().__str__(),
-            f'  - Frozen decoder: {getattr(self, "decoder", None).__class__.__name__ if hasattr(self, "decoder") else "pending init"}',
+            f'  - {decoder_label}: {getattr(self, "decoder", None).__class__.__name__ if hasattr(self, "decoder") else "pending init"}',
             f'  - Decoder checkpoint: {self.decoder_ckpt}',
             f'  - Cond drop prob: {self.cond_drop_prob}',
             f'  - Cond partial drop prob: {self.cond_partial_drop_prob}',
@@ -1151,9 +1157,9 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
     Latent-space super-resolution flow with feature-space model inputs.
 
     Clean high-resolution latents are loaded from an offline full-feature VAE
-    encoding pass. Training samples latent z_t on the encoded support, decodes
-    z_t without gradients, concatenates decoded features with the existing
-    low-resolution conditioning, and trains the time-FiLM encoder to predict z_0.
+    encoding pass. The legacy path decodes z_t with a frozen VAE decoder. The
+    optional timestep-decoder path jointly denoises decoded fields while keeping
+    the decoder-to-encoder feature connection detached.
     """
 
     def __init__(
@@ -1169,6 +1175,9 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         density_statistics_relax_std: float = 1.5,
         batch_size_per_gpu_by_high_resolution: dict = None,
         resolution_sampling_weights: dict = None,
+        train_timestep_decoder: bool = False,
+        decoder_field_loss_weight: float = 1.0,
+        cascade_snapshot: dict = None,
         **kwargs,
     ):
         self.latent_loss_parameterization = latent_loss_parameterization
@@ -1191,6 +1200,93 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             {int(key): float(value) for key, value in resolution_sampling_weights.items()}
             if resolution_sampling_weights is not None else None
         )
+        self.train_timestep_decoder = bool(train_timestep_decoder)
+        self.decoder_field_loss_weight = float(decoder_field_loss_weight)
+        self.cascade_snapshot = copy.deepcopy(cascade_snapshot)
+        if self.cascade_snapshot is not None:
+            required = {'mesh_dir', 'mesh_names', 'variants'}
+            missing = required - set(self.cascade_snapshot)
+            if missing:
+                raise ValueError(
+                    f'cascade_snapshot is missing required options: {sorted(missing)}'
+                )
+            if not self.cascade_snapshot['mesh_names']:
+                raise ValueError('cascade_snapshot.mesh_names must not be empty')
+            variants = self.cascade_snapshot['variants']
+            if not variants:
+                raise ValueError('cascade_snapshot.variants must not be empty')
+            names = [variant.get('name') for variant in variants]
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError(
+                    'cascade_snapshot variant names must be non-empty and unique'
+                )
+            for variant in variants:
+                if int(variant.get('start_resolution', -1)) not in (16, 64, 256):
+                    raise ValueError(
+                        'cascade_snapshot variant start_resolution must be 16, 64, or 256'
+                    )
+        if self.decoder_field_loss_weight < 0 or not np.isfinite(
+            self.decoder_field_loss_weight
+        ):
+            raise ValueError(
+                'decoder_field_loss_weight must be finite and non-negative, got '
+                f'{decoder_field_loss_weight}'
+            )
+        if self.train_timestep_decoder:
+            model_dict = args[0]
+            if 'decoder' in model_dict:
+                raise ValueError(
+                    "train_timestep_decoder constructs the decoder; do not add 'decoder' "
+                    'to the top-level models config'
+                )
+            encoder = model_dict['encoder']
+            if not bool(getattr(encoder, 'resolution_conditioning', False)):
+                raise ValueError(
+                    'train_timestep_decoder requires an encoder with '
+                    'resolution_conditioning enabled'
+                )
+            decoder_cfg = kwargs.get('decoder_model')
+            decoder_ckpt = kwargs.get('decoder_ckpt')
+            if decoder_cfg is None or decoder_ckpt is None:
+                raise ValueError(
+                    'train_timestep_decoder requires decoder_model and decoder_ckpt'
+                )
+            if decoder_cfg['name'] != 'SparseUnetVaeDecoder':
+                raise ValueError(
+                    'train_timestep_decoder currently requires decoder_model.name '
+                    "to be 'SparseUnetVaeDecoder', got "
+                    f"{decoder_cfg['name']}"
+                )
+            decoder_args = copy.deepcopy(decoder_cfg['args'])
+            if int(decoder_args.get('out_channels', -1)) != 2:
+                raise ValueError(
+                    'train_timestep_decoder predicts d_tri/d_vert and therefore '
+                    'requires decoder out_channels=2'
+                )
+            decoder_args.update({
+                'time_embed_dim': int(encoder.time_embed_dim),
+                'time_embed_max_period': int(encoder.time_embed_max_period),
+                'resolution_reference': float(encoder.resolution_reference),
+            })
+            decoder = models.SparseUnetVaeDecoderTimeFiLM(**decoder_args).to(
+                next(encoder.parameters()).device
+            )
+            checkpoint = torch.load(
+                decoder_ckpt,
+                map_location=next(encoder.parameters()).device,
+                weights_only=True,
+            )
+            missing, unexpected = decoder.load_state_dict(checkpoint, strict=False)
+            allowed_prefixes = ('time_embed.', 'resolution_embed.', 'film_layers.')
+            invalid_missing = [
+                name for name in missing if not name.startswith(allowed_prefixes)
+            ]
+            if invalid_missing or unexpected:
+                raise ValueError(
+                    'VAE decoder initialization did not match the timestep decoder: '
+                    f'missing={invalid_missing}, unexpected={unexpected}'
+                )
+            model_dict['decoder'] = decoder
         if self.latent_loss_parameterization not in ('z0', 'velocity'):
             raise ValueError(
                 "latent_loss_parameterization must be 'z0' or 'velocity', "
@@ -1219,6 +1315,13 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 f'{self.density_statistics_relax_std}'
             )
         super().__init__(*args, **kwargs)
+        if self.train_timestep_decoder and not bool(
+            getattr(self.dataset, 'return_high_target_fields', False)
+        ):
+            raise ValueError(
+                'train_timestep_decoder requires dataset '
+                'return_high_target_fields=true'
+            )
         model_uses_statistics = bool(getattr(
             self.models['encoder'],
             'density_statistics_conditioning',
@@ -1319,6 +1422,10 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             self.data_sampler.idx = 0
 
     def _build_frozen_decoder(self):
+        if self.train_timestep_decoder:
+            self.decoder = self.models['decoder']
+            self.decoder.train()
+            return
         cfg = self.decoder_model_config
         self.decoder = getattr(models, cfg['name'])(**cfg['args']).to(self.device)
         ckpt = torch.load(self.decoder_ckpt, map_location=self.device, weights_only=True)
@@ -1336,6 +1443,9 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             f'  - Latent self-conditioning: {self.latent_self_conditioning}',
             f'  - Decoded density mode: {self.decoded_density_mode}',
             f'  - Scalar condition presence: {self.scalar_condition_presence}',
+            f'  - Train timestep decoder: {self.train_timestep_decoder}',
+            f'  - Decoder field loss weight: {self.decoder_field_loss_weight}',
+            f'  - Cascade snapshot: {self.cascade_snapshot}',
             '  - Density statistics relax probability: '
             f'{self.density_statistics_relax_probability}',
             f'  - Density statistics relax std: {self.density_statistics_relax_std}',
@@ -1478,12 +1588,15 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         out._spatial_cache = merged_cache
         return out
 
-    @torch.no_grad()
     def _decode_latents_with_cache(
         self,
         z: sp.SparseTensor,
         caches: List[Dict[str, Any]] = None,
         cache_paths: List[str] = None,
+        t: torch.Tensor = None,
+        resolution: torch.Tensor = None,
+        resolution_condition: torch.Tensor = None,
+        use_training_model: bool = False,
     ) -> sp.SparseTensor:
         if caches is None:
             if cache_paths is None:
@@ -1492,8 +1605,48 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         if len(caches) != z.shape[0]:
             raise ValueError(f'Expected {z.shape[0]} latent caches, got {len(caches)}')
 
+        decoder = (
+            self.training_models['decoder']
+            if use_training_model and self.train_timestep_decoder
+            else self.decoder
+        )
+        decoder_kwargs = {}
+        if self.train_timestep_decoder:
+            if t is None or resolution is None:
+                raise ValueError(
+                    'Timestep-conditioned decoder requires t and resolution'
+                )
+
+            def _batch_values(value, name):
+                values = torch.as_tensor(
+                    value,
+                    device=z.device,
+                    dtype=torch.float32,
+                ).reshape(-1)
+                if values.numel() == 1 and z.shape[0] > 1:
+                    values = values.expand(z.shape[0])
+                if values.numel() != z.shape[0]:
+                    raise ValueError(
+                        f'{name} must have one value per sample, got '
+                        f'{values.numel()} for batch {z.shape[0]}'
+                    )
+                return values
+
+            decoder_kwargs = {
+                't': _batch_values(t, 't'),
+                'resolution': _batch_values(resolution, 'resolution'),
+            }
+            if resolution_condition is not None:
+                decoder_kwargs['resolution_condition'] = _batch_values(
+                    resolution_condition,
+                    'resolution_condition',
+                )
+
         if self.batched_cache_decode:
-            decoded = self.decoder(self._merge_latent_spatial_cache(z, caches))
+            decoded = decoder(
+                self._merge_latent_spatial_cache(z, caches),
+                **decoder_kwargs,
+            )
             decoded.clear_spatial_cache()
             return decoded
 
@@ -1502,10 +1655,39 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             zi = z[i]
             zi._scale = cache['scale']
             zi._spatial_cache = cache['spatial_cache']
-            decoded.append(self.decoder(zi))
+            sample_kwargs = {
+                name: value[i:i + 1]
+                for name, value in decoder_kwargs.items()
+            }
+            decoded.append(decoder(zi, **sample_kwargs))
         decoded = sp.sparse_cat(decoded, dim=0)
         decoded.clear_spatial_cache()
         return decoded
+
+    @staticmethod
+    def _per_sample_field_l1(
+        pred: sp.SparseTensor,
+        target: sp.SparseTensor,
+    ) -> torch.Tensor:
+        if pred.feats.shape != target.feats.shape or not torch.equal(
+            pred.coords,
+            target.coords,
+        ):
+            raise ValueError(
+                'Decoder field prediction and target must have matching features '
+                'and coordinates'
+            )
+        per_voxel = (pred.feats - target.feats).abs().mean(dim=-1)
+        per_sample = torch.zeros(
+            pred.shape[0],
+            device=per_voxel.device,
+            dtype=per_voxel.dtype,
+        )
+        per_sample.index_add_(0, pred.coords[:, 0].long(), per_voxel)
+        counts = pred.seqlen.to(dtype=per_voxel.dtype)
+        if torch.any(counts == 0):
+            raise ValueError('Decoder field loss received an empty sample')
+        return (per_sample / counts).mean()
 
     def _diffuse_latent(
         self,
@@ -1832,8 +2014,24 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             z_t,
             caches=triangle_field_slat_cache,
             cache_paths=triangle_field_slat_cache_path,
+            t=t * 1000.0,
+            resolution=high_resolution,
+            use_training_model=self.train_timestep_decoder,
         )
-        x_t, density_cond = self._resolve_decoded_density(decoded, density_cond)
+        decoder_field_loss = None
+        if self.train_timestep_decoder:
+            if x_0 is None:
+                raise ValueError(
+                    'train_timestep_decoder requires GT x_0 fields from the dataset'
+                )
+            decoder_field_loss = self._per_sample_field_l1(decoded, x_0)
+            decoded_for_encoder = decoded.detach()
+        else:
+            decoded_for_encoder = decoded
+        x_t, density_cond = self._resolve_decoded_density(
+            decoded_for_encoder,
+            density_cond,
+        )
         if not torch.equal(x_t.coords, cond.coords):
             raise ValueError(
                 f'Decoded z_t coords must match cond coords, got {x_t.coords.shape} vs {cond.coords.shape}'
@@ -1941,6 +2139,12 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         loss_name = f'latent_{self.loss_type}'
         terms[loss_name] = self._latent_reconstruction_loss(pred_z0, z_0, t)
         terms['loss'] = terms[loss_name]
+        if decoder_field_loss is not None:
+            terms['decoder_field_l1'] = decoder_field_loss
+            terms['loss'] = (
+                terms['loss']
+                + self.decoder_field_loss_weight * decoder_field_loss
+            )
 
         status = {
             'cond/drop_frac': cond_drop['all'].float().mean(),
@@ -2011,6 +2215,158 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
 
         return terms, status
 
+    def snapshot(
+        self,
+        suffix=None,
+        num_samples=64,
+        batch_size=4,
+        verbose=False,
+        **snapshot_kwargs,
+    ):
+        if self.cascade_snapshot is None:
+            return super().snapshot(
+                suffix=suffix,
+                num_samples=num_samples,
+                batch_size=batch_size,
+                verbose=verbose,
+                **snapshot_kwargs,
+            )
+
+        if suffix is None:
+            suffix = f'step{self.step:07d}'
+        if self.world_size > 1:
+            dist.barrier()
+        if self.is_master:
+            print(f'\nSampling fixed mesh cascades for {suffix}...', flush=True)
+            self._run_cascade_snapshot(suffix)
+            print('Fixed mesh cascade snapshot complete.', flush=True)
+        if self.world_size > 1:
+            dist.barrier()
+
+    @torch.no_grad()
+    def _run_cascade_snapshot(self, suffix: str) -> None:
+        from pathlib import Path
+
+        from compose_stage_repeat_progression import compose_progression
+        from eval_obj_folder_latent_sr_stage_repeat_cascade import (
+            main as run_mesh_cascade,
+            parse_args as parse_mesh_cascade_args,
+        )
+
+        cfg = self.cascade_snapshot
+        snapshot_root = Path(self.output_dir) / 'samples' / suffix / 'cascade_snapshot'
+        support_cache = Path(self.output_dir) / 'train_snapshot_support_cache'
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        support_cache.mkdir(parents=True, exist_ok=True)
+
+        model_modes = {name: model.training for name, model in self.models.items()}
+        decoder_mode = self.decoder.training
+        conditioning_augmentation = copy.deepcopy(self.conditioning_augmentation)
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all()
+        numpy_rng = np.random.get_state()
+        python_rng = random.getstate()
+        try:
+            for model in self.models.values():
+                model.eval()
+            self.decoder.eval()
+            common = [
+                '--mesh_dir', str(cfg['mesh_dir']),
+                '--mesh_names', *[str(name) for name in cfg['mesh_names']],
+                '--run_dir', str(self.output_dir),
+                '--batch_size', '1',
+                '--progression_only',
+                '--steps', str(int(cfg.get('steps', 11))),
+                '--base_guidance_strength', '0',
+                '--guidance_strength', '1',
+                '--stage_repeats', str(int(cfg.get('stage_repeats', 1))),
+                '--seed', str(int(cfg.get('seed', 0))),
+                '--support_cache_dir', str(support_cache),
+                '--support_voxelizer', str(cfg.get('support_voxelizer', 'o_voxel_native')),
+                '--max_active_voxels', str(int(cfg.get('max_active_voxels', 2000000))),
+            ]
+            if bool(cfg.get('nested_supports', True)):
+                common.append('--nested_supports')
+            if bool(cfg.get('apply_conditioning_augmentation', True)):
+                common.extend([
+                    '--apply_conditioning_augmentation',
+                    '--conditioning_augmentation_noise_level',
+                    str(float(cfg.get('conditioning_augmentation_noise_level', 0.25))),
+                ])
+                if bool(cfg.get('conditioning_augmentation_disable_blur', True)):
+                    common.append('--conditioning_augmentation_disable_blur')
+
+            for variant in cfg['variants']:
+                output_dir = snapshot_root / str(variant['name'])
+                argv = [
+                    *common,
+                    '--output_dir', str(output_dir),
+                    '--start_resolution', str(int(variant['start_resolution'])),
+                ]
+                density_mode = variant.get('density', 'drop')
+                if density_mode == 'drop':
+                    argv.append('--drop_density_conditioning')
+                elif density_mode == 'constant':
+                    argv.extend([
+                        '--constant_density_conditioning',
+                        '--constant_density_value', str(float(variant['density_value'])),
+                        '--constant_density_base_resolution',
+                        str(int(variant.get('density_base_resolution', 128))),
+                        '--constant_density_scale_mode',
+                        str(variant.get('density_scale_mode', 'voxel_size')),
+                    ])
+                    if variant.get('density_guidance_strength') is not None:
+                        argv.extend([
+                            '--density_guidance_strength',
+                            str(float(variant['density_guidance_strength'])),
+                        ])
+                else:
+                    raise ValueError(
+                        f"Unsupported cascade snapshot density mode: {density_mode}"
+                    )
+
+                elongation_mode = variant.get('elongation', 'drop')
+                if elongation_mode == 'drop':
+                    argv.append('--drop_elongation_conditioning')
+                elif elongation_mode == 'constant':
+                    argv.extend([
+                        '--constant_elongation_conditioning',
+                        '--constant_elongation_value',
+                        str(float(variant['elongation_value'])),
+                    ])
+                    if variant.get('elongation_guidance_strength') is not None:
+                        argv.extend([
+                            '--elongation_guidance_strength',
+                            str(float(variant['elongation_guidance_strength'])),
+                        ])
+                else:
+                    raise ValueError(
+                        f"Unsupported cascade snapshot elongation mode: {elongation_mode}"
+                    )
+
+                args = parse_mesh_cascade_args(argv)
+                eval_dir = run_mesh_cascade(
+                    args,
+                    trainer_override=self,
+                    ckpt_step_override=self.step,
+                )
+                compose_progression(
+                    eval_dir,
+                    channel='d_tri',
+                    panel_size=int(cfg.get('panel_size', 384)),
+                )
+        finally:
+            torch.set_rng_state(cpu_rng)
+            torch.cuda.set_rng_state_all(cuda_rng)
+            np.random.set_state(numpy_rng)
+            random.setstate(python_rng)
+            self.conditioning_augmentation = conditioning_augmentation
+            if hasattr(self, '_cond_blur_cache'):
+                self._cond_blur_cache.clear()
+            for name, mode in model_modes.items():
+                self.models[name].train(mode)
+            self.decoder.train(decoder_mode)
+
     @torch.no_grad()
     def run_snapshot(
         self,
@@ -2044,11 +2400,15 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 args['z_0'],
                 caches=args.get('triangle_field_slat_cache', None),
                 cache_paths=args.get('triangle_field_slat_cache_path', None),
+                t=torch.zeros_like(t),
+                resolution=args.get('high_resolution', None),
             )
             decoded = self._decode_latents_with_cache(
                 z_t,
                 caches=args.get('triangle_field_slat_cache', None),
                 cache_paths=args.get('triangle_field_slat_cache_path', None),
+                t=t * 1000.0,
+                resolution=args.get('high_resolution', None),
             )
             snapshot_cond, conditioning_noise_level = self._augment_conditioning(
                 args['cond'],
@@ -2083,6 +2443,8 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 pred_z0,
                 caches=args.get('triangle_field_slat_cache', None),
                 cache_paths=args.get('triangle_field_slat_cache_path', None),
+                t=torch.zeros_like(t),
+                resolution=args.get('high_resolution', None),
             )
 
             resolution = args.get('high_resolution', None)
@@ -2100,6 +2462,8 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 pred_images.setdefault(k, []).append(v[:batch])
 
         self.models['encoder'].train()
+        if self.train_timestep_decoder:
+            self.decoder.train()
 
         sample_dict = {}
         for k in gt_images:

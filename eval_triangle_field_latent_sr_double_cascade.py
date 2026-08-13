@@ -105,8 +105,16 @@ def run_stage(
         guidance_strength,
         high_resolution=high_resolution,
     )
-    sample = trainer._decode_latents_with_cache(sample_z, caches=caches)
-    pred_last = trainer._decode_latents_with_cache(pred_z0_last, caches=caches)
+    decode_kwargs = {
+        't': torch.zeros(sample_z.shape[0], device=sample_z.device),
+        'resolution': high_resolution,
+    }
+    sample = trainer._decode_latents_with_cache(
+        sample_z, caches=caches, **decode_kwargs
+    )
+    pred_last = trainer._decode_latents_with_cache(
+        pred_z0_last, caches=caches, **decode_kwargs
+    )
     return sample, pred_last
 
 

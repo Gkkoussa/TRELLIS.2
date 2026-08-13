@@ -1211,4 +1211,145 @@ class SparseUnetVaeDecoder(nn.Module):
                     h, sub = block(h)
                 else:
                     h = block(h)
+
+
+class SparseUnetVaeDecoderTimeFiLM(SparseUnetVaeDecoder):
+    """VAE decoder with zero-initialized timestep and resolution FiLM."""
+
+    def __init__(
+        self,
+        *args,
+        time_embed_dim: int = 256,
+        time_embed_max_period: int = 10000,
+        resolution_reference: float = 128.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.time_embed_dim = int(time_embed_dim)
+        self.time_embed_max_period = int(time_embed_max_period)
+        self.resolution_reference = float(resolution_reference)
+        if self.time_embed_dim <= 0:
+            raise ValueError(f'time_embed_dim must be positive, got {time_embed_dim}')
+        if self.resolution_reference <= 0:
+            raise ValueError(
+                f'resolution_reference must be positive, got {resolution_reference}'
+            )
+
+        self.time_embed = nn.Sequential(
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+        )
+        self.resolution_embed = nn.Sequential(
+            nn.Linear(1, self.time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+        )
+        self.film_layers = nn.ModuleList([])
+        for i, res in enumerate(self.blocks):
+            film_res = nn.ModuleList([])
+            for j, _ in enumerate(res):
+                out_channels = self.model_channels[i]
+                if i < len(self.blocks) - 1 and j == len(res) - 1:
+                    out_channels = self.model_channels[i + 1]
+                film = nn.Linear(self.time_embed_dim, 2 * out_channels)
+                nn.init.constant_(film.weight, 0)
+                nn.init.constant_(film.bias, 0)
+                film_res.append(film)
+            self.film_layers.append(film_res)
+
+    def _embed_resolution(
+        self,
+        resolution: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if resolution is None:
+            raise ValueError('resolution must be provided to the timestep-conditioned decoder')
+        resolution = torch.as_tensor(
+            resolution,
+            device=device,
+            dtype=torch.float32,
+        ).reshape(-1)
+        if resolution.numel() == 1 and batch_size > 1:
+            resolution = resolution.expand(batch_size)
+        if resolution.numel() != batch_size:
+            raise ValueError(
+                f'resolution must have one value per sample, got '
+                f'{resolution.numel()} for batch {batch_size}'
+            )
+        if torch.any(resolution <= 0):
+            raise ValueError('resolution values must be positive')
+        scalar = torch.log2(resolution / self.resolution_reference).unsqueeze(-1)
+        return self.resolution_embed(scalar)
+
+    def _apply_film(
+        self,
+        h: sp.SparseTensor,
+        emb: torch.Tensor,
+        i: int,
+        j: int,
+    ) -> sp.SparseTensor:
+        scale_shift = self.film_layers[i][j](emb).to(dtype=h.feats.dtype)
+        scale, shift = scale_shift.chunk(2, dim=-1)
+        batch_idx = h.coords[:, 0].long()
+        return h.replace(
+            h.feats * (1.0 + scale[batch_idx]) + shift[batch_idx]
+        )
+
+    def forward(
+        self,
+        x: sp.SparseTensor,
+        t: torch.Tensor,
+        resolution: torch.Tensor,
+        resolution_condition: Optional[torch.Tensor] = None,
+        guide_subs: Optional[List[sp.SparseTensor]] = None,
+        return_subs: bool = False,
+    ) -> sp.SparseTensor:
+        if guide_subs is not None and self.pred_subdiv:
+            raise ValueError('Only decoders with pred_subdiv=False can use guide_subs')
+        if return_subs and not self.pred_subdiv:
+            raise ValueError('Only decoders with pred_subdiv=True can return subdivisions')
+        t = torch.as_tensor(t, device=x.device, dtype=torch.float32).reshape(-1)
+        if t.numel() == 1 and x.shape[0] > 1:
+            t = t.expand(x.shape[0])
+        if t.numel() != x.shape[0]:
+            raise ValueError(
+                f't must have one value per sample, got {t.numel()} for batch {x.shape[0]}'
+            )
+        emb = self.time_embed(
+            timestep_embedding(t, self.time_embed_dim, self.time_embed_max_period)
+        )
+        emb = emb + self._embed_resolution(
+            resolution if resolution_condition is None else resolution_condition,
+            x.shape[0],
+            x.device,
+        )
+
+        h = self.from_latent(x)
+        h = h.type(self.dtype)
+        subs_gt = []
+        subs = []
+        for i, res in enumerate(self.blocks):
+            for j, block in enumerate(res):
+                if i < len(self.blocks) - 1 and j == len(res) - 1:
+                    if self.pred_subdiv:
+                        if self.training:
+                            subs_gt.append(h.get_spatial_cache('subdivision'))
+                        h, sub = block(h)
+                        subs.append(sub)
+                    else:
+                        guide = guide_subs[i] if guide_subs is not None else None
+                        h = block(h, subdiv=guide)
+                else:
+                    h = block(h)
+                h = self._apply_film(h, emb, i, j)
+        h = h.type(x.dtype)
+        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+        h = self.output_layer(h)
+        if self.training and self.pred_subdiv:
+            return h, subs_gt, subs
+        if return_subs:
+            return h, subs
+        return h
        

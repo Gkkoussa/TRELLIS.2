@@ -355,6 +355,24 @@ def load_encoder_checkpoint(trainer, run_dir: Path, step: int, ema_rate: str | N
     state = torch.load(path, map_location=trainer.device, weights_only=True)
     trainer.models["encoder"].load_state_dict(state)
     trainer.models["encoder"].eval()
+    if getattr(trainer, "train_timestep_decoder", False):
+        decoder_name = (
+            f"decoder_step{step:07d}.pt"
+            if ema_rate is None
+            else f"decoder_ema{ema_rate}_step{step:07d}.pt"
+        )
+        decoder_path = run_dir / "ckpts" / decoder_name
+        if not decoder_path.exists():
+            raise FileNotFoundError(
+                f"Timestep decoder checkpoint not found: {decoder_path}"
+            )
+        decoder_state = torch.load(
+            decoder_path,
+            map_location=trainer.device,
+            weights_only=True,
+        )
+        trainer.models["decoder"].load_state_dict(decoder_state)
+        trainer.models["decoder"].eval()
     return str(path)
 
 
@@ -390,8 +408,23 @@ def predict_z0(
     conditioning_noise_level: torch.Tensor | None = None,
     density_statistics: torch.Tensor | None = None,
     shape_tokens: torch.Tensor | None = None,
+    decoded: sp.SparseTensor | None = None,
 ) -> sp.SparseTensor:
-    decoded = trainer._decode_latents_with_cache(z_t, caches=caches, cache_paths=cache_paths)
+    if decoded is None:
+        decoder_t = torch.full(
+            (z_t.shape[0],),
+            t * 1000.0,
+            device=z_t.feats.device,
+            dtype=torch.float32,
+        )
+        decoded = trainer._decode_latents_with_cache(
+            z_t,
+            caches=caches,
+            cache_paths=cache_paths,
+            t=decoder_t,
+            resolution=high_resolution,
+            resolution_condition=resolution_condition,
+        )
     if decoded_density_override is not None:
         if decoded.feats.shape[1] != 3:
             raise ValueError(
@@ -583,6 +616,20 @@ def sample_latent_sr(
     t_seq = np.linspace(1.0, 0.0, steps + 1).tolist()
     pred_z0_last = None
     for t, t_prev in tqdm(list(zip(t_seq[:-1], t_seq[1:])), desc="Sampling latent SR"):
+        decoder_t = torch.full(
+            (z_t.shape[0],),
+            float(t) * 1000.0,
+            device=z_t.feats.device,
+            dtype=torch.float32,
+        )
+        decoded_t = trainer._decode_latents_with_cache(
+            z_t,
+            caches=caches,
+            cache_paths=cache_paths,
+            t=decoder_t,
+            resolution=high_resolution,
+            resolution_condition=resolution_condition,
+        )
         if guided_conditions:
             field_cond = zero_cond if guidance_strength == 0.0 else cond_pos
             pred_pos = predict_z0(
@@ -596,6 +643,7 @@ def sample_latent_sr(
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
                 shape_tokens=shape_tokens,
+                decoded=decoded_t,
             )
             if guided_strength == 1.0:
                 pred_z0 = pred_pos
@@ -611,6 +659,7 @@ def sample_latent_sr(
                     conditioning_noise_level=conditioning_noise_level,
                     density_statistics=density_statistics,
                     shape_tokens=shape_tokens,
+                    decoded=decoded_t,
                 )
                 pred_z0 = pred_pos.replace(
                     guided_strength * pred_pos.feats
@@ -628,6 +677,7 @@ def sample_latent_sr(
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
                 shape_tokens=shape_tokens,
+                decoded=decoded_t,
             )
         else:
             pred_pos = predict_z0(
@@ -641,6 +691,7 @@ def sample_latent_sr(
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
                 shape_tokens=shape_tokens,
+                decoded=decoded_t,
             )
         if not guided_conditions and guidance_strength == 1.0:
             pred_z0 = pred_pos
@@ -656,6 +707,7 @@ def sample_latent_sr(
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
                 shape_tokens=shape_tokens,
+                decoded=decoded_t,
             )
             pred_z0 = pred_pos.replace(
                 guidance_strength * pred_pos.feats + (1.0 - guidance_strength) * pred_neg.feats
@@ -752,9 +804,28 @@ def main():
             shape_normals=data.get("shape_normals", None),
             shape_guidance_strength=args.shape_guidance_strength,
         )
-        gt = data["x_0"] if args.no_latents else trainer._decode_latents_with_cache(data["z_0"], caches=caches, cache_paths=cache_paths)
-        sample = trainer._decode_latents_with_cache(sample_z, caches=caches, cache_paths=cache_paths)
-        pred_last = trainer._decode_latents_with_cache(pred_z0_last, caches=caches, cache_paths=cache_paths)
+        decode_kwargs = {
+            "t": torch.zeros(batch, device=trainer.device, dtype=torch.float32),
+            "resolution": args.high_resolution,
+        }
+        gt = data["x_0"] if args.no_latents else trainer._decode_latents_with_cache(
+            data["z_0"],
+            caches=caches,
+            cache_paths=cache_paths,
+            **decode_kwargs,
+        )
+        sample = trainer._decode_latents_with_cache(
+            sample_z,
+            caches=caches,
+            cache_paths=cache_paths,
+            **decode_kwargs,
+        )
+        pred_last = trainer._decode_latents_with_cache(
+            pred_z0_last,
+            caches=caches,
+            cache_paths=cache_paths,
+            **decode_kwargs,
+        )
 
         append_visuals(dataset, images, "gt", gt, batch)
         append_visuals(dataset, images, "cond", data["cond"], batch)

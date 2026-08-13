@@ -45,6 +45,9 @@ class SupportOnlyDataset(SparseVoxelTriangleFieldVisMixin):
         self.shape_conditioning = bool(shape_conditioning)
         self.shape_context_points = int(shape_context_points)
         self.visualization_keys = visualization_keys
+        # The support-only placeholder returned below satisfies the trainable
+        # decoder trainer's construction-time target-field contract.
+        self.return_high_target_fields = True
 
     def __len__(self):
         return 1
@@ -78,6 +81,12 @@ def parse_args(argv=None):
         type=int,
         default=None,
         help="Evaluate only this index from the sorted OBJ/GLB mesh list.",
+    )
+    parser.add_argument(
+        "--mesh_names",
+        nargs="+",
+        default=None,
+        help="Evaluate these exact filenames from --mesh_dir, in the given order.",
     )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument(
@@ -487,7 +496,12 @@ def shift_mean_then_upper_clamp(
     return tensor.replace(adjusted.to(tensor.feats.dtype)), stats
 
 
-def main(args=None, model_cache=None):
+def main(
+    args=None,
+    model_cache=None,
+    trainer_override=None,
+    ckpt_step_override=None,
+):
     args = parse_args() if args is None else args
     if args.stage_repeats < 1:
         raise ValueError("--stage_repeats must be >= 1")
@@ -697,7 +711,11 @@ def main(args=None, model_cache=None):
             f"{f'_densitymaxcfg{args.density_stat_maximum_guidance_strength:g}' if args.density_stat_maximum_guidance_strength is not None else ''}"
             f"{'_densitystatsvoxelscale' if args.density_statistics_scale_mode == 'voxel_size' else ''}"
         )
-    ckpt_step = find_ckpt_step(run_dir, args.ckpt)
+    ckpt_step = (
+        int(ckpt_step_override)
+        if ckpt_step_override is not None
+        else find_ckpt_step(run_dir, args.ckpt)
+    )
     stages = []
     low_resolution = args.start_resolution
     while low_resolution < 512:
@@ -735,6 +753,16 @@ def main(args=None, model_cache=None):
     cache_dir = Path(args.support_cache_dir).resolve() if args.support_cache_dir else output_dir / "support_cache"
 
     mesh_paths = collect_meshes(mesh_dir, args.recursive)
+    if args.mesh_index is not None and args.mesh_names is not None:
+        raise ValueError("--mesh_index and --mesh_names are mutually exclusive")
+    if args.mesh_names is not None:
+        by_name = {path.name: path for path in mesh_paths}
+        missing = [name for name in args.mesh_names if name not in by_name]
+        if missing:
+            raise FileNotFoundError(
+                f"Requested meshes are missing from {mesh_dir}: {missing}"
+            )
+        mesh_paths = [by_name[name] for name in args.mesh_names]
     if args.mesh_index is not None:
         if not 0 <= args.mesh_index < len(mesh_paths):
             raise IndexError(
@@ -801,7 +829,10 @@ def main(args=None, model_cache=None):
         target_resolutions[0],
     )
     cached_model = model_cache.get(model_cache_key) if model_cache is not None else None
-    if cached_model is None:
+    if trainer_override is not None:
+        trainer = trainer_override
+        ckpt_path = f"in-memory training weights at step {ckpt_step:07d}"
+    elif cached_model is None:
         trainer = build_trainer(
             cfg,
             SupportOnlyDataset(
@@ -1228,6 +1259,7 @@ def main(args=None, model_cache=None):
     summary = {
         "mesh_dir": str(mesh_dir),
         "mesh_index": args.mesh_index,
+        "mesh_names": args.mesh_names,
         "meshes": [{"path": str(path), "sha1": sha} for path, sha in zip(mesh_paths, mesh_hashes)],
         "support_only": True,
         "progression_only": args.progression_only,
