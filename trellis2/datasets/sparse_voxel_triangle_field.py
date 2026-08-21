@@ -1,12 +1,17 @@
 import bisect
+from collections import OrderedDict
 import io
 import json
 import os
 from typing import Union
 
 import numpy as np
+import pandas as pd
 import torch
 import utils3d
+from torch.utils.data import Dataset
+
+from data_toolkit.triangle_field_zarr import open_zipstore, read_zarr_sample
 
 from .components import StandardDatasetBase
 from ..modules import sparse as sp
@@ -465,3 +470,166 @@ class MultiResolutionSparseVoxelTriangleFieldDataset(SparseVoxelTriangleFieldVis
     @staticmethod
     def collate_fn(batch, split_size=None):
         return SparseVoxelTriangleFieldDataset.collate_fn(batch, split_size=split_size)
+
+
+class MultiResolutionZarrSparseVoxelTriangleFieldDataset(
+    SparseVoxelTriangleFieldDataset,
+):
+    """Read equal-sized resolution views from packed triangle-field ZipStore shards."""
+
+    def __init__(
+        self,
+        roots,
+        index_csv: str,
+        resolutions=(32, 64, 128, 256, 512),
+        max_open_shards: int = 4,
+        max_active_voxels: int = 1000000,
+        input_feature_scale: Union[float, list[float], None] = None,
+        distance_transform: str = 'none',
+    ):
+        Dataset.__init__(self)
+        self.resolutions = [int(resolution) for resolution in resolutions]
+        if not self.resolutions:
+            raise ValueError('resolutions must be non-empty.')
+        self.resolution = max(self.resolutions)
+        self.max_open_shards = int(max_open_shards)
+        if self.max_open_shards <= 0:
+            raise ValueError('max_open_shards must be positive.')
+        self.max_active_voxels = int(max_active_voxels)
+        if self.max_active_voxels <= 0:
+            raise ValueError('max_active_voxels must be positive.')
+
+        self.input_layout = INPUT_LAYOUT
+        self.target_layout = TARGET_LAYOUT
+        self.value_range = (0, 1)
+        self.distance_transform = distance_transform
+        if self.distance_transform not in ('none', 'minus_one_one'):
+            raise ValueError(
+                f"distance_transform must be 'none' or 'minus_one_one', got {distance_transform}"
+            )
+        self.input_feature_scale = (
+            None
+            if input_feature_scale is None
+            else torch.tensor(input_feature_scale, dtype=torch.float32)
+        )
+
+        index = pd.read_csv(index_csv)
+        required = {'sha256', 'shard_path', 'local_index'} | {
+            f'num_voxels_{resolution}' for resolution in self.resolutions
+        }
+        missing = required - set(index.columns)
+        if missing:
+            raise ValueError(f'{index_csv} is missing columns: {sorted(missing)}')
+        if index['sha256'].duplicated().any():
+            raise ValueError(f'{index_csv} contains duplicate sha256 values.')
+        if len(index) == 0:
+            raise ValueError(f'{index_csv} contains no samples.')
+
+        self.index_csv = str(index_csv)
+        self.sha256 = index['sha256'].astype(str).tolist()
+        self.shard_paths = index['shard_path'].astype(str).tolist()
+        self.local_indices = index['local_index'].astype(np.int64).tolist()
+        self.num_instances = len(index)
+        self._resolution_instance_indices = []
+        self._cumulative_sizes = []
+        self.loads = []
+        total = 0
+        for resolution in self.resolutions:
+            counts = index[f'num_voxels_{resolution}'].to_numpy(dtype=np.int64)
+            instance_indices = np.flatnonzero(counts <= self.max_active_voxels)
+            self._resolution_instance_indices.append(instance_indices)
+            self.loads.extend(counts[instance_indices].tolist())
+            total += len(instance_indices)
+            self._cumulative_sizes.append(total)
+        self.resolution_groups = {
+            resolution: range(
+                0 if i == 0 else self._cumulative_sizes[i - 1],
+                self._cumulative_sizes[i],
+            )
+            for i, resolution in enumerate(self.resolutions)
+        }
+
+        self._store_pid = None
+        self._open_shards = OrderedDict()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_store_pid'] = None
+        state['_open_shards'] = OrderedDict()
+        return state
+
+    def _close_shards(self):
+        for store, _ in self._open_shards.values():
+            store.close()
+        self._open_shards.clear()
+
+    def __del__(self):
+        try:
+            self._close_shards()
+        except Exception:
+            pass
+
+    def _zarr_root(self, path: str):
+        pid = os.getpid()
+        if self._store_pid != pid:
+            self._close_shards()
+            self._store_pid = pid
+        if path in self._open_shards:
+            store_root = self._open_shards.pop(path)
+            self._open_shards[path] = store_root
+            return store_root[1]
+
+        store_root = open_zipstore(path)
+        self._open_shards[path] = store_root
+        while len(self._open_shards) > self.max_open_shards:
+            store, _ = self._open_shards.popitem(last=False)[1]
+            store.close()
+        return store_root[1]
+
+    def __len__(self):
+        return self._cumulative_sizes[-1]
+
+    def __getitem__(self, index):
+        resolution_index = bisect.bisect_right(self._cumulative_sizes, int(index))
+        group_start = 0 if resolution_index == 0 else self._cumulative_sizes[resolution_index - 1]
+        instance_index = int(
+            self._resolution_instance_indices[resolution_index][int(index) - group_start]
+        )
+        resolution = self.resolutions[resolution_index]
+        coords, features = read_zarr_sample(
+            self._zarr_root(self.shard_paths[instance_index]),
+            resolution,
+            self.local_indices[instance_index],
+        )
+        coords = torch.from_numpy(coords)
+        features = torch.from_numpy(features.astype(np.float32, copy=False))
+        sparse_coords = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1)
+        input_features = self._transform_distance_channels(features[:, :self.num_input_channels])
+        target_features = torch.cat(
+            [input_features[:, self.input_layout[name]] for name in self.target_layout],
+            dim=1,
+        )
+        return {
+            'x': sp.SparseTensor(
+                self._scale_input_features(input_features).float(),
+                sparse_coords,
+            ),
+            'target': sp.SparseTensor(target_features.float(), sparse_coords),
+            'resolution': torch.tensor(resolution, dtype=torch.int32),
+        }
+
+    def __str__(self):
+        return '\n'.join([
+            self.__class__.__name__,
+            f'  - Unique instances: {self.num_instances}',
+            f'  - Total resolution samples: {len(self)}',
+            f'  - Resolutions: {self.resolutions}',
+            f'  - Index: {self.index_csv}',
+            f'  - Maximum open shards per worker: {self.max_open_shards}',
+            f'  - Maximum active voxels: {self.max_active_voxels}',
+            '  - Samples by resolution: '
+            + str({resolution: len(self.resolution_groups[resolution]) for resolution in self.resolutions}),
+            f'  - Input channels: {self.num_input_channels}',
+            f'  - Target channels: {self.num_target_channels}',
+            f'  - Distance transform: {self.distance_transform}',
+        ])

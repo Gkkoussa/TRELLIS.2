@@ -84,6 +84,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             'density': 0.0,
             'elongation': 0.0,
             'shape': 0.0,
+            'support': 0.0,
             **{name: 0.0 for name in DENSITY_STATISTIC_CONDITION_NAMES},
         }
         if condition_drop_values is not None:
@@ -725,6 +726,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
         force_field_drop: Optional[torch.Tensor] = None,
         density_statistics: Optional[torch.Tensor] = None,
         shape_presence: Optional[torch.Tensor] = None,
+        support_presence: Optional[torch.Tensor] = None,
     ) -> Tuple:
         batch_size = cond.shape[0]
         condition_names = ['field']
@@ -770,6 +772,19 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
                 )
             condition_names.append('shape')
             conditions.append(shape_presence)
+        if support_presence is not None:
+            support_presence = torch.as_tensor(
+                support_presence,
+                device=cond.feats.device,
+                dtype=torch.float32,
+            ).reshape(-1, 1)
+            if support_presence.shape != (batch_size, 1):
+                raise ValueError(
+                    f'support_presence must have shape ({batch_size}, 1), got '
+                    f'{tuple(support_presence.shape)}'
+                )
+            condition_names.append('support')
+            conditions.append(support_presence)
 
         event = torch.rand(batch_size, device=cond.feats.device)
         drop_all = event < self.cond_drop_prob
@@ -888,6 +903,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             dropped_by_name.get('elongation'),
             dropped_density_statistics,
             dropped_by_name.get('shape'),
+            dropped_by_name.get('support'),
             masks,
         )
 
@@ -1001,7 +1017,7 @@ class TriangleFieldSuperResolutionFlowTrainer(FlowMatchingTrainer):
             high_resolution=kwargs.get('high_resolution', None),
             return_noise_level=True,
         )
-        cond, density_cond, elongation_cond, _, _, cond_drop = self._drop_conditions(
+        cond, density_cond, elongation_cond, _, _, _, cond_drop = self._drop_conditions(
             cond,
             density_cond,
             elongation_cond,
@@ -1175,6 +1191,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         density_statistics_relax_std: float = 1.5,
         batch_size_per_gpu_by_high_resolution: dict = None,
         resolution_sampling_weights: dict = None,
+        use_decoded_field_input: bool = True,
         train_timestep_decoder: bool = False,
         decoder_field_loss_weight: float = 1.0,
         cascade_snapshot: dict = None,
@@ -1200,6 +1217,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             {int(key): float(value) for key, value in resolution_sampling_weights.items()}
             if resolution_sampling_weights is not None else None
         )
+        self.use_decoded_field_input = bool(use_decoded_field_input)
         self.train_timestep_decoder = bool(train_timestep_decoder)
         self.decoder_field_loss_weight = float(decoder_field_loss_weight)
         self.cascade_snapshot = copy.deepcopy(cascade_snapshot)
@@ -1287,6 +1305,15 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                     f'missing={invalid_missing}, unexpected={unexpected}'
                 )
             model_dict['decoder'] = decoder
+        if not self.use_decoded_field_input:
+            if self.train_timestep_decoder:
+                raise ValueError(
+                    'use_decoded_field_input=false is incompatible with train_timestep_decoder'
+                )
+            if self.decoded_density_mode != 'none':
+                raise ValueError(
+                    'use_decoded_field_input=false requires decoded_density_mode=none'
+                )
         if self.latent_loss_parameterization not in ('z0', 'velocity'):
             raise ValueError(
                 "latent_loss_parameterization must be 'z0' or 'velocity', "
@@ -1353,6 +1380,21 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                     'Encoder and dataset shape context point counts must match, '
                     f'got {model_shape_points} and {dataset_shape_points}'
                 )
+        model_uses_support = bool(getattr(
+            self.models['encoder'],
+            'multiscale_support_conditioning',
+            False,
+        ))
+        dataset_has_support = bool(getattr(
+            self.dataset,
+            'multiscale_support_conditioning',
+            False,
+        ))
+        if model_uses_support != dataset_has_support:
+            raise ValueError(
+                'Encoder and dataset multiscale_support_conditioning must be enabled '
+                f'together, got {model_uses_support} and {dataset_has_support}'
+            )
         if (
             self.decoded_density_mode == 'condition' and
             getattr(self.dataset, 'density_conditioning', False)
@@ -1443,6 +1485,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             f'  - Latent self-conditioning: {self.latent_self_conditioning}',
             f'  - Decoded density mode: {self.decoded_density_mode}',
             f'  - Scalar condition presence: {self.scalar_condition_presence}',
+            f'  - Use decoded field input: {self.use_decoded_field_input}',
             f'  - Train timestep decoder: {self.train_timestep_decoder}',
             f'  - Decoder field loss weight: {self.decoder_field_loss_weight}',
             f'  - Cascade snapshot: {self.cascade_snapshot}',
@@ -1664,6 +1707,19 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         decoded.clear_spatial_cache()
         return decoded
 
+    def _latent_encoder_field_input(
+        self,
+        z: sp.SparseTensor,
+        reference: sp.SparseTensor,
+        **decode_kwargs,
+    ) -> sp.SparseTensor:
+        if self.use_decoded_field_input:
+            return self._decode_latents_with_cache(z, **decode_kwargs)
+        out_channels = int(self.decoder_model_config['args']['out_channels'])
+        return reference.replace(reference.feats.new_zeros(
+            (reference.feats.shape[0], out_channels)
+        ))
+
     @staticmethod
     def _per_sample_field_l1(
         pred: sp.SparseTensor,
@@ -1878,6 +1934,9 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         shape_normals: Optional[torch.Tensor] = None,
         shape_tokens: Optional[torch.Tensor] = None,
         shape_presence: Optional[torch.Tensor] = None,
+        support_512: Optional[sp.SparseTensor] = None,
+        support_features: Optional[Dict[int, sp.SparseTensor]] = None,
+        support_presence: Optional[torch.Tensor] = None,
     ) -> Tuple[sp.SparseTensor, Dict[str, Any], Optional[torch.Tensor]]:
         x_t, density_cond = self._resolve_decoded_density(decoded, density_cond)
         if not torch.equal(x_t.coords, cond.coords):
@@ -1890,6 +1949,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             'density',
             'elongation',
             'shape',
+            'support',
             *DENSITY_STATISTIC_CONDITION_NAMES,
         }
         if unknown:
@@ -1987,6 +2047,46 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             raise ValueError(
                 'Shape inputs were provided but encoder shape_conditioning is disabled'
             )
+        model_uses_support = bool(getattr(
+            self.models['encoder'],
+            'multiscale_support_conditioning',
+            False,
+        ))
+        support_inputs_provided = support_512 is not None or support_features is not None
+        if model_uses_support:
+            if not support_inputs_provided:
+                raise ValueError(
+                    'Support-conditioned encoder requires support_512 or cached '
+                    'support_features'
+                )
+            if support_presence is None:
+                support_presence = torch.ones(
+                    z_t.shape[0],
+                    device=z_t.feats.device,
+                    dtype=torch.float32,
+                )
+            else:
+                support_presence = torch.as_tensor(
+                    support_presence,
+                    device=z_t.feats.device,
+                    dtype=torch.float32,
+                ).reshape(-1)
+                if support_presence.numel() != z_t.shape[0]:
+                    raise ValueError(
+                        f'support_presence must have {z_t.shape[0]} values, got '
+                        f'{support_presence.numel()}'
+                    )
+            if 'support' in dropped_condition_names:
+                support_presence = torch.zeros_like(support_presence)
+            encoder_kwargs.update({
+                'support_512': support_512,
+                'support_features': support_features,
+                'support_presence': support_presence,
+            })
+        elif support_inputs_provided or support_presence is not None:
+            raise ValueError(
+                'Support inputs were provided but encoder support conditioning is disabled'
+            )
         return enc_in, encoder_kwargs, latent_cond_missing
 
     def training_losses(
@@ -2006,12 +2106,14 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
         high_resolution: torch.Tensor = None,
         shape_points: torch.Tensor = None,
         shape_normals: torch.Tensor = None,
+        support_512: sp.SparseTensor = None,
         **kwargs,
     ) -> Tuple[Dict, Dict]:
         t = self.sample_t(z_0.shape[0]).to(z_0.feats.device).float()
         z_t, _ = self._diffuse_latent(z_0, t)
-        decoded = self._decode_latents_with_cache(
+        decoded = self._latent_encoder_field_input(
             z_t,
+            cond,
             caches=triangle_field_slat_cache,
             cache_paths=triangle_field_slat_cache_path,
             t=t * 1000.0,
@@ -2057,12 +2159,33 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 device=cond.feats.device,
                 dtype=torch.float32,
             )
+        model_uses_support = bool(getattr(
+            self.models['encoder'],
+            'multiscale_support_conditioning',
+            False,
+        ))
+        support_presence = None
+        if model_uses_support:
+            if support_512 is None:
+                raise ValueError(
+                    'Support-conditioned encoder requires support_512 from the dataset'
+                )
+            support_presence = torch.ones(
+                (cond.shape[0], 1),
+                device=cond.feats.device,
+                dtype=torch.float32,
+            )
+        elif support_512 is not None:
+            raise ValueError(
+                'Dataset provided support_512 but encoder support conditioning is disabled'
+            )
         (
             cond,
             density_cond,
             elongation_cond,
             density_statistics,
             shape_presence,
+            support_presence,
             cond_drop,
         ) = self._drop_conditions(
             cond,
@@ -2071,6 +2194,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             force_field_drop,
             density_statistics,
             shape_presence,
+            support_presence,
         )
         enc_in, encoder_kwargs, latent_cond_missing = self._build_latent_encoder_input(
             z_t,
@@ -2123,6 +2247,11 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             raise ValueError(
                 'Dataset provided shape geometry but encoder shape_conditioning is disabled'
             )
+        if model_uses_support:
+            encoder_kwargs.update({
+                'support_512': support_512,
+                'support_presence': support_presence,
+            })
         pred_z0 = self.training_models['encoder'](
             enc_in,
             t * 1000.0,
@@ -2161,6 +2290,8 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
             status['cond/elongation_drop_frac'] = cond_drop['elongation'].float().mean()
         if 'shape' in cond_drop:
             status['cond/shape_drop_frac'] = cond_drop['shape'].float().mean()
+        if 'support' in cond_drop:
+            status['cond/support_drop_frac'] = cond_drop['support'].float().mean()
         for name in DENSITY_STATISTIC_CONDITION_NAMES:
             if name in cond_drop:
                 status[f'cond/{name}_drop_frac'] = cond_drop[name].float().mean()
@@ -2403,8 +2534,9 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 t=torch.zeros_like(t),
                 resolution=args.get('high_resolution', None),
             )
-            decoded = self._decode_latents_with_cache(
+            decoded = self._latent_encoder_field_input(
                 z_t,
+                args['cond'],
                 caches=args.get('triangle_field_slat_cache', None),
                 cache_paths=args.get('triangle_field_slat_cache_path', None),
                 t=t * 1000.0,
@@ -2425,6 +2557,7 @@ class TriangleFieldLatentSuperResolutionFlowTrainer(TriangleFieldSuperResolution
                 density_statistics=args.get('density_statistics', None),
                 shape_points=args.get('shape_points', None),
                 shape_normals=args.get('shape_normals', None),
+                support_512=args.get('support_512', None),
             )
             if getattr(
                 self.models['encoder'],

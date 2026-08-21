@@ -13,8 +13,11 @@ import tempfile
 
 
 BLENDER_LINK = 'https://ftp.halifax.rwth-aachen.de/blender/release/Blender4.5/blender-4.5.1-linux-x64.tar.xz'
-BLENDER_INSTALLATION_PATH = '/tmp'
-BLENDER_PATH = f'{BLENDER_INSTALLATION_PATH}/blender-4.5.1-linux-x64/blender'
+BLENDER_INSTALLATION_PATH = os.environ.get('BLENDER_INSTALLATION_PATH', '/tmp')
+BLENDER_PATH = os.environ.get(
+    'BLENDER_PATH',
+    f'{BLENDER_INSTALLATION_PATH}/blender-4.5.1-linux-x64/blender',
+)
 
 def _install_blender():
     if not os.path.exists(BLENDER_PATH):

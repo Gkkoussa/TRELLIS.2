@@ -661,6 +661,9 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
         latent_tokens_column: str = 'triangle_field_latent_tokens',
         max_latent_tokens: int = 32768,
         return_high_target_fields: bool = False,
+        multiscale_support_conditioning: bool = False,
+        support_voxel_root_key: str = 'support_triangle_field_voxel',
+        support_resolution: int = 512,
         **kwargs,
     ):
         self.latent_root_key = latent_root_key
@@ -668,6 +671,9 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
         self.latent_tokens_column = latent_tokens_column
         self.max_latent_tokens = max_latent_tokens
         self.return_high_target_fields = bool(return_high_target_fields)
+        self.multiscale_support_conditioning = bool(multiscale_support_conditioning)
+        self.support_voxel_root_key = str(support_voxel_root_key)
+        self.support_resolution = int(support_resolution)
         super().__init__(*args, **kwargs)
 
     def __str__(self):
@@ -676,6 +682,7 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
             f'  - Latent root key: {self.latent_root_key}',
             f'  - Max latent tokens: {self.max_latent_tokens}',
             f'  - Return high target fields: {self.return_high_target_fields}',
+            f'  - Multiscale support conditioning: {self.multiscale_support_conditioning}',
         ]
         return '\n'.join(lines)
 
@@ -693,6 +700,16 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
                 .intersection(set(high_metadata['sha256'].values))
                 .intersection(set(latent_metadata['sha256'].values))
             )
+            if self.multiscale_support_conditioning:
+                if self.support_voxel_root_key not in root:
+                    raise KeyError(
+                        'Multiscale support conditioning requires root key '
+                        f'{self.support_voxel_root_key}. Available keys: {sorted(root.keys())}'
+                    )
+                support_metadata = pd.read_csv(
+                    os.path.join(root[self.support_voxel_root_key], 'metadata.csv')
+                )
+                valid = valid.intersection(set(support_metadata['sha256'].values))
             if self.density_conditioning:
                 if self.density_voxel_root_key not in root:
                     raise KeyError(
@@ -824,6 +841,19 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
         }
         if self.return_high_target_fields:
             pack['x_0'] = sp.SparseTensor(high_target.float(), sparse_coords)
+        if self.multiscale_support_conditioning:
+            support_coords = self._read_coords(
+                root[self.support_voxel_root_key],
+                instance,
+            )
+            support_sparse_coords = torch.cat([
+                torch.zeros_like(support_coords[:, 0:1]),
+                support_coords,
+            ], dim=-1).int()
+            pack['support_512'] = sp.SparseTensor(
+                torch.ones((support_coords.shape[0], 1), dtype=torch.float32),
+                support_sparse_coords,
+            )
         if self.density_conditioning:
             pack['density_cond'] = sp.SparseTensor(density_cond.float(), sparse_coords)
             pack['density_missing_parent_frac'] = torch.tensor(density_missing_frac, dtype=torch.float32)
@@ -885,6 +915,14 @@ class MultiResolutionTriangleFieldLatentSuperResolutionDataset(SparseVoxelTriang
         density_conditioning = bool(kwargs.get('density_conditioning', False))
         elongation_conditioning = bool(kwargs.get('elongation_conditioning', False))
         shape_conditioning = bool(kwargs.get('shape_conditioning', False))
+        multiscale_support_conditioning = bool(
+            kwargs.get('multiscale_support_conditioning', False)
+        )
+        support_voxel_root_key = kwargs.get(
+            'support_voxel_root_key',
+            'support_triangle_field_voxel',
+        )
+        support_resolution = int(kwargs.get('support_resolution', max(self.resolutions)))
         shape_mesh_root_key = kwargs.get('shape_mesh_root_key', 'mesh')
 
         self.datasets = []
@@ -905,6 +943,12 @@ class MultiResolutionTriangleFieldLatentSuperResolutionDataset(SparseVoxelTriang
                     high_voxel_root_key: high_voxel_root,
                     latent_root_key: self._resolve_root(source_roots, latent_root_key, high_resolution),
                 }
+                if multiscale_support_conditioning:
+                    pair_root[support_voxel_root_key] = self._resolve_root(
+                        source_roots,
+                        voxel_root_key,
+                        support_resolution,
+                    )
                 if density_conditioning:
                     pair_root[density_root_key] = self._resolve_root(
                         source_roots, density_root_key, high_resolution
@@ -944,6 +988,8 @@ class MultiResolutionTriangleFieldLatentSuperResolutionDataset(SparseVoxelTriang
         self.density_conditioning = density_conditioning
         self.elongation_conditioning = elongation_conditioning
         self.shape_conditioning = shape_conditioning
+        self.multiscale_support_conditioning = multiscale_support_conditioning
+        self.support_resolution = support_resolution
         self.return_high_target_fields = all(
             dataset.return_high_target_fields for dataset in self.datasets
         )

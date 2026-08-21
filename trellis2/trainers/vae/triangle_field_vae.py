@@ -12,7 +12,12 @@ from easydict import EasyDict as edict
 
 from .pbr_vae import PbrVaeTrainer
 from ...modules import sparse as sp
-from ...utils.data_utils import recursive_to_device, cycle, BalancedResumableSampler
+from ...utils.data_utils import (
+    recursive_to_device,
+    cycle,
+    BalancedResumableSampler,
+    GroupedBalancedResumableBatchSampler,
+)
 from ...utils.dist_utils import read_file_dist
 
 
@@ -35,6 +40,10 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
         voxel_loss_weight: dict = None,
         aux_feature_dropout: dict = None,
         partial_load_expanded_io: bool = False,
+        sample_balanced_loss: bool = False,
+        batch_size_per_gpu_by_resolution: dict = None,
+        resolution_sampling_weights: dict = None,
+        validation_dataset=None,
         **kwargs,
     ):
         self.debug_nans = debug_nans
@@ -42,6 +51,16 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
         self.aux_feature_dropout = aux_feature_dropout
         self.partial_load_expanded_io = partial_load_expanded_io
         self.lambda_subdiv = lambda_subdiv
+        self.sample_balanced_loss = bool(sample_balanced_loss)
+        self.batch_size_per_gpu_by_resolution = (
+            {int(key): int(value) for key, value in batch_size_per_gpu_by_resolution.items()}
+            if batch_size_per_gpu_by_resolution is not None else None
+        )
+        self.resolution_sampling_weights = (
+            {int(key): float(value) for key, value in resolution_sampling_weights.items()}
+            if resolution_sampling_weights is not None else None
+        )
+        self.validation_dataset = validation_dataset
         self._zero_decoder_grad_for_step = False
         self._decoder_grad_hooks = []
         if self.voxel_loss_weight is not None:
@@ -311,6 +330,45 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
         This matches PbrVaeTrainer so existing sparse voxel batching behavior is
         unchanged.
         """
+        if self.batch_size_per_gpu_by_resolution is not None:
+            if self.batch_split != 1:
+                raise ValueError('Resolution-specific batches require batch_split=1.')
+            groups = getattr(self.dataset, 'resolution_groups', None)
+            if groups is None:
+                raise ValueError(
+                    'Resolution-specific batches require dataset.resolution_groups.'
+                )
+            if set(groups) != set(self.batch_size_per_gpu_by_resolution):
+                raise ValueError(
+                    'batch_size_per_gpu_by_resolution must define every resolution: '
+                    f'{sorted(groups)}; got {sorted(self.batch_size_per_gpu_by_resolution)}'
+                )
+            if (
+                self.resolution_sampling_weights is not None
+                and set(groups) != set(self.resolution_sampling_weights)
+            ):
+                raise ValueError(
+                    'resolution_sampling_weights must define every resolution: '
+                    f'{sorted(groups)}; got {sorted(self.resolution_sampling_weights)}'
+                )
+            self.data_sampler = GroupedBalancedResumableBatchSampler(
+                self.dataset,
+                groups=groups,
+                batch_sizes=self.batch_size_per_gpu_by_resolution,
+                group_weights=self.resolution_sampling_weights,
+                shuffle=True,
+            )
+            self.dataloader = DataLoader(
+                self.dataset,
+                batch_sampler=self.data_sampler,
+                num_workers=self.num_workers if self.num_workers is not None else int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
+                pin_memory=True,
+                persistent_workers=(self.num_workers or 0) > 0,
+                collate_fn=self.dataset.collate_fn,
+            )
+            self.data_iterator = self._cycle_resolution_dataloader()
+            return
+
         self.data_sampler = BalancedResumableSampler(
             self.dataset,
             shuffle=True,
@@ -327,6 +385,27 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
             sampler=self.data_sampler,
         )
         self.data_iterator = cycle(self.dataloader)
+
+    def _cycle_resolution_dataloader(self):
+        while True:
+            for data in self.dataloader:
+                self.data_sampler.idx += 1
+                yield data
+            self.data_sampler.epoch += 1
+            self.data_sampler.idx = 0
+
+    def __str__(self):
+        lines = [super().__str__(), f'  - Sample-balanced loss: {self.sample_balanced_loss}']
+        if self.batch_size_per_gpu_by_resolution is not None:
+            lines.append(
+                '  - Batch size per GPU by resolution: '
+                f'{self.batch_size_per_gpu_by_resolution}'
+            )
+        if self.resolution_sampling_weights is not None:
+            lines.append(
+                f'  - Resolution sampling weights: {self.resolution_sampling_weights}'
+            )
+        return '\n'.join(lines)
 
     def _inverse_triangle_area_weight(self, x: sp.SparseTensor) -> torch.Tensor:
         """
@@ -364,6 +443,7 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
         target: torch.Tensor,
         pred: torch.Tensor,
         weight: torch.Tensor = None,
+        layout=None,
     ) -> torch.Tensor:
         if self.loss_type == 'l1':
             err = torch.abs(target - pred)
@@ -374,6 +454,10 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
 
         if weight is not None:
             err = err * weight.reshape(-1, 1).to(device=err.device, dtype=err.dtype)
+        if self.sample_balanced_loss:
+            if layout is None:
+                raise ValueError('Sample-balanced reconstruction loss requires a sparse layout.')
+            return torch.stack([err[sample_slice].mean() for sample_slice in layout]).mean()
         return err.mean()
 
     @staticmethod
@@ -465,12 +549,16 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
                 self._debug_abort_if_nonfinite('loss_weight', status)
 
         if self.loss_type == 'l1':
-            terms['l1'] = self._reconstruction_loss(target.feats, y.feats, loss_weight)
+            terms['l1'] = self._reconstruction_loss(
+                target.feats, y.feats, loss_weight, target.layout
+            )
             if self.debug_nans:
                 status.update(self._debug_tensor_stats('loss/l1', terms['l1'].reshape(1)))
             terms['loss'] = terms['loss'] + terms['l1']
         elif self.loss_type == 'l2':
-            terms['l2'] = self._reconstruction_loss(target.feats, y.feats, loss_weight)
+            terms['l2'] = self._reconstruction_loss(
+                target.feats, y.feats, loss_weight, target.layout
+            )
             if self.debug_nans:
                 status.update(self._debug_tensor_stats('loss/l2', terms['l2'].reshape(1)))
             terms['loss'] = terms['loss'] + terms['l2']
@@ -484,7 +572,13 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
         if subs:
             status['subdiv/num_stages'] = float(len(subs))
 
-        terms['kl'] = 0.5 * torch.mean(mean.pow(2) + logvar.exp() - logvar - 1)
+        kl = 0.5 * (mean.pow(2) + logvar.exp() - logvar - 1)
+        if self.sample_balanced_loss:
+            terms['kl'] = torch.stack([
+                kl[sample_slice].mean() for sample_slice in z.layout
+            ]).mean()
+        else:
+            terms['kl'] = kl.mean()
         terms['loss'] = terms['loss'] + self.lambda_kl * terms['kl']
         if self.debug_nans:
             status.update(self._debug_tensor_stats('loss/kl', terms['kl'].reshape(1)))
@@ -500,7 +594,7 @@ class TriangleFieldVaeTrainer(PbrVaeTrainer):
         batch_size: int,
         verbose: bool = False,
     ) -> Dict:
-        snapshot_dataset = copy.deepcopy(self.dataset)
+        snapshot_dataset = copy.deepcopy(self.validation_dataset or self.dataset)
         dataloader = DataLoader(
             snapshot_dataset,
             batch_size=batch_size,

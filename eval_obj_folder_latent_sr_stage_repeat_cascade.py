@@ -36,6 +36,7 @@ class SupportOnlyDataset(SparseVoxelTriangleFieldVisMixin):
         density_statistics_conditioning: bool = False,
         shape_conditioning: bool = False,
         shape_context_points: int = 16384,
+        multiscale_support_conditioning: bool = False,
         visualization_keys: tuple[str, ...] | None = None,
     ):
         self.resolution = int(resolution)
@@ -44,6 +45,7 @@ class SupportOnlyDataset(SparseVoxelTriangleFieldVisMixin):
         self.density_statistics = object() if density_statistics_conditioning else None
         self.shape_conditioning = bool(shape_conditioning)
         self.shape_context_points = int(shape_context_points)
+        self.multiscale_support_conditioning = bool(multiscale_support_conditioning)
         self.visualization_keys = visualization_keys
         # The support-only placeholder returned below satisfies the trainable
         # decoder trainer's construction-time target-field contract.
@@ -93,6 +95,11 @@ def parse_args(argv=None):
         "--progression_only",
         action="store_true",
         help="Render only stage/repeat d_tri samples needed by the progression sheet.",
+    )
+    parser.add_argument(
+        "--final_only",
+        action="store_true",
+        help="Render only the final repeat of the final cascade stage.",
     )
     parser.add_argument("--steps", type=int, default=11)
     parser.add_argument("--base_guidance_strength", type=float, default=0.0)
@@ -223,6 +230,8 @@ def parse_args(argv=None):
     parser.add_argument("--drop_elongation_conditioning", action="store_true")
     parser.add_argument("--shape_guidance_strength", type=float, default=None)
     parser.add_argument("--drop_shape_conditioning", action="store_true")
+    parser.add_argument("--support_guidance_strength", type=float, default=None)
+    parser.add_argument("--drop_support_conditioning", action="store_true")
     parser.add_argument(
         "--fixed_resolution_condition",
         type=float,
@@ -659,6 +668,7 @@ def main(
             args.density_stat_median_guidance_strength,
             args.density_stat_maximum_guidance_strength,
             args.shape_guidance_strength,
+            args.support_guidance_strength,
         )
         if strength is not None
     ]
@@ -678,6 +688,10 @@ def main(
     )
     shape_config = cfg["models"]["encoder"]["args"].get("shape_conditioning", None)
     model_uses_shape = shape_config is not None
+    model_uses_support = (
+        cfg["models"]["encoder"]["args"].get("multiscale_support_conditioning")
+        is not None
+    )
     model_uses_resolution_conditioning = bool(
         cfg["models"]["encoder"]["args"].get("resolution_conditioning", False)
     )
@@ -692,6 +706,19 @@ def main(
     if args.drop_shape_conditioning and args.shape_guidance_strength is not None:
         raise ValueError(
             "--drop_shape_conditioning and --shape_guidance_strength are mutually exclusive"
+        )
+    if args.support_guidance_strength is not None and not model_uses_support:
+        raise ValueError(
+            "--support_guidance_strength requires a support-conditioned model"
+        )
+    if args.drop_support_conditioning and not model_uses_support:
+        raise ValueError(
+            "--drop_support_conditioning requires a support-conditioned model"
+        )
+    if args.drop_support_conditioning and args.support_guidance_strength is not None:
+        raise ValueError(
+            "--drop_support_conditioning and --support_guidance_strength are "
+            "mutually exclusive"
         )
     requested_density_statistics = (
         args.density_stat_minimum,
@@ -743,6 +770,8 @@ def main(
         f"{density_statistics_suffix}"
         f"{f'_shapecfg{args.shape_guidance_strength:g}' if args.shape_guidance_strength is not None else ''}"
         f"{'_shapedrop' if args.drop_shape_conditioning else ''}"
+        f"{f'_supportcfg{args.support_guidance_strength:g}' if args.support_guidance_strength is not None else ''}"
+        f"{'_supportdrop' if args.drop_support_conditioning else ''}"
         f"{f'_fixedrescond{args.fixed_resolution_condition:g}' if args.fixed_resolution_condition is not None else ''}"
         f"{'_nested_supports' if args.nested_supports else ''}"
         f"_supportvox-{args.support_voxelizer}"
@@ -843,6 +872,7 @@ def main(
                     int(shape_config.get("context_points", 16384))
                     if model_uses_shape else 16384
                 ),
+                multiscale_support_conditioning=model_uses_support,
             ),
             output_dir,
         )
@@ -905,13 +935,33 @@ def main(
             )
         previous_refined = None
         previous_density_condition = None
+        support_features = None
+        if model_uses_support:
+            support_512 = make_support_tensor(
+                supports,
+                512,
+                start,
+                end,
+                trainer.device,
+            )
+            support_512 = support_512.replace(torch.ones(
+                (support_512.feats.shape[0], 1),
+                dtype=support_512.feats.dtype,
+                device=support_512.device,
+            ))
+            with torch.no_grad():
+                support_features = trainer.models["encoder"].encode_multiscale_support(
+                    support_512
+                )
         for stage_idx, (low_res, high_res) in enumerate(stages):
             high_support = make_support_tensor(supports, high_res, start, end, trainer.device)
             visualizer = SupportOnlyDataset(
                 high_res,
-                visualization_keys=("d_tri",) if args.progression_only else None,
+                visualization_keys=("d_tri",)
+                if (args.progression_only or args.final_only)
+                else None,
             )
-            if not args.progression_only:
+            if not args.progression_only and not args.final_only:
                 add_visuals(images, visualizer, f"stage{low_res}to{high_res}_support", high_support)
 
             cond = high_support.replace(torch.zeros_like(high_support.feats)) if stage_idx == 0 else (
@@ -1080,6 +1130,7 @@ def main(
                     ),
                     ("elongation", args.drop_elongation_conditioning),
                     ("shape", args.drop_shape_conditioning),
+                    ("support", args.drop_support_conditioning),
                 )
                 if dropped
             }
@@ -1133,11 +1184,18 @@ def main(
                     ),
                     shape_tokens=shape_tokens,
                     shape_guidance_strength=args.shape_guidance_strength,
+                    support_features=support_features,
+                    support_guidance_strength=args.support_guidance_strength,
                 )
-                if not args.progression_only:
+                if not args.progression_only and not args.final_only:
                     add_visuals(images, visualizer, f"{prefix}_iter{repeat_num}_cond", cond)
-                add_visuals(images, visualizer, f"{prefix}_iter{repeat_num}_sample", sample)
-                if not args.progression_only:
+                is_final_sample = (
+                    stage_idx == len(stages) - 1
+                    and repeat_idx == stage_repeats - 1
+                )
+                if not args.final_only or is_final_sample:
+                    add_visuals(images, visualizer, f"{prefix}_iter{repeat_num}_sample", sample)
+                if not args.progression_only and not args.final_only:
                     add_visuals(images, visualizer, f"{prefix}_iter{repeat_num}_pred_z0_last", pred_last)
 
                 if args.propagate_decoded_density_conditioning:
@@ -1190,7 +1248,7 @@ def main(
                         triangle_field_channels(sample),
                         factor=2,
                     )
-                    if not args.progression_only:
+                    if not args.progression_only and not args.final_only:
                         add_visuals(images, SupportOnlyDataset(low_res), f"{prefix}_iter{repeat_num}_avg_down_to_{low_res}", feedback_low)
                     cond = sparse_condition_from_low_to_high(feedback_low, high_support, low_res, high_res)
                     guidance = args.guidance_strength
@@ -1263,6 +1321,7 @@ def main(
         "meshes": [{"path": str(path), "sha1": sha} for path, sha in zip(mesh_paths, mesh_hashes)],
         "support_only": True,
         "progression_only": args.progression_only,
+        "final_only": args.final_only,
         "support_extractor": (
             f"{args.support_voxelizer} 512 support; " + "; ".join(
                 f"{resolution}=unique({resolution * 2}//2)"
@@ -1307,6 +1366,13 @@ def main(
         ),
         "shape_guidance_strength": args.shape_guidance_strength,
         "drop_shape_conditioning": args.drop_shape_conditioning,
+        "multiscale_support_conditioning": model_uses_support,
+        "support_guidance_strength": args.support_guidance_strength,
+        "drop_support_conditioning": args.drop_support_conditioning,
+        "support_feature_cache": (
+            "one full 512-support encoding per mesh batch, reused across stages and repeats"
+            if model_uses_support else None
+        ),
         "fixed_resolution_condition": args.fixed_resolution_condition,
         "density_statistics": {
             "minimum": args.density_stat_minimum,

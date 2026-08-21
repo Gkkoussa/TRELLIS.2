@@ -408,6 +408,9 @@ def predict_z0(
     conditioning_noise_level: torch.Tensor | None = None,
     density_statistics: torch.Tensor | None = None,
     shape_tokens: torch.Tensor | None = None,
+    support_512: sp.SparseTensor | None = None,
+    support_features: dict[int, sp.SparseTensor] | None = None,
+    support_presence: torch.Tensor | None = None,
     decoded: sp.SparseTensor | None = None,
 ) -> sp.SparseTensor:
     if decoded is None:
@@ -417,8 +420,9 @@ def predict_z0(
             device=z_t.feats.device,
             dtype=torch.float32,
         )
-        decoded = trainer._decode_latents_with_cache(
+        decoded = trainer._latent_encoder_field_input(
             z_t,
+            cond,
             caches=caches,
             cache_paths=cache_paths,
             t=decoder_t,
@@ -464,6 +468,9 @@ def predict_z0(
         dropped_condition_names,
         density_statistics=density_statistics,
         shape_tokens=shape_tokens,
+        support_512=support_512,
+        support_features=support_features,
+        support_presence=support_presence,
     )
     batch_t = torch.full((z_t.shape[0],), t * 1000.0, device=z_t.feats.device, dtype=torch.float32)
     if getattr(trainer.models["encoder"], "conditioning_noise_conditioning", False):
@@ -508,6 +515,9 @@ def sample_latent_sr(
     shape_normals: torch.Tensor | None = None,
     shape_tokens: torch.Tensor | None = None,
     shape_guidance_strength: float | None = None,
+    support_512: sp.SparseTensor | None = None,
+    support_features: dict[int, sp.SparseTensor] | None = None,
+    support_guidance_strength: float | None = None,
 ):
     decoded_density_condition = getattr(trainer, "decoded_density_mode", "none") == "condition"
     decoded_density_state = getattr(trainer, "decoded_density_mode", "none") == "state"
@@ -534,6 +544,11 @@ def sample_latent_sr(
     decoded_density_override = density_cond if override_decoded_density else None
     model_density_cond = None if override_decoded_density else density_cond
     model_uses_shape = bool(getattr(trainer.models["encoder"], "shape_conditioning", False))
+    model_uses_support = bool(getattr(
+        trainer.models["encoder"],
+        "multiscale_support_conditioning",
+        False,
+    ))
     if shape_tokens is not None and (shape_points is not None or shape_normals is not None):
         raise ValueError("Provide cached shape_tokens or raw shape geometry, not both")
     if shape_tokens is None and shape_points is not None:
@@ -546,6 +561,18 @@ def sample_latent_sr(
         )
     if model_uses_shape and shape_tokens is None:
         raise ValueError("Shape-conditioned evaluation requires shape geometry or cached tokens")
+    if support_512 is not None and support_features is not None:
+        raise ValueError("Provide raw support_512 or cached support_features, not both")
+    if model_uses_support and support_512 is None and support_features is None:
+        raise ValueError(
+            "Support-conditioned evaluation requires support_512 or cached support_features"
+        )
+    if not model_uses_support and (
+        support_512 is not None
+        or support_features is not None
+        or support_guidance_strength is not None
+    ):
+        raise ValueError("Support inputs require a support-conditioned model")
     guided_conditions = {
         name: (condition, strength)
         for name, condition, strength in (
@@ -567,6 +594,11 @@ def sample_latent_sr(
                 density_stat_maximum_guidance_strength,
             ),
             ("shape", shape_tokens, shape_guidance_strength),
+            (
+                "support",
+                support_features if support_features is not None else support_512,
+                support_guidance_strength,
+            ),
         )
         if strength is not None
     }
@@ -622,8 +654,9 @@ def sample_latent_sr(
             device=z_t.feats.device,
             dtype=torch.float32,
         )
-        decoded_t = trainer._decode_latents_with_cache(
+        decoded_t = trainer._latent_encoder_field_input(
             z_t,
+            cond_pos,
             caches=caches,
             cache_paths=cache_paths,
             t=decoder_t,
@@ -643,6 +676,8 @@ def sample_latent_sr(
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
                 shape_tokens=shape_tokens,
+                support_512=support_512,
+                support_features=support_features,
                 decoded=decoded_t,
             )
             if guided_strength == 1.0:
@@ -659,6 +694,8 @@ def sample_latent_sr(
                     conditioning_noise_level=conditioning_noise_level,
                     density_statistics=density_statistics,
                     shape_tokens=shape_tokens,
+                    support_512=support_512,
+                    support_features=support_features,
                     decoded=decoded_t,
                 )
                 pred_z0 = pred_pos.replace(
@@ -677,6 +714,8 @@ def sample_latent_sr(
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
                 shape_tokens=shape_tokens,
+                support_512=support_512,
+                support_features=support_features,
                 decoded=decoded_t,
             )
         else:
@@ -691,6 +730,8 @@ def sample_latent_sr(
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
                 shape_tokens=shape_tokens,
+                support_512=support_512,
+                support_features=support_features,
                 decoded=decoded_t,
             )
         if not guided_conditions and guidance_strength == 1.0:
@@ -707,6 +748,8 @@ def sample_latent_sr(
                 conditioning_noise_level=conditioning_noise_level,
                 density_statistics=density_statistics,
                 shape_tokens=shape_tokens,
+                support_512=support_512,
+                support_features=support_features,
                 decoded=decoded_t,
             )
             pred_z0 = pred_pos.replace(

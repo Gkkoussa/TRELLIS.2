@@ -54,6 +54,11 @@ def parse_args():
     parser.add_argument('--mesh_dir', default=None)
     parser.add_argument('--recursive', action='store_true')
     parser.add_argument('--support_cache_dir', default=None)
+    parser.add_argument(
+        '--support_voxelizer',
+        choices=('o_voxel_native', 'trimesh'),
+        default='o_voxel_native',
+    )
     parser.add_argument('--projection_chunk_size', type=int, default=65536)
     parser.add_argument('--voxel_root', default=None)
     parser.add_argument('--gt_voxel_root', default=None)
@@ -392,7 +397,9 @@ def main():
                 else output_dir / 'support_cache'
             )
             start = time.perf_counter()
-            coords = support_coords_from_mesh(mesh_path, 512, cache_dir)
+            coords = support_coords_from_mesh(
+                mesh_path, 512, cache_dir, args.support_voxelizer
+            )
             timings['support_extraction_or_cache_load_s'] = time.perf_counter() - start
             start = time.perf_counter()
             query_points = project_support_centers(

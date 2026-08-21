@@ -210,6 +210,9 @@ def run_stage(
     density_stat_maximum_guidance_strength: float | None = None,
     shape_tokens: torch.Tensor | None = None,
     shape_guidance_strength: float | None = None,
+    support_512: sp.SparseTensor | None = None,
+    support_features: dict[int, sp.SparseTensor] | None = None,
+    support_guidance_strength: float | None = None,
 ):
     z_0, caches = build_support_latents(data["x_0"], latent_channels)
     sample_z, pred_z0_last = sample_latent_sr(
@@ -236,6 +239,9 @@ def run_stage(
         density_stat_maximum_guidance_strength=density_stat_maximum_guidance_strength,
         shape_tokens=shape_tokens,
         shape_guidance_strength=shape_guidance_strength,
+        support_512=support_512,
+        support_features=support_features,
+        support_guidance_strength=support_guidance_strength,
     )
     decode_kwargs = {
         't': torch.zeros(sample_z.shape[0], device=sample_z.device),

@@ -313,6 +313,137 @@ class SparseConvNeXtBlock3d(nn.Module):
             return self._forward(x)
 
 
+class SparseMultiscaleSupportEncoder(nn.Module):
+    """Encode one full-resolution sparse support into absolute-resolution features."""
+
+    def __init__(
+        self,
+        input_resolution: int,
+        model_channels: List[int],
+        output_channels: int,
+        num_blocks: List[int],
+        block_type: List[str],
+        down_block_type: List[str],
+        block_args: List[Dict[str, Any]],
+        use_fp16: bool = False,
+        use_bf16: bool = False,
+    ):
+        super().__init__()
+        if use_fp16 and use_bf16:
+            raise ValueError('use_fp16 and use_bf16 are mutually exclusive')
+        if input_resolution <= 0:
+            raise ValueError(f'input_resolution must be positive, got {input_resolution}')
+        lengths = {
+            len(model_channels),
+            len(num_blocks),
+            len(block_type),
+            len(block_args),
+        }
+        if len(lengths) != 1 or len(down_block_type) != len(model_channels) - 1:
+            raise ValueError(
+                'Support encoder stage settings must have matching lengths and one '
+                'fewer down_block_type entry'
+            )
+        self.input_resolution = int(input_resolution)
+        self.model_channels = [int(channels) for channels in model_channels]
+        self.output_channels = int(output_channels)
+        self.resolutions = [
+            self.input_resolution // (2 ** level)
+            for level in range(len(self.model_channels))
+        ]
+        if any(resolution <= 0 for resolution in self.resolutions):
+            raise ValueError(
+                f'Invalid support resolutions {self.resolutions} for input '
+                f'resolution {self.input_resolution}'
+            )
+        self.dtype = (
+            torch.float16 if use_fp16
+            else torch.bfloat16 if use_bf16
+            else torch.float32
+        )
+
+        self.input_layer = sp.SparseLinear(1, self.model_channels[0])
+        self.blocks = nn.ModuleList([])
+        self.output_heads = nn.ModuleList([])
+        for stage, channels in enumerate(self.model_channels):
+            stage_blocks = nn.ModuleList([
+                globals()[block_type[stage]](channels, **block_args[stage])
+                for _ in range(num_blocks[stage])
+            ])
+            if stage < len(self.model_channels) - 1:
+                stage_blocks.append(
+                    globals()[down_block_type[stage]](
+                        channels,
+                        self.model_channels[stage + 1],
+                        **block_args[stage],
+                    )
+                )
+            self.blocks.append(stage_blocks)
+            self.output_heads.append(sp.SparseLinear(channels, self.output_channels))
+
+        self.apply(self._initialize_linear)
+        if use_fp16:
+            self.convert_to_fp16()
+        elif use_bf16:
+            self.convert_to_bf16()
+
+    @staticmethod
+    def _initialize_linear(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def convert_to_fp16(self) -> None:
+        self.blocks.apply(convert_module_to_f16)
+        self.dtype = torch.float16
+
+    def convert_to_bf16(self) -> None:
+        self.blocks.apply(lambda module: convert_module_to(module, torch.bfloat16))
+        self.dtype = torch.bfloat16
+
+    def convert_to_fp32(self) -> None:
+        self.blocks.apply(convert_module_to_f32)
+        self.dtype = torch.float32
+
+    def forward(
+        self,
+        support: sp.SparseTensor,
+        target_resolution: Optional[int] = None,
+    ) -> Dict[int, sp.SparseTensor]:
+        if support.feats.shape[1] != 1:
+            raise ValueError(
+                'Multiscale support encoder requires one occupancy channel, got '
+                f'{support.feats.shape[1]}'
+            )
+        if (
+            target_resolution is not None
+            and target_resolution not in self.resolutions
+        ):
+            raise ValueError(
+                f'Support encoder has resolutions {self.resolutions}, not requested '
+                f'target {target_resolution}'
+            )
+        h = self.input_layer(support).type(self.dtype)
+        outputs = {}
+        for stage, stage_blocks in enumerate(self.blocks):
+            num_feature_blocks = len(stage_blocks) - (stage < len(self.blocks) - 1)
+            for block in stage_blocks[:num_feature_blocks]:
+                h = block(h)
+
+            head_input = h.type(support.dtype)
+            head_input = head_input.replace(
+                F.layer_norm(head_input.feats, head_input.feats.shape[-1:])
+            )
+            outputs[self.resolutions[stage]] = self.output_heads[stage](head_input)
+
+            if self.resolutions[stage] == target_resolution:
+                break
+            if stage < len(self.blocks) - 1:
+                h = stage_blocks[-1](h)
+        return outputs
+
+
 class SparseUnetVaeEncoder(nn.Module):
     """
     Sparse Swin Transformer Unet VAE model.
@@ -518,6 +649,7 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         conditioning_noise_embed_scale: float = 1000.0,
         density_statistics_conditioning: bool = False,
         shape_conditioning: Optional[Dict[str, Any]] = None,
+        multiscale_support_conditioning: Optional[Dict[str, Any]] = None,
         latent_cond_channels: int = 0,
         latent_cond_mode: Optional[Literal['bottleneck']] = None,
         **kwargs,
@@ -532,6 +664,8 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         self.conditioning_noise_embed_scale = float(conditioning_noise_embed_scale)
         self.density_statistics_conditioning = bool(density_statistics_conditioning)
         self.shape_conditioning = shape_conditioning is not None
+        self.multiscale_support_conditioning = multiscale_support_conditioning is not None
+        self.support_condition_channels = 0
         if self.resolution_reference <= 0:
             raise ValueError(f'resolution_reference must be positive, got {resolution_reference}')
         if self.conditioning_noise_embed_scale <= 0:
@@ -545,6 +679,19 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
             raise ValueError(f"latent_cond_mode must be None or 'bottleneck', got {self.latent_cond_mode}")
         if self.latent_cond_mode is not None and self.latent_cond_channels <= 0:
             raise ValueError(f'latent_cond_channels must be positive when latent_cond_mode is set, got {latent_cond_channels}')
+
+        if self.multiscale_support_conditioning:
+            support_args = dict(multiscale_support_conditioning)
+            support_args.setdefault('use_fp16', self.dtype == torch.float16)
+            support_args.setdefault('use_bf16', self.dtype == torch.bfloat16)
+            self.support_encoder = SparseMultiscaleSupportEncoder(**support_args)
+            self.support_condition_channels = self.support_encoder.output_channels
+            expected_support_channels = self.support_condition_channels + 1
+            if self.in_channels <= expected_support_channels:
+                raise ValueError(
+                    'Encoder in_channels must include ordinary flow inputs plus '
+                    f'{expected_support_channels} support channels, got {self.in_channels}'
+                )
 
         self.time_embed = nn.Sequential(
             nn.Linear(time_embed_dim, time_embed_dim),
@@ -708,15 +855,18 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         if self.output_transformer_block is not None:
             self.output_transformer_block.apply(convert_module_to_f16)
         self._convert_shape_modules(torch.float16)
+        self._convert_support_modules(torch.float16)
         self.dtype = torch.float16
 
     def convert_to_bf16(self) -> None:
         super().convert_to_bf16()
         self._convert_shape_modules(torch.bfloat16)
+        self._convert_support_modules(torch.bfloat16)
 
     def convert_to_fp32(self) -> None:
         super().convert_to_fp32()
         self._convert_shape_modules(torch.float32)
+        self._convert_support_modules(torch.float32)
 
     def _convert_shape_modules(self, dtype: torch.dtype) -> None:
         if not hasattr(self, 'shape_token_encoder'):
@@ -730,6 +880,126 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         self.shape_post_blocks.apply(converter)
         # Match the existing FiLM projections: consume the fp32 timestep
         # embedding, then cast the projected modulation at the call site.
+
+    def _convert_support_modules(self, dtype: torch.dtype) -> None:
+        if not hasattr(self, 'support_encoder'):
+            return
+        if dtype == torch.float16:
+            self.support_encoder.convert_to_fp16()
+        elif dtype == torch.bfloat16:
+            self.support_encoder.convert_to_bf16()
+        else:
+            self.support_encoder.convert_to_fp32()
+
+    def encode_multiscale_support(
+        self,
+        support_512: sp.SparseTensor,
+        target_resolution: Optional[int] = None,
+    ) -> Dict[int, sp.SparseTensor]:
+        if not self.multiscale_support_conditioning:
+            raise ValueError('Encoder does not have multiscale support conditioning enabled')
+        return self.support_encoder(
+            support_512,
+            target_resolution=target_resolution,
+        )
+
+    def _append_multiscale_support(
+        self,
+        x: sp.SparseTensor,
+        resolution: Optional[torch.Tensor],
+        support_512: Optional[sp.SparseTensor],
+        support_features: Optional[Dict[int, sp.SparseTensor]],
+        support_presence: Optional[torch.Tensor],
+    ) -> sp.SparseTensor:
+        inputs_provided = support_512 is not None or support_features is not None
+        if not self.multiscale_support_conditioning:
+            if inputs_provided or support_presence is not None:
+                raise ValueError(
+                    'Support inputs were provided but multiscale support conditioning is disabled'
+                )
+            return x
+        if support_512 is not None and support_features is not None:
+            raise ValueError('Provide raw support_512 or cached support_features, not both')
+        if not inputs_provided:
+            raise ValueError(
+                'Multiscale support-conditioned encoder requires support_512 or cached '
+                'support_features'
+            )
+        if resolution is None:
+            raise ValueError('Support conditioning requires the target resolution')
+
+        resolutions = torch.as_tensor(
+            resolution,
+            device=x.feats.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if resolutions.numel() == 1 and x.shape[0] > 1:
+            resolutions = resolutions.expand(x.shape[0])
+        if resolutions.numel() != x.shape[0]:
+            raise ValueError(
+                f'Resolution must have {x.shape[0]} values, got {resolutions.numel()}'
+            )
+        unique_resolutions = torch.unique(resolutions)
+        if unique_resolutions.numel() != 1:
+            raise ValueError(
+                'A sparse batch must use one target resolution for support conditioning, '
+                f'got {unique_resolutions.tolist()}'
+            )
+        target_resolution = int(unique_resolutions.item())
+        if support_features is None:
+            support_features = self.encode_multiscale_support(
+                support_512,
+                target_resolution=target_resolution,
+            )
+        if target_resolution not in support_features:
+            raise ValueError(
+                f'Support encoder has resolutions {sorted(support_features)}, '
+                f'not requested target {target_resolution}'
+            )
+        selected = support_features[target_resolution]
+        if not torch.equal(x.coords, selected.coords):
+            raise ValueError(
+                'Selected support feature coordinates must exactly equal flow input '
+                f'coordinates at resolution {target_resolution}; got '
+                f'{tuple(selected.coords.shape)} and {tuple(x.coords.shape)}'
+            )
+
+        if support_presence is None:
+            presence = torch.ones(
+                x.shape[0],
+                device=x.feats.device,
+                dtype=x.feats.dtype,
+            )
+        else:
+            presence = torch.as_tensor(
+                support_presence,
+                device=x.feats.device,
+                dtype=x.feats.dtype,
+            ).reshape(-1)
+            if presence.numel() == 1 and x.shape[0] > 1:
+                presence = presence.expand(x.shape[0])
+            if presence.numel() != x.shape[0]:
+                raise ValueError(
+                    f'support_presence must have {x.shape[0]} values, got '
+                    f'{presence.numel()}'
+                )
+            if torch.any((presence < 0) | (presence > 1)):
+                raise ValueError('support_presence values must be in [0, 1]')
+
+        voxel_presence = presence[x.coords[:, 0].long()].reshape(-1, 1)
+        # Training only evaluates the prefix needed for this resolution. Keep skipped
+        # stages connected to DDP without paying for their sparse convolutions.
+        zero_dependency = selected.feats.new_zeros(())
+        if torch.is_grad_enabled():
+            zero_dependency = zero_dependency + sum(
+                parameter.sum() * 0.0
+                for parameter in self.support_encoder.parameters()
+                if parameter.requires_grad
+            )
+        support_feats = (
+            selected.feats.to(dtype=x.feats.dtype) + zero_dependency
+        ) * voxel_presence
+        return x.replace(torch.cat([x.feats, support_feats, voxel_presence], dim=-1))
 
     def _apply_film(self, h: sp.SparseTensor, emb: torch.Tensor, i: int, j: int) -> sp.SparseTensor:
         scale_shift = self.film_layers[i][j](emb).to(dtype=h.feats.dtype)
@@ -1013,6 +1283,9 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         shape_normals: Optional[torch.Tensor] = None,
         shape_tokens: Optional[torch.Tensor] = None,
         shape_presence: Optional[torch.Tensor] = None,
+        support_512: Optional[sp.SparseTensor] = None,
+        support_features: Optional[Dict[int, sp.SparseTensor]] = None,
+        support_presence: Optional[torch.Tensor] = None,
     ):
         if t.ndim != 1:
             t = t.reshape(-1)
@@ -1041,6 +1314,13 @@ class SparseUnetVaeEncoderTimeFiLM(SparseUnetVaeEncoder):
         if density_statistics_emb is not None:
             emb = emb + density_statistics_emb
 
+        x = self._append_multiscale_support(
+            x,
+            resolution,
+            support_512,
+            support_features,
+            support_presence,
+        )
         h = self.input_layer(x)
         h = h.type(self.dtype)
         for i, res in enumerate(self.blocks):
