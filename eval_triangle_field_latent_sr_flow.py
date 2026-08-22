@@ -1,5 +1,6 @@
 import argparse
 import copy
+import csv
 import glob
 import json
 import math
@@ -28,11 +29,15 @@ def parse_args():
     parser.add_argument("--ckpt", type=str, default="latest")
     parser.add_argument("--ema_rate", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--num_samples", type=int, default=16)
+    parser.add_argument("--num_samples", type=int, default=16, help="Number of visual samples to save.")
+    parser.add_argument("--metrics_num_samples", type=int, default=0, help="Number of dataset items for metrics. Use <=0 for all.")
+    parser.add_argument("--save_partial_every", type=int, default=1, help="Write partial metrics every N processed batches.")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--steps", type=int, default=12)
     parser.add_argument("--guidance_strength", type=float, default=3.0)
+    parser.add_argument("--shape_guidance_strength", type=float, default=None)
+    parser.add_argument("--drop_shape_conditioning", action="store_true")
     parser.add_argument(
         "--apply_conditioning_augmentation",
         action="store_true",
@@ -169,6 +174,8 @@ def build_data_dir(
             "high_triangle_field_voxel": str(triangle_field_voxel_root(high_resolution)),
         }
     }
+    if cfg["models"]["encoder"]["args"].get("shape_conditioning", None) is not None:
+        data_dir["objxl4k_filtered"]["mesh"] = str(root)
     if require_latents:
         data_dir["objxl4k_filtered"]["triangle_field_latent"] = str(latent_root)
     return attach_eval_metadata_filter(data_dir, root, split, args)
@@ -351,6 +358,24 @@ def load_encoder_checkpoint(trainer, run_dir: Path, step: int, ema_rate: str | N
     state = torch.load(path, map_location=trainer.device, weights_only=True)
     trainer.models["encoder"].load_state_dict(state)
     trainer.models["encoder"].eval()
+    if getattr(trainer, "train_timestep_decoder", False):
+        decoder_name = (
+            f"decoder_step{step:07d}.pt"
+            if ema_rate is None
+            else f"decoder_ema{ema_rate}_step{step:07d}.pt"
+        )
+        decoder_path = run_dir / "ckpts" / decoder_name
+        if not decoder_path.exists():
+            raise FileNotFoundError(
+                f"Timestep decoder checkpoint not found: {decoder_path}"
+            )
+        decoder_state = torch.load(
+            decoder_path,
+            map_location=trainer.device,
+            weights_only=True,
+        )
+        trainer.models["decoder"].load_state_dict(decoder_state)
+        trainer.models["decoder"].eval()
     return str(path)
 
 
@@ -377,31 +402,90 @@ def predict_z0(
     cache_paths,
     t: float,
     density_cond: sp.SparseTensor | None = None,
+    elongation_cond: sp.SparseTensor | None = None,
+    dropped_condition_names: set[str] | None = None,
+    decoded_density_override: sp.SparseTensor | None = None,
+    decoded_density_external_condition_max: float | None = None,
+    high_resolution: int | torch.Tensor | None = None,
+    resolution_condition: int | float | torch.Tensor | None = None,
+    conditioning_noise_level: torch.Tensor | None = None,
+    density_statistics: torch.Tensor | None = None,
+    shape_tokens: torch.Tensor | None = None,
+    support_512: sp.SparseTensor | None = None,
+    support_features: dict[int, sp.SparseTensor] | None = None,
+    support_presence: torch.Tensor | None = None,
+    decoded: sp.SparseTensor | None = None,
 ) -> sp.SparseTensor:
-    x_t = trainer._decode_latents_with_cache(z_t, caches=caches, cache_paths=cache_paths)
-    if not torch.equal(x_t.coords, cond.coords):
-        raise ValueError(f"Decoded z_t coords must match cond coords: {x_t.coords.shape} vs {cond.coords.shape}")
-    mode = getattr(trainer, "latent_self_conditioning_mode", "none")
-    if mode == "input":
-        latent_cond_input, _ = trainer._latent_to_field_support(z_t, x_t)
-        enc_in = trainer._make_encoder_input(x_t, cond)
-        enc_in = enc_in.replace(torch.cat([enc_in.feats, latent_cond_input.feats], dim=-1))
+    if decoded is None:
+        decoder_t = torch.full(
+            (z_t.shape[0],),
+            t * 1000.0,
+            device=z_t.feats.device,
+            dtype=torch.float32,
+        )
+        decoded = trainer._latent_encoder_field_input(
+            z_t,
+            cond,
+            caches=caches,
+            cache_paths=cache_paths,
+            t=decoder_t,
+            resolution=high_resolution,
+            resolution_condition=resolution_condition,
+        )
+    if decoded_density_override is not None:
+        if decoded.feats.shape[1] != 3:
+            raise ValueError(
+                "Decoded density override requires exactly three decoder output channels, "
+                f"got {decoded.feats.shape[1]}"
+            )
+        if decoded_density_override.feats.shape[1] != 1:
+            raise ValueError(
+                "Decoded density override must have one feature channel, "
+                f"got {decoded_density_override.feats.shape[1]}"
+            )
+        if not torch.equal(decoded.coords, decoded_density_override.coords):
+            raise ValueError("Decoded density override coords must match decoded latent coords")
+        decoded = decoded.replace(torch.cat(
+            [decoded.feats[:, :2], decoded_density_override.feats],
+            dim=-1,
+        ))
+    if decoded_density_external_condition_max is not None:
+        if decoded.feats.shape[1] != 3:
+            raise ValueError(
+                "Decoded density external conditioning requires exactly three decoder "
+                f"output channels, got {decoded.feats.shape[1]}"
+            )
         if density_cond is not None:
-            if not torch.equal(enc_in.coords, density_cond.coords):
-                raise ValueError(
-                    f"density_cond coords must match encoder input coords: "
-                    f"{density_cond.coords.shape} vs {enc_in.coords.shape}"
-                )
-            enc_in = enc_in.replace(torch.cat([enc_in.feats, density_cond.feats], dim=-1))
-        encoder_kwargs = {}
-    elif mode == "bottleneck":
-        enc_in = trainer._make_encoder_input(x_t, cond, density_cond)
-        encoder_kwargs = {"latent_cond": z_t}
-    else:
-        enc_in = trainer._make_encoder_input(x_t, cond, density_cond)
-        encoder_kwargs = {}
+            raise ValueError(
+                "Decoded density external conditioning cannot also receive density_cond"
+            )
+        density_cond = decoded.replace(
+            decoded.feats[:, 2:3].clamp(max=float(decoded_density_external_condition_max))
+        )
+    enc_in, encoder_kwargs, _ = trainer.prepare_latent_encoder_input(
+        z_t,
+        decoded,
+        cond,
+        density_cond,
+        elongation_cond,
+        dropped_condition_names,
+        density_statistics=density_statistics,
+        shape_tokens=shape_tokens,
+        support_512=support_512,
+        support_features=support_features,
+        support_presence=support_presence,
+    )
     batch_t = torch.full((z_t.shape[0],), t * 1000.0, device=z_t.feats.device, dtype=torch.float32)
-    pred_z0 = trainer.models["encoder"](enc_in, batch_t, sample_posterior=False, **encoder_kwargs)
+    if getattr(trainer.models["encoder"], "conditioning_noise_conditioning", False):
+        encoder_kwargs["conditioning_noise_level"] = conditioning_noise_level
+    pred_z0 = trainer.models["encoder"](
+        enc_in,
+        batch_t,
+        sample_posterior=False,
+        resolution=high_resolution,
+        resolution_condition=resolution_condition,
+        **encoder_kwargs,
+    )
     if not torch.equal(pred_z0.coords, z_t.coords):
         raise ValueError(f"Predicted latent coords must match z_t coords: {pred_z0.coords.shape} vs {z_t.coords.shape}")
     return pred_z0
@@ -418,21 +502,259 @@ def sample_latent_sr(
     guidance_strength: float,
     apply_conditioning_augmentation: bool = False,
     density_cond: sp.SparseTensor | None = None,
+    density_guidance_strength: float | None = None,
+    elongation_cond: sp.SparseTensor | None = None,
+    elongation_guidance_strength: float | None = None,
+    override_decoded_density: bool = False,
+    always_dropped_condition_names: set[str] | None = None,
+    decoded_density_external_condition_max: float | None = None,
+    high_resolution: int | torch.Tensor | None = None,
+    resolution_condition: int | float | torch.Tensor | None = None,
+    density_statistics: torch.Tensor | None = None,
+    density_stat_minimum_guidance_strength: float | None = None,
+    density_stat_median_guidance_strength: float | None = None,
+    density_stat_maximum_guidance_strength: float | None = None,
+    shape_points: torch.Tensor | None = None,
+    shape_normals: torch.Tensor | None = None,
+    shape_tokens: torch.Tensor | None = None,
+    shape_guidance_strength: float | None = None,
+    support_512: sp.SparseTensor | None = None,
+    support_features: dict[int, sp.SparseTensor] | None = None,
+    support_guidance_strength: float | None = None,
 ):
+    decoded_density_condition = getattr(trainer, "decoded_density_mode", "none") == "condition"
+    decoded_density_state = getattr(trainer, "decoded_density_mode", "none") == "state"
+    dynamic_external_density = decoded_density_external_condition_max is not None
+    always_dropped_condition_names = set(always_dropped_condition_names or ())
+    if override_decoded_density:
+        if not decoded_density_condition:
+            raise ValueError(
+                "Decoded density override requires trainer decoded_density_mode='condition'"
+            )
+        if density_cond is None:
+            raise ValueError("Decoded density override requires density_cond")
+    if dynamic_external_density:
+        if not decoded_density_state:
+            raise ValueError(
+                "Decoded density external conditioning requires trainer "
+                "decoded_density_mode='state'"
+            )
+        if override_decoded_density or density_cond is not None:
+            raise ValueError(
+                "Decoded density external conditioning is mutually exclusive with "
+                "decoded density override and density_cond"
+            )
+    decoded_density_override = density_cond if override_decoded_density else None
+    model_density_cond = None if override_decoded_density else density_cond
+    model_uses_shape = bool(getattr(trainer.models["encoder"], "shape_conditioning", False))
+    model_uses_support = bool(getattr(
+        trainer.models["encoder"],
+        "multiscale_support_conditioning",
+        False,
+    ))
+    if shape_tokens is not None and (shape_points is not None or shape_normals is not None):
+        raise ValueError("Provide cached shape_tokens or raw shape geometry, not both")
+    if shape_tokens is None and shape_points is not None:
+        if shape_normals is None:
+            raise ValueError("shape_normals are required with shape_points")
+        shape_tokens = trainer.models["encoder"].encode_shape(
+            shape_points,
+            shape_normals,
+            random_start_point=False,
+        )
+    if model_uses_shape and shape_tokens is None:
+        raise ValueError("Shape-conditioned evaluation requires shape geometry or cached tokens")
+    if support_512 is not None and support_features is not None:
+        raise ValueError("Provide raw support_512 or cached support_features, not both")
+    if model_uses_support and support_512 is None and support_features is None:
+        raise ValueError(
+            "Support-conditioned evaluation requires support_512 or cached support_features"
+        )
+    if not model_uses_support and (
+        support_512 is not None
+        or support_features is not None
+        or support_guidance_strength is not None
+    ):
+        raise ValueError("Support inputs require a support-conditioned model")
+    guided_conditions = {
+        name: (condition, strength)
+        for name, condition, strength in (
+            ("density", density_cond, density_guidance_strength),
+            ("elongation", elongation_cond, elongation_guidance_strength),
+            (
+                "density_minimum",
+                density_statistics,
+                density_stat_minimum_guidance_strength,
+            ),
+            (
+                "density_median",
+                density_statistics,
+                density_stat_median_guidance_strength,
+            ),
+            (
+                "density_maximum",
+                density_statistics,
+                density_stat_maximum_guidance_strength,
+            ),
+            ("shape", shape_tokens, shape_guidance_strength),
+            (
+                "support",
+                support_features if support_features is not None else support_512,
+                support_guidance_strength,
+            ),
+        )
+        if strength is not None
+    }
+    guided_but_dropped = set(guided_conditions) & always_dropped_condition_names
+    if guided_but_dropped:
+        raise ValueError(
+            "Guided conditions cannot also be permanently dropped: "
+            f"{sorted(guided_but_dropped)}"
+        )
+    guided_strength = next(
+        (strength for _, strength in guided_conditions.values()),
+        None,
+    )
+    if guided_conditions:
+        if any(strength != guided_strength for _, strength in guided_conditions.values()):
+            raise ValueError("Joint scalar-condition CFG requires equal guidance strengths")
+        missing = [
+            name
+            for name, (condition, _) in guided_conditions.items()
+            if condition is None and not (
+                name == "density"
+                and (decoded_density_condition or dynamic_external_density)
+            )
+        ]
+        if missing:
+            raise ValueError(f"Scalar-condition CFG requires conditions: {', '.join(missing)}")
+        if guidance_strength not in (0.0, 1.0):
+            raise ValueError(
+                "Scalar-condition CFG requires low-resolution guidance strength 0 or 1"
+            )
+
     z_t = z_0.replace(torch.randn_like(z_0.feats))
-    cond_pos = trainer._augment_conditioning(cond) if apply_conditioning_augmentation else cond
+    if apply_conditioning_augmentation:
+        cond_pos, conditioning_noise_level = trainer._augment_conditioning(
+            cond,
+            return_noise_level=True,
+        )
+    else:
+        cond_pos = cond
+        conditioning_noise_level = torch.zeros(
+            cond.shape[0],
+            device=cond.feats.device,
+            dtype=torch.float32,
+        )
     zero_cond = cond.replace(torch.zeros_like(cond.feats))
+    dropped_guided_condition_names = always_dropped_condition_names | set(guided_conditions)
     t_seq = np.linspace(1.0, 0.0, steps + 1).tolist()
     pred_z0_last = None
     for t, t_prev in tqdm(list(zip(t_seq[:-1], t_seq[1:])), desc="Sampling latent SR"):
-        if guidance_strength == 0.0:
-            pred_z0 = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t), density_cond)
+        decoder_t = torch.full(
+            (z_t.shape[0],),
+            float(t) * 1000.0,
+            device=z_t.feats.device,
+            dtype=torch.float32,
+        )
+        decoded_t = trainer._latent_encoder_field_input(
+            z_t,
+            cond_pos,
+            caches=caches,
+            cache_paths=cache_paths,
+            t=decoder_t,
+            resolution=high_resolution,
+            resolution_condition=resolution_condition,
+        )
+        if guided_conditions:
+            field_cond = zero_cond if guidance_strength == 0.0 else cond_pos
+            pred_pos = predict_z0(
+                trainer, z_t, field_cond, caches, cache_paths, float(t),
+                model_density_cond, elongation_cond,
+                always_dropped_condition_names,
+                decoded_density_override=decoded_density_override,
+                decoded_density_external_condition_max=decoded_density_external_condition_max,
+                high_resolution=high_resolution,
+                resolution_condition=resolution_condition,
+                conditioning_noise_level=conditioning_noise_level,
+                density_statistics=density_statistics,
+                shape_tokens=shape_tokens,
+                support_512=support_512,
+                support_features=support_features,
+                decoded=decoded_t,
+            )
+            if guided_strength == 1.0:
+                pred_z0 = pred_pos
+            else:
+                pred_neg = predict_z0(
+                    trainer, z_t, field_cond, caches, cache_paths, float(t),
+                    model_density_cond, elongation_cond,
+                    dropped_guided_condition_names,
+                    decoded_density_override=decoded_density_override,
+                    decoded_density_external_condition_max=decoded_density_external_condition_max,
+                    high_resolution=high_resolution,
+                    resolution_condition=resolution_condition,
+                    conditioning_noise_level=conditioning_noise_level,
+                    density_statistics=density_statistics,
+                    shape_tokens=shape_tokens,
+                    support_512=support_512,
+                    support_features=support_features,
+                    decoded=decoded_t,
+                )
+                pred_z0 = pred_pos.replace(
+                    guided_strength * pred_pos.feats
+                    + (1.0 - guided_strength) * pred_neg.feats
+                )
+        elif guidance_strength == 0.0:
+            pred_z0 = predict_z0(
+                trainer, z_t, zero_cond, caches, cache_paths, float(t),
+                model_density_cond, elongation_cond,
+                always_dropped_condition_names,
+                decoded_density_override=decoded_density_override,
+                decoded_density_external_condition_max=decoded_density_external_condition_max,
+                high_resolution=high_resolution,
+                resolution_condition=resolution_condition,
+                conditioning_noise_level=conditioning_noise_level,
+                density_statistics=density_statistics,
+                shape_tokens=shape_tokens,
+                support_512=support_512,
+                support_features=support_features,
+                decoded=decoded_t,
+            )
         else:
-            pred_pos = predict_z0(trainer, z_t, cond_pos, caches, cache_paths, float(t), density_cond)
-        if guidance_strength == 1.0:
+            pred_pos = predict_z0(
+                trainer, z_t, cond_pos, caches, cache_paths, float(t),
+                model_density_cond, elongation_cond,
+                always_dropped_condition_names,
+                decoded_density_override=decoded_density_override,
+                decoded_density_external_condition_max=decoded_density_external_condition_max,
+                high_resolution=high_resolution,
+                resolution_condition=resolution_condition,
+                conditioning_noise_level=conditioning_noise_level,
+                density_statistics=density_statistics,
+                shape_tokens=shape_tokens,
+                support_512=support_512,
+                support_features=support_features,
+                decoded=decoded_t,
+            )
+        if not guided_conditions and guidance_strength == 1.0:
             pred_z0 = pred_pos
-        elif guidance_strength != 0.0:
-            pred_neg = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t), density_cond)
+        elif not guided_conditions and guidance_strength != 0.0:
+            pred_neg = predict_z0(
+                trainer, z_t, zero_cond, caches, cache_paths, float(t),
+                model_density_cond, elongation_cond,
+                always_dropped_condition_names,
+                decoded_density_override=decoded_density_override,
+                decoded_density_external_condition_max=decoded_density_external_condition_max,
+                high_resolution=high_resolution,
+                resolution_condition=resolution_condition,
+                conditioning_noise_level=conditioning_noise_level,
+                density_statistics=density_statistics,
+                shape_tokens=shape_tokens,
+                support_512=support_512,
+                support_features=support_features,
+                decoded=decoded_t,
+            )
             pred_z0 = pred_pos.replace(
                 guidance_strength * pred_pos.feats + (1.0 - guidance_strength) * pred_neg.feats
             )
@@ -448,6 +770,133 @@ def append_visuals(dataset, store: dict, prefix: str, tensor: sp.SparseTensor, b
         store.setdefault(f"{prefix}_{key}", []).append(value[:batch].cpu())
 
 
+def values_01(dataset, tensor: sp.SparseTensor) -> torch.Tensor:
+    values = tensor.feats[:, :2].float()
+    if getattr(dataset, "distance_transform", "none") == "minus_one_one":
+        values = values * 0.5 + 0.5
+    return values
+
+
+def compare_decoded(dataset, gt: sp.SparseTensor, pred: sp.SparseTensor) -> dict:
+    gt_values = values_01(dataset, gt)
+    pred_values = values_01(dataset, pred)
+    gt_coords = gt.coords.int()
+    pred_coords = pred.coords.int()
+
+    coord_exact = gt_coords.shape == pred_coords.shape and torch.equal(gt_coords, pred_coords)
+    if coord_exact:
+        diff = (pred_values - gt_values).abs()
+        return {
+            "coord_exact": True,
+            "gt_tokens": int(gt_values.shape[0]),
+            "pred_tokens": int(pred_values.shape[0]),
+            "common_tokens": int(gt_values.shape[0]),
+            "d_tri_l1_sum": float(diff[:, 0].sum().detach().cpu().double()),
+            "d_vert_l1_sum": float(diff[:, 1].sum().detach().cpu().double()),
+            "l1_sum": float(diff.sum().detach().cpu().double()),
+            "value_count": int(diff.numel()),
+        }
+
+    gt_map = {tuple(c.tolist()): i for i, c in enumerate(gt_coords.cpu())}
+    pred_map = {tuple(c.tolist()): i for i, c in enumerate(pred_coords.cpu())}
+    common = sorted(set(gt_map) & set(pred_map))
+    if not common:
+        return {
+            "coord_exact": False,
+            "gt_tokens": int(gt_values.shape[0]),
+            "pred_tokens": int(pred_values.shape[0]),
+            "common_tokens": 0,
+            "d_tri_l1_sum": 0.0,
+            "d_vert_l1_sum": 0.0,
+            "l1_sum": 0.0,
+            "value_count": 0,
+        }
+
+    gt_idx = torch.tensor([gt_map[c] for c in common], device=gt_values.device)
+    pred_idx = torch.tensor([pred_map[c] for c in common], device=pred_values.device)
+    diff = (pred_values[pred_idx] - gt_values[gt_idx]).abs()
+    return {
+        "coord_exact": False,
+        "gt_tokens": int(gt_values.shape[0]),
+        "pred_tokens": int(pred_values.shape[0]),
+        "common_tokens": int(len(common)),
+        "d_tri_l1_sum": float(diff[:, 0].sum().detach().cpu().double()),
+        "d_vert_l1_sum": float(diff[:, 1].sum().detach().cpu().double()),
+        "l1_sum": float(diff.sum().detach().cpu().double()),
+        "value_count": int(diff.numel()),
+    }
+
+
+def make_metric_accumulator() -> dict:
+    return {
+        "d_tri_l1_sum": 0.0,
+        "d_vert_l1_sum": 0.0,
+        "l1_sum": 0.0,
+        "common_tokens": 0,
+        "value_count": 0,
+        "gt_tokens": 0,
+        "pred_tokens": 0,
+        "coord_exact": 0,
+        "compared": 0,
+    }
+
+
+def update_metric_accumulator(acc: dict, metrics: dict) -> None:
+    acc["d_tri_l1_sum"] += metrics["d_tri_l1_sum"]
+    acc["d_vert_l1_sum"] += metrics["d_vert_l1_sum"]
+    acc["l1_sum"] += metrics["l1_sum"]
+    acc["common_tokens"] += metrics["common_tokens"]
+    acc["value_count"] += metrics["value_count"]
+    acc["gt_tokens"] += metrics["gt_tokens"]
+    acc["pred_tokens"] += metrics["pred_tokens"]
+    acc["coord_exact"] += int(metrics["coord_exact"])
+    if metrics["common_tokens"] > 0:
+        acc["compared"] += 1
+
+
+def finalize_metric_accumulator(acc: dict) -> dict:
+    common = acc["common_tokens"]
+    value_count = acc["value_count"]
+    d_tri_l1 = acc["d_tri_l1_sum"] / common if common else None
+    d_vert_l1 = acc["d_vert_l1_sum"] / common if common else None
+    l1 = acc["l1_sum"] / value_count if value_count else None
+    return {
+        "num_compared": acc["compared"],
+        "coord_exact_rate": acc["coord_exact"] / acc["compared"] if acc["compared"] else None,
+        "gt_tokens": acc["gt_tokens"],
+        "pred_tokens": acc["pred_tokens"],
+        "common_tokens": common,
+        "d_tri_l1": d_tri_l1,
+        "d_vert_l1": d_vert_l1,
+        "edge_l1": d_tri_l1,
+        "vertex_l1": d_vert_l1,
+        "l1": l1,
+    }
+
+
+def write_rows_csv(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    keys = sorted({key for row in rows for key in row.keys()})
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_partial_metrics(output_dir: Path, processed: int, sample_acc: dict, pred_last_acc: dict, rows: list[dict]) -> None:
+    partial = {
+        "processed": processed,
+        "metrics": {
+            "sample": finalize_metric_accumulator(sample_acc),
+            "pred_z0_last": finalize_metric_accumulator(pred_last_acc),
+        },
+    }
+    with open(output_dir / "partial_metrics.json", "w") as f:
+        json.dump(partial, f, indent=2)
+    write_rows_csv(output_dir / "per_sample_metrics.partial.csv", rows)
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -457,6 +906,18 @@ def main():
     root = Path(args.root).resolve()
     cfg = load_config(run_dir)
     ckpt_step = find_ckpt_step(run_dir, args.ckpt)
+    model_uses_shape = (
+        cfg["models"]["encoder"]["args"].get("shape_conditioning", None)
+        is not None
+    )
+    if args.shape_guidance_strength is not None and not model_uses_shape:
+        raise ValueError("--shape_guidance_strength requires a shape-conditioned model")
+    if args.drop_shape_conditioning and not model_uses_shape:
+        raise ValueError("--drop_shape_conditioning requires a shape-conditioned model")
+    if args.drop_shape_conditioning and args.shape_guidance_strength is not None:
+        raise ValueError(
+            "--drop_shape_conditioning and --shape_guidance_strength are mutually exclusive"
+        )
     output_dir = (
         Path(args.output_dir).resolve()
         if args.output_dir is not None
@@ -465,18 +926,21 @@ def main():
             f"eval_filtered_{args.split}_{args.low_resolution}to{args.high_resolution}"
             f"{'_support_only' if args.no_latents else ''}"
             f"_latent_flow_sampling_step{ckpt_step:07d}_cfg{args.guidance_strength:g}_n{args.num_samples}"
+            f"{f'_shapecfg{args.shape_guidance_strength:g}' if args.shape_guidance_strength is not None else ''}"
+            f"{'_shapedrop' if args.drop_shape_conditioning else ''}"
         )
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset, data_dir = build_dataset(cfg, root, args)
     trainer = build_trainer(cfg, dataset, output_dir)
+    apply_conditioning_augmentation_overrides(trainer, args)
     ckpt_path = load_encoder_checkpoint(trainer, run_dir, ckpt_step, args.ema_rate)
 
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,
         drop_last=False,
         num_workers=args.num_workers,
         persistent_workers=(args.num_workers > 0),
@@ -484,45 +948,144 @@ def main():
     )
 
     images = {}
-    remaining = args.num_samples
-    for data in loader:
-        batch = min(remaining, args.batch_size)
-        data = recursive_to_device(slice_batch(data, batch), trainer.device)
-        cache_paths = None
-        if args.no_latents:
-            latent_channels = int(cfg["models"]["encoder"]["args"]["latent_channels"])
-            data["z_0"], caches = build_support_latents(data["x_0"], latent_channels)
-        else:
-            caches = data.get("triangle_field_slat_cache", None)
-            cache_paths = data.get("triangle_field_slat_cache_path", None)
+    visual_remaining = max(args.num_samples, 0)
+    metric_limit = args.metrics_num_samples if args.metrics_num_samples > 0 else len(dataset)
+    metric_limit = min(metric_limit, len(dataset))
+    sample_acc = make_metric_accumulator()
+    pred_last_acc = make_metric_accumulator()
+    rows = []
+    processed = 0
 
-        sample_z, pred_z0_last = sample_latent_sr(
-            trainer,
-            data["z_0"],
-            data["cond"],
-            caches,
-            cache_paths,
-            args.steps,
-            args.guidance_strength,
-            args.apply_conditioning_augmentation,
-            data.get("density_cond", None),
-        )
-        gt = data["x_0"] if args.no_latents else trainer._decode_latents_with_cache(data["z_0"], caches=caches, cache_paths=cache_paths)
-        sample = trainer._decode_latents_with_cache(sample_z, caches=caches, cache_paths=cache_paths)
-        pred_last = trainer._decode_latents_with_cache(pred_z0_last, caches=caches, cache_paths=cache_paths)
+    with torch.no_grad():
+        pbar = tqdm(total=metric_limit, desc=f"Evaluating {args.split} split")
+        for batch_index, data in enumerate(loader):
+            batch = min(metric_limit - processed, args.batch_size)
+            if batch <= 0:
+                break
+            data = recursive_to_device(slice_batch(data, batch), trainer.device)
+            cache_paths = None
+            if args.no_latents:
+                latent_channels = int(cfg["models"]["encoder"]["args"]["latent_channels"])
+                data["z_0"], caches = build_support_latents(data["x_0"], latent_channels)
+            else:
+                caches = data.get("triangle_field_slat_cache", None)
+                cache_paths = data.get("triangle_field_slat_cache_path", None)
 
-        append_visuals(dataset, images, "gt", gt, batch)
-        append_visuals(dataset, images, "cond", data["cond"], batch)
-        append_visuals(dataset, images, "sample", sample, batch)
-        append_visuals(dataset, images, "pred_z0_last", pred_last, batch)
+            sample_z, pred_z0_last = sample_latent_sr(
+                trainer,
+                data["z_0"],
+                data["cond"],
+                caches,
+                cache_paths,
+                args.steps,
+                args.guidance_strength,
+                args.apply_conditioning_augmentation,
+                data.get("density_cond", None),
+                always_dropped_condition_names=(
+                    {"shape"} if args.drop_shape_conditioning else None
+                ),
+                high_resolution=args.high_resolution,
+                shape_points=data.get("shape_points", None),
+                shape_normals=data.get("shape_normals", None),
+                shape_guidance_strength=args.shape_guidance_strength,
+            )
+            decode_kwargs = {
+                "t": torch.zeros(batch, device=trainer.device, dtype=torch.float32),
+                "resolution": args.high_resolution,
+            }
+            gt = data["x_0"] if args.no_latents else trainer._decode_latents_with_cache(
+                data["z_0"],
+                caches=caches,
+                cache_paths=cache_paths,
+                **decode_kwargs,
+            )
+            sample = trainer._decode_latents_with_cache(
+                sample_z,
+                caches=caches,
+                cache_paths=cache_paths,
+                **decode_kwargs,
+            )
+            pred_last = trainer._decode_latents_with_cache(
+                pred_z0_last,
+                caches=caches,
+                cache_paths=cache_paths,
+                **decode_kwargs,
+            )
 
-        remaining -= batch
-        if remaining <= 0:
-            break
+            for i in range(batch):
+                _, sha256 = dataset.instances[processed + i]
+                sample_metrics = compare_decoded(dataset, gt[i], sample[i])
+                pred_last_metrics = compare_decoded(dataset, gt[i], pred_last[i])
+                update_metric_accumulator(sample_acc, sample_metrics)
+                update_metric_accumulator(pred_last_acc, pred_last_metrics)
+                rows.append({
+                    "index": processed + i,
+                    "sha256": str(sha256),
+                    "sample_d_tri_l1": (
+                        sample_metrics["d_tri_l1_sum"] / sample_metrics["common_tokens"]
+                        if sample_metrics["common_tokens"] else None
+                    ),
+                    "sample_d_vert_l1": (
+                        sample_metrics["d_vert_l1_sum"] / sample_metrics["common_tokens"]
+                        if sample_metrics["common_tokens"] else None
+                    ),
+                    "sample_edge_l1": (
+                        sample_metrics["d_tri_l1_sum"] / sample_metrics["common_tokens"]
+                        if sample_metrics["common_tokens"] else None
+                    ),
+                    "sample_vertex_l1": (
+                        sample_metrics["d_vert_l1_sum"] / sample_metrics["common_tokens"]
+                        if sample_metrics["common_tokens"] else None
+                    ),
+                    "sample_l1": (
+                        sample_metrics["l1_sum"] / sample_metrics["value_count"]
+                        if sample_metrics["value_count"] else None
+                    ),
+                    "sample_coord_exact": sample_metrics["coord_exact"],
+                    "sample_common_tokens": sample_metrics["common_tokens"],
+                    "pred_z0_last_d_tri_l1": (
+                        pred_last_metrics["d_tri_l1_sum"] / pred_last_metrics["common_tokens"]
+                        if pred_last_metrics["common_tokens"] else None
+                    ),
+                    "pred_z0_last_d_vert_l1": (
+                        pred_last_metrics["d_vert_l1_sum"] / pred_last_metrics["common_tokens"]
+                        if pred_last_metrics["common_tokens"] else None
+                    ),
+                    "pred_z0_last_edge_l1": (
+                        pred_last_metrics["d_tri_l1_sum"] / pred_last_metrics["common_tokens"]
+                        if pred_last_metrics["common_tokens"] else None
+                    ),
+                    "pred_z0_last_vertex_l1": (
+                        pred_last_metrics["d_vert_l1_sum"] / pred_last_metrics["common_tokens"]
+                        if pred_last_metrics["common_tokens"] else None
+                    ),
+                    "pred_z0_last_l1": (
+                        pred_last_metrics["l1_sum"] / pred_last_metrics["value_count"]
+                        if pred_last_metrics["value_count"] else None
+                    ),
+                    "pred_z0_last_coord_exact": pred_last_metrics["coord_exact"],
+                    "pred_z0_last_common_tokens": pred_last_metrics["common_tokens"],
+                })
+
+            if visual_remaining > 0:
+                visual_batch = min(visual_remaining, batch)
+                append_visuals(dataset, images, "gt", gt, visual_batch)
+                append_visuals(dataset, images, "cond", data["cond"], visual_batch)
+                append_visuals(dataset, images, "sample", sample, visual_batch)
+                append_visuals(dataset, images, "pred_z0_last", pred_last, visual_batch)
+                visual_remaining -= visual_batch
+
+            processed += batch
+            pbar.update(batch)
+            if args.save_partial_every > 0 and (batch_index + 1) % args.save_partial_every == 0:
+                write_partial_metrics(output_dir, processed, sample_acc, pred_last_acc, rows)
+                print(f"Processed {processed}/{metric_limit}; wrote partial metrics.", flush=True)
+        pbar.close()
 
     suffix = f"step{ckpt_step:07d}_cfg{args.guidance_strength:g}_{args.low_resolution}to{args.high_resolution}"
     for name, chunks in images.items():
-        save_image_grid(torch.cat(chunks, dim=0)[: args.num_samples], output_dir / f"{name}_{suffix}.jpg")
+        if chunks:
+            save_image_grid(torch.cat(chunks, dim=0)[: args.num_samples], output_dir / f"{name}_{suffix}.jpg")
 
     summary = {
         "run_dir": str(run_dir),
@@ -532,11 +1095,15 @@ def main():
         "root": str(root),
         "split": args.split,
         "data_dir": data_dir,
-        "num_samples": args.num_samples,
+        "dataset_size": len(dataset),
+        "num_visual_samples": args.num_samples,
+        "num_metric_samples": processed,
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
         "steps": args.steps,
         "guidance_strength": args.guidance_strength,
+        "shape_guidance_strength": args.shape_guidance_strength,
+        "drop_shape_conditioning": args.drop_shape_conditioning,
         "apply_conditioning_augmentation": args.apply_conditioning_augmentation,
         "conditioning_augmentation": getattr(trainer, "conditioning_augmentation", None),
         "low_resolution": args.low_resolution,
@@ -544,9 +1111,17 @@ def main():
         "no_latents": args.no_latents,
         "latent_name": args.latent_name,
         "output_dir": str(output_dir),
+        "distance_units": "[0, 1]",
+        "metrics": {
+            "sample": finalize_metric_accumulator(sample_acc),
+            "pred_z0_last": finalize_metric_accumulator(pred_last_acc),
+        },
     }
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(summary["metrics"], f, indent=2)
+    write_rows_csv(output_dir / "per_sample_metrics.csv", rows)
     print(json.dumps(summary, indent=2))
 
 

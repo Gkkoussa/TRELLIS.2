@@ -74,6 +74,10 @@ if __name__ == '__main__':
                         help='Directory to save the gaussian distance voxel files')
     parser.add_argument('--triangle_field_voxel_root', type=str, default=None,
                         help='Directory to save the triangle-field voxel files')
+    parser.add_argument('--qem_edge_collapsed_root', type=str, default=None,
+                        help='Directory containing qem_edge_collapsed_meshes_<resolution>')
+    parser.add_argument('--hierarchical_vertex_target_root', type=str, default=None,
+                        help='Directory containing hierarchical_vertex_targets_<resolution>')
     parser.add_argument('--ss_latent_root', type=str, default=None,
                         help='Directory to save the sparse structure latent files')
     parser.add_argument('--shape_latent_root', type=str, default=None,
@@ -110,6 +114,8 @@ if __name__ == '__main__':
     opt.vertex_voxel_root = opt.vertex_voxel_root or opt.root
     opt.gaussian_distance_voxel_root = opt.gaussian_distance_voxel_root or opt.root
     opt.triangle_field_voxel_root = opt.triangle_field_voxel_root or opt.root
+    opt.qem_edge_collapsed_root = opt.qem_edge_collapsed_root or opt.root
+    opt.hierarchical_vertex_target_root = opt.hierarchical_vertex_target_root or opt.root
     opt.ss_latent_root = opt.ss_latent_root or opt.root
     opt.shape_latent_root = opt.shape_latent_root or opt.root
     opt.pbr_latent_root = opt.pbr_latent_root or opt.root
@@ -201,12 +207,57 @@ if __name__ == '__main__':
     # merge triangle-field voxelized
     triangle_field_voxel_resolutions = []
     for dir in os.listdir(opt.triangle_field_voxel_root):
-        if os.path.isdir(os.path.join(opt.triangle_field_voxel_root, dir)) and dir.startswith('triangle_field_voxels_'):
-            triangle_field_voxel_resolutions.append(int(dir.split('_')[-1]))
+        prefix = 'triangle_field_voxels_'
+        suffix = dir[len(prefix):] if dir.startswith(prefix) else ''
+        if (
+            os.path.isdir(os.path.join(opt.triangle_field_voxel_root, dir))
+            and suffix.isdigit()
+        ):
+            triangle_field_voxel_resolutions.append(int(suffix))
     triangle_field_voxel_metadata = {}
     for res in triangle_field_voxel_resolutions:
         triangle_field_voxel_metadata[res] = update_metadata(
             os.path.join(opt.triangle_field_voxel_root, f'triangle_field_voxels_{res}'),
+            opt,
+        )
+
+    # merge voxel-constrained QEM edge-collapsed meshes
+    qem_edge_collapsed_resolutions = []
+    for dir in os.listdir(opt.qem_edge_collapsed_root):
+        prefix = 'qem_edge_collapsed_meshes_'
+        suffix = dir[len(prefix):] if dir.startswith(prefix) else ''
+        if (
+            os.path.isdir(os.path.join(opt.qem_edge_collapsed_root, dir))
+            and suffix.isdigit()
+        ):
+            qem_edge_collapsed_resolutions.append(int(suffix))
+    qem_edge_collapsed_metadata = {}
+    for res in qem_edge_collapsed_resolutions:
+        qem_edge_collapsed_metadata[res] = update_metadata(
+            os.path.join(
+                opt.qem_edge_collapsed_root,
+                f'qem_edge_collapsed_meshes_{res}',
+            ),
+            opt,
+        )
+
+    # merge complete-chain hierarchical vertex targets
+    hierarchical_vertex_target_resolutions = []
+    for dir in os.listdir(opt.hierarchical_vertex_target_root):
+        prefix = 'hierarchical_vertex_targets_'
+        suffix = dir[len(prefix):] if dir.startswith(prefix) else ''
+        if (
+            os.path.isdir(os.path.join(opt.hierarchical_vertex_target_root, dir))
+            and suffix.isdigit()
+        ):
+            hierarchical_vertex_target_resolutions.append(int(suffix))
+    hierarchical_vertex_target_metadata = {}
+    for res in hierarchical_vertex_target_resolutions:
+        hierarchical_vertex_target_metadata[res] = update_metadata(
+            os.path.join(
+                opt.hierarchical_vertex_target_root,
+                f'hierarchical_vertex_targets_{res}',
+            ),
             opt,
         )
         
@@ -315,6 +366,19 @@ if __name__ == '__main__':
             for res in triangle_field_voxel_resolutions:
                 if triangle_field_voxel_metadata[res] is not None:
                     f.write(f'    - {res}: {triangle_field_voxel_metadata[res]["triangle_field_voxelized"].sum()}\n')
+        if len(qem_edge_collapsed_resolutions) != 0:
+            f.write(f'  - Number of assets with QEM edge-collapsed meshes:\n')
+            for res in qem_edge_collapsed_resolutions:
+                if qem_edge_collapsed_metadata[res] is not None:
+                    f.write(f'    - {res}: {qem_edge_collapsed_metadata[res]["qem_edge_collapsed"].sum()}\n')
+        if len(hierarchical_vertex_target_resolutions) != 0:
+            f.write(f'  - Number of assets with hierarchical vertex targets:\n')
+            for res in hierarchical_vertex_target_resolutions:
+                if hierarchical_vertex_target_metadata[res] is not None:
+                    generated = hierarchical_vertex_target_metadata[res][
+                        "hierarchical_vertex_targets_generated"
+                    ].sum()
+                    f.write(f'    - {res}: {generated}\n')
         if len(ss_latent_models) != 0:
             f.write(f'  - Number of assets with sparse structure latents:\n')
             for model in ss_latent_models:

@@ -38,8 +38,21 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
     flex_gemm.ops.spconv.set_algorithm(config.FLEX_GEMM_ALGO)
     flex_gemm.ops.spconv.set_hashmap_ratio(config.FLEX_GEMM_HASHMAP_RATIO)
 
+    # flex_gemm's Triton kernels are not registered with PyTorch autocast, so
+    # autocast may produce FP16 sparse features while leaving this module's
+    # FP32 parameters untouched. Triton's dot requires both operands to have
+    # the same dtype. Cast parameters for this invocation only; the module's
+    # parameters remain FP32, and autograd propagates through the casts back to
+    # those FP32 parameters for GradScaler/optimizer updates.
+    weight = self.weight
+    bias = self.bias
+    if torch.is_autocast_enabled() and weight.dtype != x.feats.dtype:
+        weight = weight.to(dtype=x.feats.dtype)
+        if bias is not None:
+            bias = bias.to(dtype=x.feats.dtype)
+
     # check if neighbor map is already computed
-    Co, Kd, Kh, Kw, Ci = self.weight.shape
+    Co, Kd, Kh, Kw, Ci = weight.shape
     neighbor_cache_key = f'SubMConv3d_neighbor_cache_{Kw}x{Kh}x{Kd}_dilation{self.dilation}'
     neighbor_cache = x.get_spatial_cache(neighbor_cache_key)
     
@@ -47,8 +60,8 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
         x.feats,
         x.coords,
         torch.Size([*x.shape, *x.spatial_shape]),
-        self.weight,
-        self.bias,
+        weight,
+        bias,
         neighbor_cache,
         self.dilation
     )

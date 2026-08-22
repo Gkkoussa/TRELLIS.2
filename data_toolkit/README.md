@@ -109,6 +109,46 @@ python data_toolkit/voxelize_pbr.py ObjaverseXL --root datasets/ObjaverseXL_sket
 
 ### At this point, the dataset is ready for SC-VAE Training
 
+### Optional: Build voxel-constrained QEM meshes
+
+After triangle-field voxelization has been finalized at a resolution, its
+active sparse support can be used to build a voxel-collapsed version of every
+normalized mesh. All source vertices assigned to one active voxel are replaced
+by one box-constrained QEM representative, even when they do not share a mesh
+edge. The representative is forced to remain inside that saved active voxel.
+The original PBR dumps and triangle-field payloads are read-only inputs.
+
+Run one sharded Slurm array for a resolution:
+
+```bash
+QEM_RESOLUTION=128 sbatch qem_edge_collapse.sh
+```
+
+After every array task has finished, merge its records with `build_metadata.py`
+and validate every payload:
+
+```bash
+QEM_RESOLUTION=128 sbatch finalize_qem_edge_collapse.sh
+```
+
+The finalized stage is stored at:
+
+```text
+<ROOT>/qem_edge_collapsed_meshes_<RESOLUTION>/
+```
+
+Each `<sha256>.npz.zst` payload contains:
+
+- `vertices`, `faces`, and unique `edges`
+- final area-weighted `vertex_normals`
+- final `face_normals` and `face_areas`
+- `vertex_voxel_coords` and voxel-local vertex offsets
+- JSON provenance and collapse statistics
+
+Shard records are written to `new_records/part_<rank>.csv`. The finalization
+job creates `metadata.csv` through the standard metadata builder and writes
+`validation_stats.json`.
+
 ### Step 6: Encode Latents
 
 Encode sparse structures into latents to train the first-stage generator.

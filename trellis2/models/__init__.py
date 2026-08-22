@@ -12,10 +12,17 @@ __attributes = {
     
     # SC-VAEs
     'SparseUnetVaeEncoder': 'sc_vaes.sparse_unet_vae',
+    'SparseUnetVaeEncoderTimeFiLM': 'sc_vaes.sparse_unet_vae',
     'SparseUnetVaeDecoder': 'sc_vaes.sparse_unet_vae',
+    'SparseUnetVaeDecoderTimeFiLM': 'sc_vaes.sparse_unet_vae',
+    'SparseUnetVaeHierarchicalVertexDecoder': 'sc_vaes.sparse_unet_vae_hierarchical_vertex',
+    'SparseUnetVaeHierarchicalVertexEdgeDecoder': 'sc_vaes.sparse_unet_vae_hierarchical_vertex_edge',
     'SparseUNetDiTFlowModel': 'sc_vaes.sparse_unet_dit_flow',
     'FlexiDualGridVaeEncoder': 'sc_vaes.fdg_vae',
-    'FlexiDualGridVaeDecoder': 'sc_vaes.fdg_vae'
+    'FlexiDualGridVaeDecoder': 'sc_vaes.fdg_vae',
+
+    # Point Density Flow
+    'HunyuanPointDensityFlowModel': 'point_density_flow',
 }
 
 __submodules = []
@@ -75,6 +82,9 @@ if __name__ == '__main__':
     from .sparse_structure_flow import SparseStructureFlowModel
     from .structured_latent_flow import SLatFlowModel, ElasticSLatFlowModel
         
-    from .sc_vaes.sparse_unet_vae import SparseUnetVaeEncoder, SparseUnetVaeDecoder
+    from .sc_vaes.sparse_unet_vae import SparseUnetVaeEncoder, SparseUnetVaeEncoderTimeFiLM, SparseUnetVaeDecoder, SparseUnetVaeDecoderTimeFiLM
+    from .sc_vaes.sparse_unet_vae_hierarchical_vertex import SparseUnetVaeHierarchicalVertexDecoder
+    from .sc_vaes.sparse_unet_vae_hierarchical_vertex_edge import SparseUnetVaeHierarchicalVertexEdgeDecoder
     from .sc_vaes.sparse_unet_dit_flow import SparseUNetDiTFlowModel
     from .sc_vaes.fdg_vae import FlexiDualGridVaeEncoder, FlexiDualGridVaeDecoder
+    from .point_density_flow import HunyuanPointDensityFlowModel
