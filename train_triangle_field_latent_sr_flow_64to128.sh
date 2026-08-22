@@ -28,7 +28,7 @@ export CKPT="${CKPT:-none}"
 export LOW_TRIANGLE_FIELD_VOXEL_DIR="${LOW_TRIANGLE_FIELD_VOXEL_DIR:-$ROOT/triangle_field_voxels_64}"
 export HIGH_TRIANGLE_FIELD_VOXEL_DIR="${HIGH_TRIANGLE_FIELD_VOXEL_DIR:-$ROOT/triangle_field_voxels_128}"
 export DENSITY_TRIANGLE_FIELD_VOXEL_DIR="${DENSITY_TRIANGLE_FIELD_VOXEL_DIR:-}"
-export TRIANGLE_FIELD_LATENT_DIR="${TRIANGLE_FIELD_LATENT_DIR:-$ROOT/triangle_field_latents/triangle_field_vae_512_invarea_auxdrop_52039231_step0180000_128}"
+export TRIANGLE_FIELD_LATENT_DIR="${TRIANGLE_FIELD_LATENT_DIR:-$ROOT/triangle_field_latents/triangle_field_vae_allres_invarea_fullaux_52454251_step0320000_128}"
 export SPLIT="${SPLIT:-train}"
 export INSTANCES_PATH="${INSTANCES_PATH:-$ROOT/splits/train_triangle_field_512/instances.txt}"
 

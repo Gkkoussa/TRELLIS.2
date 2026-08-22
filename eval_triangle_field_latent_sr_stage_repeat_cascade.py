@@ -196,6 +196,23 @@ def run_stage(
     guidance_strength: float,
     apply_conditioning_augmentation: bool,
     density_cond: sp.SparseTensor | None = None,
+    density_guidance_strength: float | None = None,
+    elongation_cond: sp.SparseTensor | None = None,
+    elongation_guidance_strength: float | None = None,
+    override_decoded_density: bool = False,
+    always_dropped_condition_names: set[str] | None = None,
+    decoded_density_external_condition_max: float | None = None,
+    high_resolution: int | None = None,
+    resolution_condition: int | float | None = None,
+    density_statistics: torch.Tensor | None = None,
+    density_stat_minimum_guidance_strength: float | None = None,
+    density_stat_median_guidance_strength: float | None = None,
+    density_stat_maximum_guidance_strength: float | None = None,
+    shape_tokens: torch.Tensor | None = None,
+    shape_guidance_strength: float | None = None,
+    support_512: sp.SparseTensor | None = None,
+    support_features: dict[int, sp.SparseTensor] | None = None,
+    support_guidance_strength: float | None = None,
 ):
     z_0, caches = build_support_latents(data["x_0"], latent_channels)
     sample_z, pred_z0_last = sample_latent_sr(
@@ -208,9 +225,39 @@ def run_stage(
         guidance_strength,
         apply_conditioning_augmentation,
         density_cond,
+        density_guidance_strength,
+        elongation_cond,
+        elongation_guidance_strength,
+        override_decoded_density,
+        always_dropped_condition_names,
+        decoded_density_external_condition_max,
+        high_resolution=high_resolution,
+        resolution_condition=resolution_condition,
+        density_statistics=density_statistics,
+        density_stat_minimum_guidance_strength=density_stat_minimum_guidance_strength,
+        density_stat_median_guidance_strength=density_stat_median_guidance_strength,
+        density_stat_maximum_guidance_strength=density_stat_maximum_guidance_strength,
+        shape_tokens=shape_tokens,
+        shape_guidance_strength=shape_guidance_strength,
+        support_512=support_512,
+        support_features=support_features,
+        support_guidance_strength=support_guidance_strength,
     )
-    sample = trainer._decode_latents_with_cache(sample_z, caches=caches)
-    pred_last = trainer._decode_latents_with_cache(pred_z0_last, caches=caches)
+    decode_kwargs = {
+        't': torch.zeros(sample_z.shape[0], device=sample_z.device),
+        'resolution': high_resolution,
+        'resolution_condition': resolution_condition,
+    }
+    sample = trainer._decode_latents_with_cache(
+        sample_z,
+        caches=caches,
+        **decode_kwargs,
+    )
+    pred_last = trainer._decode_latents_with_cache(
+        pred_z0_last,
+        caches=caches,
+        **decode_kwargs,
+    )
     return sample, pred_last
 
 
@@ -517,6 +564,7 @@ def main():
                     guidance,
                     args.apply_conditioning_augmentation,
                     density_cond,
+                    high_resolution=high_res,
                 )
                 add_visuals(images, dataset, f"{prefix}_iter{repeat_num}_cond", cond)
                 add_visuals(images, dataset, f"{prefix}_iter{repeat_num}_sample", sample)

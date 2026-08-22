@@ -160,6 +160,20 @@ static void collect_intersected_voxels_for_triangle(
     const Eigen::Vector3i& grid_max,
     std::unordered_set<VoxelCoord>& intersected_voxels
 ) {
+    // The scan-line loops are half-open and can skip triangle tips or triangles
+    // contained within one voxel. Seed each vertex cell to guarantee coverage.
+    for (const Eigen::Vector3f* vertex : {&v0, &v1, &v2}) {
+        VoxelCoord coord;
+        for (int axis = 0; axis < 3; ++axis) {
+            coord[axis] = std::clamp(
+                static_cast<int>(std::floor((*vertex)[axis] / voxel_size[axis])),
+                grid_min[axis],
+                grid_max[axis] - 1
+            );
+        }
+        intersected_voxels.insert(coord);
+    }
+
     auto scan_line_fill = [&] (const int ax2) {
         int ax0 = (ax2 + 1) % 3;
         int ax1 = (ax2 + 2) % 3;
@@ -591,71 +605,11 @@ voxelize_trimesh_pbr_impl(
         // Material ID
         int mid = materialIds[tid];
 
-        // Find intersected voxel for each triangle
+        // Find intersected voxels for each triangle.
         std::unordered_set<VoxelCoord> intersected_voxels;
-        // Scan-line algorithm to find intersections with the voxel grid from three directions
-        /*
-          t0
-          | \
-          |  t1
-          | /
-          t2
-         */
-        auto scan_line_fill = [&] (const int ax2) {
-            int ax0 = (ax2 + 1) % 3;
-            int ax1 = (ax2 + 2) % 3;
-
-            // Canonical question
-            std::array<Eigen::Vector3d, 3> t = {
-                Eigen::Vector3d(v0[ax0], v0[ax1], v0[ax2]),
-                Eigen::Vector3d(v1[ax0], v1[ax1], v1[ax2]),
-                Eigen::Vector3d(v2[ax0], v2[ax1], v2[ax2])
-            };
-            std::sort(t.begin(), t.end(), [](const Eigen::Vector3d& a, const Eigen::Vector3d& b) { return a.y() < b.y(); });
-
-            // Scan-line algorithm
-            int start = std::clamp(int(t[0].y() / voxel_size[ax1]), grid_min[ax1], grid_max[ax1] - 1);
-            int mid = std::clamp(int(t[1].y() / voxel_size[ax1]), grid_min[ax1], grid_max[ax1] - 1);
-            int end = std::clamp(int(t[2].y() / voxel_size[ax1]), grid_min[ax1], grid_max[ax1] - 1);
-
-            auto scan_line_half = [&] (const int row_start, const int row_end, const Eigen::Vector3d t0, const Eigen::Vector3d t1, const Eigen::Vector3d t2) {
-            /*
-             t0
-             | \
-             t3-t4
-             |   \
-             t1---t2
-             */
-                for (int y_idx = row_start; y_idx < row_end; ++y_idx) {
-                    double y = (y_idx + 1) * voxel_size[ax1];
-                    Eigen::Vector2d t3 = lerp(t0.y(), t1.y(), y, Eigen::Vector2d(t0.x(), t0.z()), Eigen::Vector2d(t1.x(), t1.z()));
-                    Eigen::Vector2d t4 = lerp(t0.y(), t2.y(), y, Eigen::Vector2d(t0.x(), t0.z()), Eigen::Vector2d(t2.x(), t2.z()));
-                    if (t3.x() > t4.x()) std::swap(t3, t4);
-                    int line_start = std::clamp(int(t3.x() / voxel_size[ax0]), grid_min[ax0], grid_max[ax0] - 1);
-                    int line_end = std::clamp(int(t4.x() / voxel_size[ax0]), grid_min[ax0], grid_max[ax0] - 1);
-                    for (int x_idx = line_start; x_idx < line_end; ++x_idx) {
-                        double x = (x_idx + 1) * voxel_size[ax0];
-                        double z = lerp(t3.x(), t4.x(), x, t3.y(), t4.y());
-                        int z_idx = int(z / voxel_size[ax2]);
-                        if (z_idx >= grid_min[ax2] && z_idx < grid_max[ax2]) {
-                            // For 4-connected voxels
-                            for (int dx = 0; dx < 2; ++dx) {
-                                for (int dy = 0; dy < 2; ++dy) {
-                                    VoxelCoord coord;
-                                    coord[ax0] = x_idx + dx; coord[ax1] = y_idx + dy; coord[ax2] = z_idx;
-                                    intersected_voxels.insert(coord);
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-            scan_line_half(start, mid, t[0], t[1], t[2]);
-            scan_line_half(mid, end, t[2], t[1], t[0]);   
-        };
-        scan_line_fill(0);
-        scan_line_fill(1);
-        scan_line_fill(2);
+        collect_intersected_voxels_for_triangle(
+            v0, v1, v2, voxel_size, grid_min, grid_max, intersected_voxels
+        );
 
         // For all intersected voxels, ample texture and write to voxel grid
         for (auto voxel : intersected_voxels) {

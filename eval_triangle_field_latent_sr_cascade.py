@@ -138,6 +138,7 @@ def sparse_condition_from_low_to_high(
     cond_feats = []
     cond_coords = []
     missing = []
+    missing_counts = []
     for batch_idx, high_layout in enumerate(high.layout):
         high_coords = high.coords[high_layout].clone()
         high_spatial = high_coords[:, 1:].long()
@@ -170,10 +171,15 @@ def sparse_condition_from_low_to_high(
             feats[valid] = sorted_feats[idx[valid]]
         cond_feats.append(feats)
         cond_coords.append(high_coords)
-        missing.append(1.0 - valid.float().mean().item())
+        missing_count = int((~valid).sum().item())
+        missing_counts.append(missing_count)
+        missing.append(missing_count / max(1, valid.numel()))
 
-    if any(value > 0 for value in missing):
-        print(f"Warning: generated low-res conditioning missed high-res parents; max missing={max(missing):.6f}")
+    if any(missing_counts):
+        print(
+            "Warning: generated low-res conditioning missed high-res parents; "
+            f"max missing={max(missing):.9f} ({max(missing_counts)} voxels)"
+        )
     return sp.SparseTensor(torch.cat(cond_feats, dim=0), torch.cat(cond_coords, dim=0))
 
 
@@ -244,9 +250,18 @@ def main():
                 args.steps,
                 guidance,
                 args.apply_conditioning_augmentation,
+                high_resolution=high_res,
             )
-            sample = trainer._decode_latents_with_cache(sample_z, caches=caches)
-            pred_last = trainer._decode_latents_with_cache(pred_z0_last, caches=caches)
+            decode_kwargs = {
+                't': torch.zeros(sample_z.shape[0], device=sample_z.device),
+                'resolution': high_res,
+            }
+            sample = trainer._decode_latents_with_cache(
+                sample_z, caches=caches, **decode_kwargs
+            )
+            pred_last = trainer._decode_latents_with_cache(
+                pred_z0_last, caches=caches, **decode_kwargs
+            )
 
             for prefix, tensor in (
                 (f"gt_{high_res}", data["x_0"]),

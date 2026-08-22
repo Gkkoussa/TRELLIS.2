@@ -116,6 +116,7 @@ def sample_trajectory(
     steps: int,
     guidance_strength: float,
     panel_width: int,
+    high_resolution: int,
 ):
     z_t = z_0.replace(torch.randn_like(z_0.feats))
     zero_cond = cond.replace(torch.zeros_like(cond.feats))
@@ -130,19 +131,45 @@ def sample_trajectory(
     prev_output_d_tri = None
 
     for step_idx, (t, t_prev) in enumerate(tqdm(list(zip(t_seq[:-1], t_seq[1:])), desc="Sampling/rendering trajectory")):
-        x_t = trainer._decode_latents_with_cache(z_t, caches=caches, cache_paths=cache_paths)
+        decoder_t = torch.full(
+            (z_t.shape[0],),
+            float(t) * 1000.0,
+            device=z_t.device,
+        )
+        x_t = trainer._decode_latents_with_cache(
+            z_t,
+            caches=caches,
+            cache_paths=cache_paths,
+            t=decoder_t,
+            resolution=high_resolution,
+        )
         if guidance_strength == 0.0:
-            pred_z0 = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t))
+            pred_z0 = predict_z0(
+                trainer, z_t, zero_cond, caches, cache_paths, float(t),
+                high_resolution=high_resolution, decoded=x_t,
+            )
         else:
-            pred_pos = predict_z0(trainer, z_t, cond, caches, cache_paths, float(t))
+            pred_pos = predict_z0(
+                trainer, z_t, cond, caches, cache_paths, float(t),
+                high_resolution=high_resolution, decoded=x_t,
+            )
             if guidance_strength == 1.0:
                 pred_z0 = pred_pos
             else:
-                pred_neg = predict_z0(trainer, z_t, zero_cond, caches, cache_paths, float(t))
+                pred_neg = predict_z0(
+                    trainer, z_t, zero_cond, caches, cache_paths, float(t),
+                    high_resolution=high_resolution, decoded=x_t,
+                )
                 pred_z0 = pred_pos.replace(
                     guidance_strength * pred_pos.feats + (1.0 - guidance_strength) * pred_neg.feats
                 )
-        y = trainer._decode_latents_with_cache(pred_z0, caches=caches, cache_paths=cache_paths)
+        y = trainer._decode_latents_with_cache(
+            pred_z0,
+            caches=caches,
+            cache_paths=cache_paths,
+            t=torch.zeros_like(decoder_t),
+            resolution=high_resolution,
+        )
 
         input_vis = dataset.visualize_sample({"target": x_t})["d_tri"][0]
         output_vis = dataset.visualize_sample({"target": y})["d_tri"][0]
@@ -174,8 +201,21 @@ def sample_trajectory(
         final_pred = pred_z0
 
     # Include the final decoded sample as a last, steady frame.
-    x_final = trainer._decode_latents_with_cache(final_sample, caches=caches, cache_paths=cache_paths)
-    y_final = trainer._decode_latents_with_cache(final_pred, caches=caches, cache_paths=cache_paths)
+    final_t = torch.zeros(final_sample.shape[0], device=final_sample.device)
+    x_final = trainer._decode_latents_with_cache(
+        final_sample,
+        caches=caches,
+        cache_paths=cache_paths,
+        t=final_t,
+        resolution=high_resolution,
+    )
+    y_final = trainer._decode_latents_with_cache(
+        final_pred,
+        caches=caches,
+        cache_paths=cache_paths,
+        t=final_t,
+        resolution=high_resolution,
+    )
     input_vis = dataset.visualize_sample({"target": x_final})["d_tri"][0]
     output_vis = dataset.visualize_sample({"target": y_final})["d_tri"][0]
     frames.append(make_frame(input_vis, output_vis, steps, steps, 0.0, panel_width))
@@ -265,6 +305,7 @@ def main():
         steps=args.steps,
         guidance_strength=args.guidance_strength,
         panel_width=args.panel_width,
+        high_resolution=args.high_resolution,
     )
 
     gif_path = output_dir / f"unconditional_{args.high_resolution}_d_tri_trajectory.gif"

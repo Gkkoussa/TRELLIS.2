@@ -1,0 +1,1 @@
+[SPARSE] Conv backend: flex_gemm; Attention backend: flash_attn

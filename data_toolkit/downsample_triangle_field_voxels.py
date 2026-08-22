@@ -24,6 +24,24 @@ def parse_args():
     parser.add_argument("--source_metadata", type=Path, default=None, help="Defaults to <source_root>/metadata.csv.")
     parser.add_argument("--output_prefix", type=str, default="triangle_field_voxels")
     parser.add_argument("--output_suffix", type=str, default="avg_from_512")
+    parser.add_argument(
+        "--feature_mode",
+        choices=("average_all", "average_targets_recompute_aux"),
+        default="average_all",
+        help=(
+            "Average every channel (legacy), or average only d_tri/d_vert and take "
+            "the 18 coherent auxiliary channels from target-resolution voxelizer outputs."
+        ),
+    )
+    parser.add_argument(
+        "--recomputed_root",
+        type=Path,
+        default=None,
+        help=(
+            "Root containing triangle_field_voxels_<resolution> directories. Required "
+            "for --feature_mode average_targets_recompute_aux."
+        ),
+    )
     parser.add_argument("--feature_dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--compression", choices=("zstd", "npz"), default="zstd")
     parser.add_argument("--zstd_level", type=int, default=5)
@@ -53,6 +71,42 @@ def find_source_file(source_root: Path, sha256: str) -> Path:
         if path.exists():
             return path
     raise FileNotFoundError(f"No source triangle-field voxel file found for {sha256} in {source_root}")
+
+
+def find_recomputed_file(recomputed_root: Path, resolution: int, sha256: str) -> Path:
+    return find_source_file(recomputed_root / f"triangle_field_voxels_{resolution}", sha256)
+
+
+def align_recomputed_features(
+    expected_coords: np.ndarray,
+    recomputed_coords: np.ndarray,
+    recomputed_features: np.ndarray,
+    resolution: int,
+) -> np.ndarray:
+    if expected_coords.shape != recomputed_coords.shape:
+        raise ValueError(
+            f"Support shape mismatch at resolution {resolution}: "
+            f"expected {expected_coords.shape}, recomputed {recomputed_coords.shape}"
+        )
+
+    expected_keys = (
+        (expected_coords[:, 0].astype(np.int64) * resolution + expected_coords[:, 1])
+        * resolution
+        + expected_coords[:, 2]
+    )
+    recomputed_keys = (
+        (recomputed_coords[:, 0].astype(np.int64) * resolution + recomputed_coords[:, 1])
+        * resolution
+        + recomputed_coords[:, 2]
+    )
+    expected_order = np.argsort(expected_keys)
+    recomputed_order = np.argsort(recomputed_keys)
+    if not np.array_equal(expected_keys[expected_order], recomputed_keys[recomputed_order]):
+        raise ValueError(f"Support coordinate mismatch at resolution {resolution}")
+
+    aligned = np.empty_like(recomputed_features)
+    aligned[expected_order] = recomputed_features[recomputed_order]
+    return aligned
 
 
 def average_downsample(coords: np.ndarray, features: np.ndarray, factor: int) -> tuple[np.ndarray, np.ndarray]:
@@ -119,6 +173,8 @@ def process_one(
     zstd_level: int,
     device: str,
     skip_existing: bool,
+    feature_mode: str,
+    recomputed_root: str | None,
 ) -> dict:
     source_path = find_source_file(Path(source_root), sha256)
     extension = ".npz.zst" if compression == "zstd" else ".npz"
@@ -152,6 +208,28 @@ def process_one(
             out_coords, out_features = average_downsample_torch(coords, features, factor, device)
         else:
             out_coords, out_features = average_downsample(coords, features, factor)
+        if feature_mode == "average_targets_recompute_aux":
+            if features.shape[1] != 20:
+                raise ValueError(
+                    f"{source_path} has {features.shape[1]} channels; hybrid base-field "
+                    "downsampling requires exactly 20"
+                )
+            recomputed_path = find_recomputed_file(Path(recomputed_root), res, sha256)
+            with load_npz(recomputed_path) as recomputed:
+                recomputed_coords = recomputed["coords"].astype(np.int32, copy=False)
+                recomputed_features = recomputed["features"].astype(np.float32, copy=False)
+            if recomputed_features.shape[1] != 20:
+                raise ValueError(
+                    f"{recomputed_path} has {recomputed_features.shape[1]} channels; expected 20"
+                )
+            out_aux = align_recomputed_features(
+                out_coords,
+                recomputed_coords,
+                recomputed_features,
+                res,
+            )
+            out_aux[:, :2] = out_features[:, :2]
+            out_features = out_aux
         out_features = out_features.astype(out_dtype, copy=False)
         save_triangle_field(output_path, out_coords, out_features, compression, zstd_level)
         counts[str(res)] = int(out_coords.shape[0])
@@ -160,6 +238,10 @@ def process_one(
 
 def main():
     args = parse_args()
+    if args.feature_mode == "average_targets_recompute_aux" and args.recomputed_root is None:
+        raise ValueError(
+            "--recomputed_root is required for --feature_mode average_targets_recompute_aux"
+        )
     source_metadata = args.source_metadata or args.source_root / "metadata.csv"
     if not source_metadata.exists():
         raise FileNotFoundError(f"Source metadata not found: {source_metadata}")
@@ -196,6 +278,8 @@ def main():
         "zstd_level": args.zstd_level,
         "device": args.device,
         "skip_existing": args.skip_existing,
+        "feature_mode": args.feature_mode,
+        "recomputed_root": None if args.recomputed_root is None else str(args.recomputed_root),
     }
     if args.device == "cuda" and args.max_workers != 1:
         print("Warning: --device cuda uses a single worker to avoid multiple processes contending for one GPU.")
@@ -216,6 +300,8 @@ def main():
             [kwargs["zstd_level"]] * len(instances),
             [kwargs["device"]] * len(instances),
             [kwargs["skip_existing"]] * len(instances),
+            [kwargs["feature_mode"]] * len(instances),
+            [kwargs["recomputed_root"]] * len(instances),
             chunksize=args.chunksize,
         )
 
@@ -255,6 +341,8 @@ def main():
             "compression": args.compression,
             "zstd_level": args.zstd_level if args.compression == "zstd" else None,
             "device": args.device,
+            "feature_mode": args.feature_mode,
+            "recomputed_root": None if args.recomputed_root is None else str(args.recomputed_root),
             "output_dir": str(output_dir),
         }
         with open(output_dir / "downsample_summary.json", "w") as f:

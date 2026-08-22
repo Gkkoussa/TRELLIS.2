@@ -77,6 +77,8 @@ class BasicTrainer:
         mix_precision_mode='inflat_all',
         mix_precision_dtype='float16',
         fp16_scale_growth=1e-3,
+        fp16_initial_log_scale=20.0,
+        fp16_min_log_scale=0.0,
         parallel_mode='ddp',
         finetune_ckpt=None,
         log_param_stats=False,
@@ -107,6 +109,8 @@ class BasicTrainer:
         self.mix_precision_mode = mix_precision_mode
         self.mix_precision_dtype = str_to_dtype(mix_precision_dtype)
         self.fp16_scale_growth = fp16_scale_growth
+        self.fp16_initial_log_scale = float(fp16_initial_log_scale)
+        self.fp16_min_log_scale = float(fp16_min_log_scale)
         self.parallel_mode = parallel_mode
         self.log_param_stats = log_param_stats
         self.prefetch_data = prefetch_data
@@ -232,7 +236,7 @@ class BasicTrainer:
         elif self.mix_precision_mode == 'inflat_all':
             self.master_params = make_master_params(self.model_params)
             if self.mix_precision_dtype == torch.float16:
-                self.log_scale = 20.0
+                self.log_scale = self.fp16_initial_log_scale
         elif self.mix_precision_mode is None:
             self.master_params = self.model_params
         else:
@@ -498,8 +502,9 @@ class BasicTrainer:
             collate_fn=self.dataset.collate_fn if hasattr(self.dataset, 'collate_fn') else None,
         )
         save_cfg = {}
+        data_iterator = iter(dataloader)
         for i in range(0, num_samples, batch_size):
-            data = next(iter(dataloader))
+            data = next(data_iterator)
             data = {k: v[:min(num_samples - i, batch_size)] for k, v in data.items()}
             data = recursive_to_device(data, self.device)
             vis = self.visualize_sample(data)
@@ -801,20 +806,25 @@ class BasicTrainer:
         """
         Check if training should be aborted due to certain conditions.
         """
-        # 1. If log_scale in inflat_all mode is less than 0
+        # 1. If log_scale in inflat_all mode falls below the configured floor
         if self.mix_precision_dtype == torch.float16 and \
            self.mix_precision_mode == 'inflat_all' and \
-           self.log_scale < 0:
+           self.log_scale < self.fp16_min_log_scale:
             if self.is_master:
                 print ('\n\n\033[91m')
-                print (f'ABORT: log_scale in inflat_all mode is less than 0 at step {self.step}.')
+                print (
+                    f'ABORT: log_scale in inflat_all mode is below '
+                    f'{self.fp16_min_log_scale} at step {self.step}.'
+                )
                 print ('This indicates that the model is diverging. You should look into the model and the data.')
                 print ('\033[0m')
                 self.save(non_blocking=False)
                 self.save_logs()
             if self.world_size > 1:
                 dist.barrier()
-            raise ValueError('ABORT: log_scale in inflat_all mode is less than 0.')
+            raise ValueError(
+                f'ABORT: log_scale in inflat_all mode is below {self.fp16_min_log_scale}.'
+            )
 
     def run(self):
         """

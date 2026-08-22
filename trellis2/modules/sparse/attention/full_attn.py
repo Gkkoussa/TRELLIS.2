@@ -183,7 +183,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         out = xops.memory_efficient_attention(q, k, v, mask)[0]
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
-            import flash_attn
+            from flash_attn import flash_attn_interface as flash_attn
         cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
         if num_all_args in [2, 3]:
             cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)

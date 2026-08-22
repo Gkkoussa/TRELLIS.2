@@ -114,8 +114,21 @@ def main():
     preds = []
     decoded = []
     for t in t_values:
-        pred = predict_z0(trainer, z_t, cond, caches, cache_paths=None, t=t)
-        y = trainer._decode_latents_with_cache(pred, caches=caches)
+        pred = predict_z0(
+            trainer,
+            z_t,
+            cond,
+            caches,
+            cache_paths=None,
+            t=t,
+            high_resolution=args.high_resolution,
+        )
+        y = trainer._decode_latents_with_cache(
+            pred,
+            caches=caches,
+            t=torch.zeros(pred.shape[0], device=pred.device),
+            resolution=args.high_resolution,
+        )
         preds.append(pred)
         decoded.append(y)
 

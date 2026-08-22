@@ -1,12 +1,19 @@
 from typing import *
 
+import bisect
+import hashlib
+import json
+import math
 import os
 import torch
 import numpy as np
 import pandas as pd
 
 from .components import StandardDatasetBase
+from .point_density_mesh import load_normalized_mesh, sample_surface_geometry
 from .sparse_voxel_triangle_field import (
+    DENSITY_ELONGATION_INPUT_LAYOUT,
+    ELONGATION_INPUT_LAYOUT,
     EXTENDED_INPUT_LAYOUT,
     SparseVoxelTriangleFieldVisMixin,
     find_triangle_field_path,
@@ -43,6 +50,22 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         density_conditioning: bool = False,
         density_voxel_root_key: str = 'density_triangle_field_voxel',
         density_channel: str = 'density_field',
+        elongation_conditioning: bool = False,
+        elongation_voxel_root_key: str = 'elongation_triangle_field_voxel',
+        elongation_channel: str = 'elongation_field',
+        density_statistics_path: str = None,
+        density_statistics_columns: Tuple[str, str, str] = (
+            'density_field_min_128',
+            'density_field_median_128',
+            'density_field_max_128',
+        ),
+        density_statistics_reference_resolution: float = None,
+        force_dropped_field_condition: bool = False,
+        shape_conditioning: bool = False,
+        shape_mesh_root_key: str = 'mesh',
+        shape_context_points: int = 16384,
+        shape_deterministic_sampling: bool = False,
+        shape_sampling_seed: int = 0,
         instances_path: str = None,
     ):
         if high_resolution % low_resolution != 0:
@@ -64,11 +87,48 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         self.density_conditioning = bool(density_conditioning)
         self.density_voxel_root_key = density_voxel_root_key
         self.density_channel = density_channel
-        self.instances_path = instances_path
-        if self.density_channel not in EXTENDED_INPUT_LAYOUT:
+        self.elongation_conditioning = bool(elongation_conditioning)
+        self.elongation_voxel_root_key = elongation_voxel_root_key
+        self.elongation_channel = elongation_channel
+        self.density_statistics_path = density_statistics_path
+        self.density_statistics_columns = tuple(density_statistics_columns)
+        self.density_statistics_reference_resolution = density_statistics_reference_resolution
+        if (
+            self.density_statistics_reference_resolution is not None
+            and self.density_statistics_reference_resolution <= 0
+        ):
             raise ValueError(
-                f'density_channel must be one of {sorted(EXTENDED_INPUT_LAYOUT.keys())}, '
+                'density_statistics_reference_resolution must be positive, got '
+                f'{self.density_statistics_reference_resolution}'
+            )
+        self.force_dropped_field_condition = bool(force_dropped_field_condition)
+        self.shape_conditioning = bool(shape_conditioning)
+        self.shape_mesh_root_key = str(shape_mesh_root_key)
+        self.shape_context_points = int(shape_context_points)
+        self.shape_deterministic_sampling = bool(shape_deterministic_sampling)
+        self.shape_sampling_seed = int(shape_sampling_seed)
+        if self.shape_context_points <= 0:
+            raise ValueError(
+                f'shape_context_points must be positive, got {shape_context_points}'
+            )
+        self.instances_path = instances_path
+        if self.density_conditioning and self.elongation_conditioning:
+            self.conditioning_input_layout = DENSITY_ELONGATION_INPUT_LAYOUT
+        elif self.density_conditioning:
+            self.conditioning_input_layout = EXTENDED_INPUT_LAYOUT
+        elif self.elongation_conditioning:
+            self.conditioning_input_layout = ELONGATION_INPUT_LAYOUT
+        else:
+            self.conditioning_input_layout = {}
+        if self.density_conditioning and self.density_channel not in self.conditioning_input_layout:
+            raise ValueError(
+                f'density_channel must be one of {sorted(self.conditioning_input_layout.keys())}, '
                 f'got {self.density_channel}'
+            )
+        if self.elongation_conditioning and self.elongation_channel not in self.conditioning_input_layout:
+            raise ValueError(
+                f'elongation_channel must be one of {sorted(self.conditioning_input_layout.keys())}, '
+                f'got {self.elongation_channel}'
             )
         if self.distance_transform not in ('none', 'minus_one_one'):
             raise ValueError(f"distance_transform must be 'none' or 'minus_one_one', got {self.distance_transform}")
@@ -78,6 +138,7 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         super().__init__(roots)
         self._filter_paired_instances()
         self._filter_instances_path()
+        self._load_density_statistics()
         self.loads = [
             self.metadata.loc[sha256, self.num_voxels_column]
             if self.num_voxels_column in self.metadata.columns else 1
@@ -96,8 +157,102 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
             f'  - Density conditioning: {self.density_conditioning}',
             f'  - Density voxel root key: {self.density_voxel_root_key}',
             f'  - Density channel: {self.density_channel}',
+            f'  - Elongation conditioning: {self.elongation_conditioning}',
+            f'  - Elongation voxel root key: {self.elongation_voxel_root_key}',
+            f'  - Elongation channel: {self.elongation_channel}',
+            f'  - Density statistics path: {self.density_statistics_path}',
+            f'  - Density statistics columns: {self.density_statistics_columns}',
+            f'  - Density statistics reference resolution: '
+            f'{self.density_statistics_reference_resolution}',
+            f'  - Force dropped field condition: {self.force_dropped_field_condition}',
+            f'  - Shape conditioning: {self.shape_conditioning}',
+            f'  - Shape context points: {self.shape_context_points}',
+            f'  - Shape mesh root key: {self.shape_mesh_root_key}',
+            f'  - Shape deterministic sampling: {self.shape_deterministic_sampling}',
         ]
         return '\n'.join(lines)
+
+    def _shape_sample_seed(self, instance: str) -> int:
+        if not self.shape_deterministic_sampling:
+            return int(np.random.randint(0, np.iinfo(np.int32).max))
+        digest = hashlib.sha256(
+            f'{self.shape_sampling_seed}:{instance}'.encode()
+        ).digest()
+        return int.from_bytes(digest[:4], byteorder='little', signed=False)
+
+    def _sample_shape_geometry(self, root, instance: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.shape_mesh_root_key not in root:
+            raise KeyError(
+                f'Shape conditioning requires root key {self.shape_mesh_root_key}. '
+                f'Available keys: {sorted(root.keys())}'
+            )
+        if 'local_path' not in self.metadata.columns:
+            raise KeyError('Shape conditioning requires a local_path metadata column')
+        local_path = str(self.metadata.loc[instance, 'local_path'])
+        mesh_path = (
+            local_path
+            if os.path.isabs(local_path)
+            else os.path.join(root[self.shape_mesh_root_key], local_path)
+        )
+        mesh = load_normalized_mesh(mesh_path)
+        points, normals = sample_surface_geometry(
+            mesh,
+            self.shape_context_points,
+            seed=self._shape_sample_seed(instance),
+        )
+        return torch.from_numpy(points), torch.from_numpy(normals)
+
+    def _load_density_statistics(self) -> None:
+        self.density_statistics = None
+        if self.density_statistics_path is None:
+            return
+        if not os.path.exists(self.density_statistics_path):
+            raise FileNotFoundError(
+                f'density_statistics_path not found: {self.density_statistics_path}'
+            )
+        if len(self.density_statistics_columns) != 3:
+            raise ValueError(
+                'density_statistics_columns must contain min, median, and max columns, '
+                f'got {self.density_statistics_columns}'
+            )
+        frame = pd.read_csv(self.density_statistics_path)
+        required = {'sha256', *self.density_statistics_columns}
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(
+                f'{self.density_statistics_path} is missing columns: {sorted(missing)}'
+            )
+        if frame['sha256'].duplicated().any():
+            raise ValueError(f'{self.density_statistics_path} contains duplicate sha256 rows')
+        frame = frame.set_index('sha256').loc[:, list(self.density_statistics_columns)]
+        values = frame.to_numpy(dtype=np.float32, copy=True)
+        if not np.isfinite(values).all():
+            raise ValueError(f'{self.density_statistics_path} contains non-finite values')
+        self.density_statistics = pd.DataFrame(
+            values,
+            index=frame.index.astype(str),
+            columns=self.density_statistics_columns,
+        )
+        keep = set(self.density_statistics.index)
+        self.instances = [
+            (root, sha256) for root, sha256 in self.instances if sha256 in keep
+        ]
+        if len(self.metadata) > 0:
+            self.metadata = self.metadata[self.metadata.index.astype(str).isin(keep)]
+        for stats in self._stats.values():
+            stats['Matched density statistics'] = len(self.instances)
+
+    def _get_density_statistics(self, instance: str) -> Optional[torch.Tensor]:
+        if self.density_statistics is None:
+            return None
+        statistics = torch.from_numpy(
+            self.density_statistics.loc[instance].to_numpy(dtype=np.float32, copy=True)
+        )
+        if self.density_statistics_reference_resolution is not None:
+            statistics -= 2.0 * math.log(
+                self.high_resolution / self.density_statistics_reference_resolution
+            )
+        return statistics
 
     def _filter_instances_path(self) -> None:
         if self.instances_path is None:
@@ -150,9 +305,25 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
                     )
                 density_metadata = pd.read_csv(os.path.join(root[self.density_voxel_root_key], 'metadata.csv'))
                 valid = valid.intersection(set(density_metadata['sha256'].values))
+            if self.elongation_conditioning:
+                if self.elongation_voxel_root_key not in root:
+                    raise KeyError(
+                        f'Elongation conditioning requires root key {self.elongation_voxel_root_key}. '
+                        f'Available keys: {sorted(root.keys())}'
+                    )
+                elongation_metadata = pd.read_csv(
+                    os.path.join(root[self.elongation_voxel_root_key], 'metadata.csv')
+                )
+                valid = valid.intersection(set(elongation_metadata['sha256'].values))
             valid_by_source[key] = valid
             if key in self._stats:
-                stat_name = 'Paired low/high/density metadata' if self.density_conditioning else 'Paired low/high metadata'
+                condition_names = []
+                if self.density_conditioning:
+                    condition_names.append('density')
+                if self.elongation_conditioning:
+                    condition_names.append('elongation')
+                suffix = f"/{'/'.join(condition_names)}" if condition_names else ''
+                stat_name = f'Paired low/high{suffix} metadata'
                 self._stats[key][stat_name] = len(valid)
 
         filtered = []
@@ -269,11 +440,12 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         missing_frac = 1.0 - valid.float().mean().item()
         return feats, missing_frac
 
-    def _read_density_conditioning(
+    def _read_scalar_conditioning(
         self,
         root: str,
         instance: str,
         high_coords: torch.Tensor,
+        channel: str,
     ) -> Tuple[torch.Tensor, float]:
         path = find_triangle_field_path(root, instance)
         with load_triangle_field_npz(path) as data:
@@ -286,11 +458,11 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         if coords.shape[0] != features.shape[0]:
             raise ValueError(f'{path} coords/features length mismatch: {coords.shape[0]} vs {features.shape[0]}')
 
-        slc = EXTENDED_INPUT_LAYOUT[self.density_channel]
+        slc = self.conditioning_input_layout[channel]
         if features.shape[1] < slc.stop:
             raise ValueError(
-                f'{path} has {features.shape[1]} feature channels, but density channel '
-                f'{self.density_channel} requires at least {slc.stop}'
+                f'{path} has {features.shape[1]} feature channels, but conditioning channel '
+                f'{channel} requires at least {slc.stop}'
             )
         return self._features_to_support(
             coords,
@@ -386,21 +558,37 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
         return cond
 
     def get_instance(self, root, instance):
-        low_coords, low_target, _ = self._read_target_features(root[self.low_voxel_root_key], instance)
         high_coords, high_target, area_offsets = self._read_target_features(
             root[self.high_voxel_root_key],
             instance,
             return_area_offsets=self.return_area_offsets,
         )
-        cond, missing_frac = self._low_to_high_support(low_coords, low_target, high_coords)
+        if self.force_dropped_field_condition:
+            cond = torch.zeros((high_coords.shape[0], high_target.shape[1]), dtype=high_target.dtype)
+            missing_frac = 1.0
+        else:
+            low_coords, low_target, _ = self._read_target_features(
+                root[self.low_voxel_root_key], instance
+            )
+            cond, missing_frac = self._low_to_high_support(low_coords, low_target, high_coords)
         cond = self._augment_conditioning(high_coords, cond)
         density_cond = None
         density_missing_frac = None
         if self.density_conditioning:
-            density_cond, density_missing_frac = self._read_density_conditioning(
+            density_cond, density_missing_frac = self._read_scalar_conditioning(
                 root[self.density_voxel_root_key],
                 instance,
                 high_coords,
+                self.density_channel,
+            )
+        elongation_cond = None
+        elongation_missing_frac = None
+        if self.elongation_conditioning:
+            elongation_cond, elongation_missing_frac = self._read_scalar_conditioning(
+                root[self.elongation_voxel_root_key],
+                instance,
+                high_coords,
+                self.elongation_channel,
             )
 
         sparse_coords = torch.cat([torch.zeros_like(high_coords[:, 0:1]), high_coords], dim=-1).int()
@@ -410,12 +598,26 @@ class TriangleFieldSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin, Stan
             'x_0': x_0,
             'cond': cond,
             'missing_low_parent_frac': torch.tensor(missing_frac, dtype=torch.float32),
+            'force_field_drop': torch.tensor(self.force_dropped_field_condition, dtype=torch.bool),
         }
         if self.return_area_offsets:
             pack['area_offsets'] = sp.SparseTensor(area_offsets.float(), sparse_coords)
         if self.density_conditioning:
             pack['density_cond'] = sp.SparseTensor(density_cond.float(), sparse_coords)
             pack['density_missing_parent_frac'] = torch.tensor(density_missing_frac, dtype=torch.float32)
+        if self.elongation_conditioning:
+            pack['elongation_cond'] = sp.SparseTensor(elongation_cond.float(), sparse_coords)
+            pack['elongation_missing_parent_frac'] = torch.tensor(
+                elongation_missing_frac,
+                dtype=torch.float32,
+            )
+        density_statistics = self._get_density_statistics(instance)
+        if density_statistics is not None:
+            pack['density_statistics'] = density_statistics
+        if self.shape_conditioning:
+            shape_points, shape_normals = self._sample_shape_geometry(root, instance)
+            pack['shape_points'] = shape_points
+            pack['shape_normals'] = shape_normals
         return pack
 
     @staticmethod
@@ -458,12 +660,20 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
         latent_encoded_flag_column: str = 'triangle_field_latent_encoded',
         latent_tokens_column: str = 'triangle_field_latent_tokens',
         max_latent_tokens: int = 32768,
+        return_high_target_fields: bool = False,
+        multiscale_support_conditioning: bool = False,
+        support_voxel_root_key: str = 'support_triangle_field_voxel',
+        support_resolution: int = 512,
         **kwargs,
     ):
         self.latent_root_key = latent_root_key
         self.latent_encoded_flag_column = latent_encoded_flag_column
         self.latent_tokens_column = latent_tokens_column
         self.max_latent_tokens = max_latent_tokens
+        self.return_high_target_fields = bool(return_high_target_fields)
+        self.multiscale_support_conditioning = bool(multiscale_support_conditioning)
+        self.support_voxel_root_key = str(support_voxel_root_key)
+        self.support_resolution = int(support_resolution)
         super().__init__(*args, **kwargs)
 
     def __str__(self):
@@ -471,6 +681,8 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
             super().__str__(),
             f'  - Latent root key: {self.latent_root_key}',
             f'  - Max latent tokens: {self.max_latent_tokens}',
+            f'  - Return high target fields: {self.return_high_target_fields}',
+            f'  - Multiscale support conditioning: {self.multiscale_support_conditioning}',
         ]
         return '\n'.join(lines)
 
@@ -488,6 +700,16 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
                 .intersection(set(high_metadata['sha256'].values))
                 .intersection(set(latent_metadata['sha256'].values))
             )
+            if self.multiscale_support_conditioning:
+                if self.support_voxel_root_key not in root:
+                    raise KeyError(
+                        'Multiscale support conditioning requires root key '
+                        f'{self.support_voxel_root_key}. Available keys: {sorted(root.keys())}'
+                    )
+                support_metadata = pd.read_csv(
+                    os.path.join(root[self.support_voxel_root_key], 'metadata.csv')
+                )
+                valid = valid.intersection(set(support_metadata['sha256'].values))
             if self.density_conditioning:
                 if self.density_voxel_root_key not in root:
                     raise KeyError(
@@ -496,13 +718,25 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
                     )
                 density_metadata = pd.read_csv(os.path.join(root[self.density_voxel_root_key], 'metadata.csv'))
                 valid = valid.intersection(set(density_metadata['sha256'].values))
+            if self.elongation_conditioning:
+                if self.elongation_voxel_root_key not in root:
+                    raise KeyError(
+                        f'Elongation conditioning requires root key {self.elongation_voxel_root_key}. '
+                        f'Available keys: {sorted(root.keys())}'
+                    )
+                elongation_metadata = pd.read_csv(
+                    os.path.join(root[self.elongation_voxel_root_key], 'metadata.csv')
+                )
+                valid = valid.intersection(set(elongation_metadata['sha256'].values))
             valid_by_source[key] = valid
             if key in self._stats:
-                stat_name = (
-                    'Paired low/high/latent/density metadata'
-                    if self.density_conditioning else
-                    'Paired low/high/latent metadata'
-                )
+                condition_names = []
+                if self.density_conditioning:
+                    condition_names.append('density')
+                if self.elongation_conditioning:
+                    condition_names.append('elongation')
+                suffix = f"/{'/'.join(condition_names)}" if condition_names else ''
+                stat_name = f'Paired low/high/latent{suffix} metadata'
                 self._stats[key][stat_name] = len(valid)
 
         filtered = []
@@ -562,28 +796,279 @@ class TriangleFieldLatentSuperResolutionDataset(TriangleFieldSuperResolutionData
             return torch.load(cache_path, map_location='cpu')
 
     def get_instance(self, root, instance):
-        low_coords, low_target, _ = self._read_target_features(root[self.low_voxel_root_key], instance)
-        high_coords = self._read_coords(root[self.high_voxel_root_key], instance)
-        cond, missing_frac = self._low_to_high_support(low_coords, low_target, high_coords)
+        high_target = None
+        if self.return_high_target_fields:
+            high_coords, high_target, _ = self._read_target_features(
+                root[self.high_voxel_root_key],
+                instance,
+            )
+        else:
+            high_coords = self._read_coords(root[self.high_voxel_root_key], instance)
+        if self.force_dropped_field_condition:
+            cond = torch.zeros((high_coords.shape[0], 2), dtype=torch.float32)
+            missing_frac = 1.0
+        else:
+            low_coords, low_target, _ = self._read_target_features(
+                root[self.low_voxel_root_key], instance
+            )
+            cond, missing_frac = self._low_to_high_support(low_coords, low_target, high_coords)
         cond = self._augment_conditioning(high_coords, cond)
         sparse_coords = torch.cat([torch.zeros_like(high_coords[:, 0:1]), high_coords], dim=-1).int()
         z_0, cache_path = self._read_latent(root[self.latent_root_key], instance)
         density_cond = None
         density_missing_frac = None
         if self.density_conditioning:
-            density_cond, density_missing_frac = self._read_density_conditioning(
+            density_cond, density_missing_frac = self._read_scalar_conditioning(
                 root[self.density_voxel_root_key],
                 instance,
                 high_coords,
+                self.density_channel,
+            )
+        elongation_cond = None
+        elongation_missing_frac = None
+        if self.elongation_conditioning:
+            elongation_cond, elongation_missing_frac = self._read_scalar_conditioning(
+                root[self.elongation_voxel_root_key],
+                instance,
+                high_coords,
+                self.elongation_channel,
             )
         pack = {
             'cond': sp.SparseTensor(cond.float(), sparse_coords),
             'missing_low_parent_frac': torch.tensor(missing_frac, dtype=torch.float32),
             'z_0': z_0,
+            'force_field_drop': torch.tensor(self.force_dropped_field_condition, dtype=torch.bool),
         }
+        if self.return_high_target_fields:
+            pack['x_0'] = sp.SparseTensor(high_target.float(), sparse_coords)
+        if self.multiscale_support_conditioning:
+            support_coords = self._read_coords(
+                root[self.support_voxel_root_key],
+                instance,
+            )
+            support_sparse_coords = torch.cat([
+                torch.zeros_like(support_coords[:, 0:1]),
+                support_coords,
+            ], dim=-1).int()
+            pack['support_512'] = sp.SparseTensor(
+                torch.ones((support_coords.shape[0], 1), dtype=torch.float32),
+                support_sparse_coords,
+            )
         if self.density_conditioning:
             pack['density_cond'] = sp.SparseTensor(density_cond.float(), sparse_coords)
             pack['density_missing_parent_frac'] = torch.tensor(density_missing_frac, dtype=torch.float32)
+        if self.elongation_conditioning:
+            pack['elongation_cond'] = sp.SparseTensor(elongation_cond.float(), sparse_coords)
+            pack['elongation_missing_parent_frac'] = torch.tensor(
+                elongation_missing_frac,
+                dtype=torch.float32,
+            )
+        density_statistics = self._get_density_statistics(instance)
+        if density_statistics is not None:
+            pack['density_statistics'] = density_statistics
+        if self.shape_conditioning:
+            shape_points, shape_normals = self._sample_shape_geometry(root, instance)
+            pack['shape_points'] = shape_points
+            pack['shape_normals'] = shape_normals
         pack['triangle_field_slat_cache_path'] = cache_path
         pack['triangle_field_slat_cache'] = self._read_latent_cache(cache_path)
         return pack
+
+
+class MultiResolutionTriangleFieldLatentSuperResolutionDataset(SparseVoxelTriangleFieldVisMixin):
+    """Flatten adjacent latent super-resolution pairs into one dataset."""
+
+    def __init__(
+        self,
+        roots: str,
+        resolutions=(32, 64, 128, 256, 512),
+        voxel_root_key: str = 'triangle_field_voxel',
+        force_drop_low_condition_high_resolutions=(),
+        instances_path: str = None,
+        **kwargs,
+    ):
+        self.resolutions = [int(resolution) for resolution in resolutions]
+        if len(self.resolutions) < 2:
+            raise ValueError('resolutions must contain at least two entries.')
+        for low_resolution, high_resolution in zip(self.resolutions, self.resolutions[1:]):
+            if high_resolution != 2 * low_resolution:
+                raise ValueError(
+                    'Adjacent resolutions must differ by a factor of two, got '
+                    f'{low_resolution}->{high_resolution}.'
+                )
+        force_drop_high_resolutions = {
+            int(resolution) for resolution in force_drop_low_condition_high_resolutions
+        }
+        valid_high_resolutions = set(self.resolutions[1:])
+        if not force_drop_high_resolutions.issubset(valid_high_resolutions):
+            raise ValueError(
+                'force_drop_low_condition_high_resolutions must contain target resolutions from '
+                f'{sorted(valid_high_resolutions)}, got {sorted(force_drop_high_resolutions)}'
+            )
+
+        parsed_roots = json.loads(roots)
+        low_voxel_root_key = kwargs.get('low_voxel_root_key', 'low_triangle_field_voxel')
+        high_voxel_root_key = kwargs.get('high_voxel_root_key', 'high_triangle_field_voxel')
+        latent_root_key = kwargs.get('latent_root_key', 'triangle_field_latent')
+        density_root_key = kwargs.get('density_voxel_root_key', 'density_triangle_field_voxel')
+        elongation_root_key = kwargs.get('elongation_voxel_root_key', 'elongation_triangle_field_voxel')
+        density_conditioning = bool(kwargs.get('density_conditioning', False))
+        elongation_conditioning = bool(kwargs.get('elongation_conditioning', False))
+        shape_conditioning = bool(kwargs.get('shape_conditioning', False))
+        multiscale_support_conditioning = bool(
+            kwargs.get('multiscale_support_conditioning', False)
+        )
+        support_voxel_root_key = kwargs.get(
+            'support_voxel_root_key',
+            'support_triangle_field_voxel',
+        )
+        support_resolution = int(kwargs.get('support_resolution', max(self.resolutions)))
+        shape_mesh_root_key = kwargs.get('shape_mesh_root_key', 'mesh')
+
+        self.datasets = []
+        self._cumulative_sizes = []
+        self._stats = {}
+        total = 0
+        for low_resolution, high_resolution in zip(self.resolutions, self.resolutions[1:]):
+            force_dropped_field_condition = high_resolution in force_drop_high_resolutions
+            pair_roots = {}
+            for source_name, source_roots in parsed_roots.items():
+                high_voxel_root = self._resolve_root(source_roots, voxel_root_key, high_resolution)
+                pair_root = {
+                    low_voxel_root_key: (
+                        high_voxel_root
+                        if force_dropped_field_condition
+                        else self._resolve_root(source_roots, voxel_root_key, low_resolution)
+                    ),
+                    high_voxel_root_key: high_voxel_root,
+                    latent_root_key: self._resolve_root(source_roots, latent_root_key, high_resolution),
+                }
+                if multiscale_support_conditioning:
+                    pair_root[support_voxel_root_key] = self._resolve_root(
+                        source_roots,
+                        voxel_root_key,
+                        support_resolution,
+                    )
+                if density_conditioning:
+                    pair_root[density_root_key] = self._resolve_root(
+                        source_roots, density_root_key, high_resolution
+                    )
+                if elongation_conditioning:
+                    pair_root[elongation_root_key] = self._resolve_root(
+                        source_roots, elongation_root_key, high_resolution
+                    )
+                if shape_conditioning:
+                    if shape_mesh_root_key not in source_roots:
+                        raise KeyError(
+                            f'Shape conditioning requires source root key '
+                            f'{shape_mesh_root_key}. Available keys: '
+                            f'{sorted(source_roots.keys())}'
+                        )
+                    pair_root[shape_mesh_root_key] = source_roots[shape_mesh_root_key]
+                pair_root.update({key: value for key, value in source_roots.items() if key.startswith('_')})
+                pair_roots[source_name] = pair_root
+
+            dataset = TriangleFieldLatentSuperResolutionDataset(
+                json.dumps(pair_roots),
+                low_resolution=low_resolution,
+                high_resolution=high_resolution,
+                force_dropped_field_condition=force_dropped_field_condition,
+                instances_path=instances_path,
+                **kwargs,
+            )
+            self.datasets.append(dataset)
+            total += len(dataset)
+            self._cumulative_sizes.append(total)
+            self._stats[f'{low_resolution}->{high_resolution}'] = {'Total instances': len(dataset)}
+
+        self.loads = [load for dataset in self.datasets for load in dataset.loads]
+        self.resolution = max(self.resolutions)
+        self.value_range = self.datasets[0].value_range
+        self.distance_transform = self.datasets[0].distance_transform
+        self.density_conditioning = density_conditioning
+        self.elongation_conditioning = elongation_conditioning
+        self.shape_conditioning = shape_conditioning
+        self.multiscale_support_conditioning = multiscale_support_conditioning
+        self.support_resolution = support_resolution
+        self.return_high_target_fields = all(
+            dataset.return_high_target_fields for dataset in self.datasets
+        )
+        self.shape_context_points = int(kwargs.get('shape_context_points', 16384))
+        self.density_statistics = self.datasets[0].density_statistics
+        self._datasets_by_high_resolution = {
+            dataset.high_resolution: dataset for dataset in self.datasets
+        }
+
+    @staticmethod
+    def _resolve_root(source_roots: Dict[str, str], root_key: str, resolution: int) -> str:
+        explicit_key = f'{root_key}_{resolution}'
+        if explicit_key in source_roots:
+            return source_roots[explicit_key]
+        if root_key not in source_roots:
+            raise KeyError(
+                f"Source must define '{explicit_key}' or a '{root_key}' template containing "
+                "'{resolution}'."
+            )
+        template = str(source_roots[root_key])
+        if '{resolution}' not in template:
+            raise ValueError(
+                f"Root template '{root_key}' must contain '{{resolution}}', got {template}."
+            )
+        return template.format(resolution=resolution)
+
+    def __len__(self):
+        return self._cumulative_sizes[-1]
+
+    def __getitem__(self, index):
+        dataset_index = bisect.bisect_right(self._cumulative_sizes, index)
+        previous_size = 0 if dataset_index == 0 else self._cumulative_sizes[dataset_index - 1]
+        pack = self.datasets[dataset_index][index - previous_size]
+        pack['low_resolution'] = torch.tensor(
+            self.datasets[dataset_index].low_resolution, dtype=torch.int32
+        )
+        pack['high_resolution'] = torch.tensor(
+            self.datasets[dataset_index].high_resolution, dtype=torch.int32
+        )
+        return pack
+
+    def __str__(self):
+        lines = [
+            self.__class__.__name__,
+            f'  - Total instances: {len(self)}',
+            f'  - Resolutions: {self.resolutions}',
+            '  - Adjacent pairs:',
+        ]
+        for pair, stats in self._stats.items():
+            lines.append(f"    - {pair}: {stats['Total instances']}")
+        return '\n'.join(lines)
+
+    @torch.no_grad()
+    def visualize_sample(self, sample):
+        if not isinstance(sample, dict) or sample.get('high_resolution') is None:
+            return super().visualize_sample(sample)
+
+        if 'target' in sample:
+            sparse = sample['target']
+        elif 'x_0' in sample:
+            sparse = sample['x_0']
+        elif 'cond' in sample:
+            sparse = sample['cond']
+        else:
+            sparse = sample['x']
+        resolutions = sample['high_resolution'].reshape(-1).detach().cpu().tolist()
+        if sparse.shape[0] != len(resolutions):
+            raise ValueError(
+                f'Expected {sparse.shape[0]} visualization resolutions, got {len(resolutions)}.'
+            )
+
+        images = {}
+        for index, resolution in enumerate(resolutions):
+            dataset = self._datasets_by_high_resolution[int(resolution)]
+            rendered = dataset.visualize_sample(sparse[index])
+            for key, value in rendered.items():
+                images.setdefault(key, []).append(value)
+        return {key: torch.cat(values, dim=0) for key, values in images.items()}
+
+    @staticmethod
+    def collate_fn(batch, split_size=None):
+        return TriangleFieldLatentSuperResolutionDataset.collate_fn(batch, split_size=split_size)
